@@ -455,3 +455,47 @@ def predict_power_demand(station: str, target_year: int = 2026, pass_rate: float
         "chart_data": chart_data,
         "feat_data": feat_data
     }
+
+# ⚡ [API 4] 실시간 15분 단위 전력 데이터 (한전 API 연동 전 임시 시뮬레이터)
+@app.get("/api/realtime/{station}")
+def get_realtime_data(station: str):
+    target = STATION_COORDS.get(station, STATION_COORDS['전체'])
+    mult = target['mult']
+    
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    seed_hash = int(hashlib.md5(f"realtime_{station}_{today_str}".encode('utf-8')).hexdigest(), 16)
+    random.seed(seed_hash)
+    
+    usage_kwh_base = random.uniform(20000, 24000) * mult
+    peak_kw_base = usage_kwh_base * random.uniform(0.06, 0.08)
+    
+    records = []
+    h, m = 0, 0
+    now = datetime.now()
+    # 현재 시간을 분으로 환산 (미래 시간은 그래프에 안 그리도록 처리)
+    current_minutes = now.hour * 60 + now.minute
+    
+    for _ in range(96):
+        time_str = f"{h:02d}:{m:02d}"
+        time_minutes = h * 60 + m
+        
+        # 미래 시간은 데이터를 None으로 주어 실시간 느낌 부여
+        if time_minutes > current_minutes:
+            records.append({ "time": time_str, "usage_kwh": None, "peak_kw": None })
+        else:
+            # 시간대별 전력 사용 패턴 적용 (낮에 높고 밤에 낮음)
+            time_factor = 1.0
+            if 8 <= h <= 18: time_factor = random.uniform(1.2, 1.5)
+            elif 0 <= h <= 5: time_factor = random.uniform(0.5, 0.7)
+                
+            usage = round((usage_kwh_base / 96) * time_factor * random.uniform(0.9, 1.1), 1)
+            peak = round((peak_kw_base) * time_factor * random.uniform(0.9, 1.1), 1)
+            records.append({ "time": time_str, "usage_kwh": usage, "peak_kw": peak })
+            
+        m += 15
+        if m >= 60:
+            m = 0
+            h += 1
+            
+    random.seed()
+    return {"station_name": station, "date": today_str, "records": records}
