@@ -208,15 +208,30 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
     target = STATION_COORDS.get(station, STATION_COORDS.get('전체'))
     mult = target['mult'] if target else 1.0
     
-    # 🌟 1. 기상청 API를 호출하여 두 연도의 전체 기상 데이터 수집 (페이징 자동 처리)
     base_wx = fetch_kma_asos_daily(f"{base_year}-01-01", f"{base_year}-12-31", "143")
     comp_wx = fetch_kma_asos_daily(f"{comp_year}-01-01", f"{comp_year}-12-31", "143")
     
-    # 🌟 2. 대구 관측소 맞춤형 기후 지표 산출 (폭염: 33도 이상, 한파: -10도 이하)
+    # 🌟 기상청 데이터(문자열)를 실수(float)로 안전하게 변환하여 계산하도록 수정
     def get_weather_stats(wx_data):
-        heatwave = sum(1 for v in wx_data.values() if v.get('temp_max') is not None and v['temp_max'] >= 33.0)
-        coldwave = sum(1 for v in wx_data.values() if v.get('temp_min') is not None and v['temp_min'] <= -10.0)
-        valid_temps = [v['temp_max'] for v in wx_data.values() if v.get('temp_max') is not None]
+        heatwave, coldwave = 0, 0
+        valid_temps = []
+        for v in wx_data.values():
+            t_max_raw = v.get('temp_max')
+            t_min_raw = v.get('temp_min')
+            
+            if t_max_raw:
+                try:
+                    t_max = float(t_max_raw) # 문자를 숫자로 변환
+                    valid_temps.append(t_max)
+                    if t_max >= 33.0: heatwave += 1
+                except ValueError: pass
+                
+            if t_min_raw:
+                try:
+                    t_min = float(t_min_raw)
+                    if t_min <= -10.0: coldwave += 1
+                except ValueError: pass
+                
         avg_temp = sum(valid_temps) / len(valid_temps) if valid_temps else 0.0
         return heatwave, coldwave, avg_temp
 
@@ -229,7 +244,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         random.seed(int(hashlib.md5(f"base_{station}_{base_year}_{m}".encode('utf-8')).hexdigest(), 16))
         bv = int(random.uniform(500000, 800000) * mult)
         
-        # 기상 지표에 따라 전력 사용량 시뮬레이션 가중치 부여
         random.seed(int(hashlib.md5(f"comp_{station}_{comp_year}_{m}".encode('utf-8')).hexdigest(), 16))
         factor = 1.0
         if m in [7, 8] and comp_hw > base_hw: factor += 0.05
@@ -243,7 +257,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
     diff_total = tc - tb
     diff_pct = round((diff_total / tb) * 100, 1) if tb > 0 else 0
     
-    # 🌟 3. 실제 기상 데이터를 반영한 동적 리포트 생성
     report_text = f"[{station}] {base_year}년 대비 {comp_year}년 전력 수요 분석 리포트\n\n"
     report_text += f"▶ 대구 관측소 기상 실측 데이터:\n"
     report_text += f" - {base_year}년: 폭염일수 {base_hw}일 / 한파일수 {base_cw}일 (연평균 최고기온 {base_avg:.1f}℃)\n"
@@ -268,7 +281,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
     return {
         "summary": {
             "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct, "cost": diff_total*price,
-            "ai_report": report_text # 🌟 완성된 텍스트를 프론트엔드로 전달
+            "ai_report": report_text 
         }, 
         "records": records
     }
