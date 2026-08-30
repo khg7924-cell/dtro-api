@@ -1,0 +1,60 @@
+[2026-08-30 12:29:13.179835] 대기질통계_응답에러(수창동) 오류
+응답내용: {
+  "OpenAPI_ServiceResponse": {
+    "cmmMsgHeader": {
+      "errMsg": "SERVICETIMEOUT_ERROR",
+      "returnAuthMsg": "서비스 연결실패 에러",
+      "returnReasonCode": "05"
+    }
+  }
+}
+
+
+[2026-08-30 12:29:24.380095] 대기질통계_응답에러(수창동) 오류
+응답내용: {
+  "OpenAPI_ServiceResponse": {
+    "cmmMsgHeader": {
+      "errMsg": "SERVICETIMEOUT_ERROR",
+      "returnAuthMsg": "서비스 연결실패 에러",
+      "returnReasonCode": "05"
+    }
+  }
+}
+
+
+[2026-08-30 12:29:35.283368] 대기질통계_응답에러(수창동) 오류
+응답내용: {
+  "OpenAPI_ServiceResponse": {
+    "cmmMsgHeader": {
+      "errMsg": "SERVICETIMEOUT_ERROR",
+      "returnAuthMsg": "서비스 연결실패 에러",
+      "returnReasonCode": "05"
+    }
+  }
+}
+
+
+[2026-08-30 12:50:05.129149] 대기질통계_응답에러(수창동) 오류
+응답내용: {
+  "OpenAPI_ServiceResponse": {
+    "cmmMsgHeader": {
+      "errMsg": "SERVICETIMEOUT_ERROR",
+      "returnAuthMsg": "서비스 연결실패 에러",
+      "returnReasonCode": "05"
+    }
+  }
+}
+
+
+[2026-08-30 12:51:10.047695] 근접측정소조회 오류
+응답내용: {
+  "OpenAPI_ServiceResponse": {
+    "cmmMsgHeader": {
+      "errMsg": "SERVICETIMEOUT_ERROR",
+      "returnAuthMsg": "서비스 연결실패 에러",
+      "returnReasonCode": "05"
+    }
+  }
+}
+
+
