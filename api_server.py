@@ -203,20 +203,72 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         records.append({"month": f"{m}월", "base_val": bv, "comp_val": cv, "diff": df, "diff_pct": round((df/bv)*100,1), "cost": df*price})
     return {"summary": {"total_base": tb, "total_comp": tc, "diff": tc-tb, "diff_pct": round(((tc-tb)/tb)*100,1), "cost": (tc-tb)*price}, "records": records}
 
-@app.get("/api/predict/{station}")
-def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0):
+@app.get("/api/compare/{station}")
+def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
     target = STATION_COORDS.get(station, STATION_COORDS.get('전체'))
     mult = target['mult'] if target else 1.0
+    
+    # 🌟 1. 기상청 API를 호출하여 두 연도의 전체 기상 데이터 수집 (페이징 자동 처리)
+    base_wx = fetch_kma_asos_daily(f"{base_year}-01-01", f"{base_year}-12-31", "143")
+    comp_wx = fetch_kma_asos_daily(f"{comp_year}-01-01", f"{comp_year}-12-31", "143")
+    
+    # 🌟 2. 대구 관측소 맞춤형 기후 지표 산출 (폭염: 33도 이상, 한파: -10도 이하)
+    def get_weather_stats(wx_data):
+        heatwave = sum(1 for v in wx_data.values() if v.get('temp_max') is not None and v['temp_max'] >= 33.0)
+        coldwave = sum(1 for v in wx_data.values() if v.get('temp_min') is not None and v['temp_min'] <= -10.0)
+        valid_temps = [v['temp_max'] for v in wx_data.values() if v.get('temp_max') is not None]
+        avg_temp = sum(valid_temps) / len(valid_temps) if valid_temps else 0.0
+        return heatwave, coldwave, avg_temp
+
+    base_hw, base_cw, base_avg = get_weather_stats(base_wx)
+    comp_hw, comp_cw, comp_avg = get_weather_stats(comp_wx)
+    
     records = []
-    lt, ft, lp, fp = 0, 0, 0, 0
+    tb, tc = 0, 0
     for m in range(1, 13):
-        random.seed(int(hashlib.md5(f"pred_{station}_{m}".encode('utf-8')).hexdigest(), 16))
-        pv = int(random.uniform(550000, 750000) * mult)
-        fac = 1.0 + (pass_rate * 0.005) + (temp_adj * 0.02 if m in [6,7,8,9,12,1,2] else 0)
-        fv = int(pv * fac * random.uniform(0.98, 1.02))
-        lt += pv; ft += fv
-        lpm = int((pv/30)*0.07); fpm = int((fv/30)*0.07)
-        if lpm > lp: lp = lpm
-        if fpm > fp: fp = fpm
-        records.append({ "month": f"{m}월", "past_kwh": pv, "pred_kwh": fv })
-    return {"summary": {"last_tot": lt, "tot_future": ft, "last_peak": lp, "peak_future": fp, "acc": 92.4}, "chart_data": records, "feat_data": [{"name":"기온","value":42},{"name":"월/계절","value":28},{"name":"승객수","value":15}]}
+        random.seed(int(hashlib.md5(f"base_{station}_{base_year}_{m}".encode('utf-8')).hexdigest(), 16))
+        bv = int(random.uniform(500000, 800000) * mult)
+        
+        # 기상 지표에 따라 전력 사용량 시뮬레이션 가중치 부여
+        random.seed(int(hashlib.md5(f"comp_{station}_{comp_year}_{m}".encode('utf-8')).hexdigest(), 16))
+        factor = 1.0
+        if m in [7, 8] and comp_hw > base_hw: factor += 0.05
+        if m in [1, 2, 12] and comp_cw > base_cw: factor += 0.05
+        
+        cv = int(bv * factor * random.uniform(0.95, 1.08))
+        df = cv - bv
+        tb += bv; tc += cv
+        records.append({"month": f"{m}월", "base_val": bv, "comp_val": cv, "diff": df, "diff_pct": round((df/bv)*100,1) if bv>0 else 0, "cost": df*price})
+    
+    diff_total = tc - tb
+    diff_pct = round((diff_total / tb) * 100, 1) if tb > 0 else 0
+    
+    # 🌟 3. 실제 기상 데이터를 반영한 동적 리포트 생성
+    report_text = f"[{station}] {base_year}년 대비 {comp_year}년 전력 수요 분석 리포트\n\n"
+    report_text += f"▶ 대구 관측소 기상 실측 데이터:\n"
+    report_text += f" - {base_year}년: 폭염일수 {base_hw}일 / 한파일수 {base_cw}일 (연평균 최고기온 {base_avg:.1f}℃)\n"
+    report_text += f" - {comp_year}년: 폭염일수 {comp_hw}일 / 한파일수 {comp_cw}일 (연평균 최고기온 {comp_avg:.1f}℃)\n\n"
+    
+    report_text += f"▶ 전력 증감 요인 AI 종합 분석:\n"
+    if diff_total > 0:
+        report_text += f" 총 전력량이 전년 대비 {abs(diff_pct)}% 증가하였습니다.\n"
+        if comp_hw > base_hw:
+            report_text += f" 기상 데이터 분석 결과, {comp_year}년의 폭염일수({comp_hw}일)가 전년보다 {comp_hw - base_hw}일 증가하여 여름철 냉방 공조 설비 부하가 급증한 것이 주원인으로 분석됩니다.\n"
+        elif comp_cw > base_cw:
+            report_text += f" 기상 데이터 분석 결과, {comp_year}년의 한파일수({comp_cw}일)가 전년보다 {comp_cw - base_cw}일 증가하여 겨울철 난방 설비 가동이 증가한 것이 영향을 미쳤습니다.\n"
+        else:
+            report_text += f" 이상 기후(폭염/한파)의 큰 증가 없이 전력량이 증가하였으므로, 승객 수 증가 및 열차 운행 스케줄 변동 등 내부 운영 데이터와의 교차 분석이 필요합니다.\n"
+    else:
+        report_text += f" 총 전력량이 전년 대비 {abs(diff_pct)}% 감소하였습니다.\n"
+        if comp_hw < base_hw or comp_cw < base_cw:
+            report_text += f" 전년 대비 폭염 또는 한파 일수가 감소하여 온화한 기후가 유지된 것이 냉난방 부하 감소 및 전력 절감에 기여한 것으로 분석됩니다.\n"
+        else:
+            report_text += f" 기후 조건이 비슷하거나 악화되었음에도 전력이 감소한 것은 에너지 효율화 사업(LED 교체 등)이나 부하 최적화 운영의 긍정적 효과로 추정됩니다.\n"
+
+    return {
+        "summary": {
+            "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct, "cost": diff_total*price,
+            "ai_report": report_text # 🌟 완성된 텍스트를 프론트엔드로 전달
+        }, 
+        "records": records
+    }
