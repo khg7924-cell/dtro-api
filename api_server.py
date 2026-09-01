@@ -1,4 +1,5 @@
 import hashlib
+import random
 from datetime import datetime, timedelta
 import os
 import pandas as pd
@@ -6,17 +7,18 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import requests
+from sklearn.ensemble import RandomForestRegressor
 import xgboost as xgb
 from sklearn.metrics import r2_score
-import holidays
 import traceback
+import holidays
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=False, # 🚨 브라우저 통신 차단(CORS 에러)을 막기 위해 False로 고정
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -96,7 +98,7 @@ def fetch_kma_asos_daily(start_date: str, end_date: str, stn_id: str = "143"):
         }
         
         try:
-            r = requests.get(url, params=params, timeout=3)
+            r = requests.get(url, params=params, timeout=10)
             data = r.json()
             if "response" in data and "body" in data["response"] and "items" in data["response"]["body"]:
                 items_data = data["response"]["body"]["items"]
@@ -352,7 +354,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         if off_diff > 0:
             ai_report_text += f"휴일이 전년 대비 {off_diff}일 증가하여 열차 운행 횟수(다이아)가 줄어든 점도 전사적 절전 노력과 시너지를 낸 보조 요인입니다."
         else:
-            ai_report_text += "휴일 일수 감소로 열차 운행 횟수마저 증가하는 악조건이었으나 절전 성과가 이를 모두 극복했습니다."
+            ai_report_text += "휴일 일수 감소로 열차 운행 횟마저 증가하는 악조건이었으나 절전 성과가 이를 모두 극복했습니다."
 
     else:
         direction = "증가" if diff_total > 0 else "감소"
@@ -383,12 +385,9 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         "records": records
     }
 
-# =========================================================================
-# 🚀 3. AI 수요 예측 (XGBoost 엔진 장착 및 최신 Pandas 문법 오류 100% 방어)
-# =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0):
-    try:
+    try: # 🚨 브라우저의 "통신할 수 없습니다" 에러를 원천 방어하기 위한 보호막
         df = load_excel_dataset()
         if df is None: return {"error": "과거 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
             
@@ -403,10 +402,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             df['target_power'] = df[kwh_cols[0]] if kwh_cols else df.iloc[:, 1]
         
         kr_holidays = holidays.KR()
+        df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         df['month'] = df['date'].dt.month
         df['dayofweek'] = df['date'].dt.dayofweek
         df['is_weekend'] = df['dayofweek'].isin([5,6]).astype(int)
-        df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
         asos_data = fetch_kma_asos_daily("2023-01-01", "2025-12-31", "143")
         df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax'))
@@ -449,21 +448,20 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         X_train, y_train = train_df[features].copy(), train_df['target_power'].copy()
         X_test = test_df[features].copy()
         
-        # 🌟 최신 Pandas 문법 오류 원천 차단 (.bfill().ffill() 직접 호출)
+        # 🚨 TypeError 통신 오류를 100% 방어하는 최신 Pandas 호환 구문
         X_train = X_train.bfill().ffill()
         X_test = X_test.bfill().ffill()
         
-        # 🚀 XGBoost 초정밀 예측 모델 장착 완료
-        model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, random_state=42)
+        # 🚀 XGBoost 엔진 탑재
+        model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
         model.fit(X_train, y_train)
         test_df['pred_power'] = model.predict(X_test)
         
-        # 정확도(R2 Score) 실시간 산출
+        # 실제 R2 스코어 연산
         train_pred = model.predict(X_train)
         r2_acc = round(r2_score(y_train, train_pred) * 100, 1)
         
-        train_last_year_df = train_df[train_df['date'].dt.year == (int(target_year) - 1)]
-        lt = float(train_last_year_df['target_power'].sum()) if not train_last_year_df.empty else 0
+        lt = float(train_df[train_df['date'].dt.year == 2025]['target_power'].sum())
         ft = float(test_df['pred_power'].sum())
         
         feat_df = pd.DataFrame({'name': features, 'value': (model.feature_importances_ * 100).round(1)})
@@ -473,14 +471,14 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         
         records = []
         for m in range(1, 13):
-            m_past = float(train_last_year_df[train_last_year_df['date'].dt.month == m]['target_power'].sum()) if not train_last_year_df.empty else 0
-            m_pred = float(test_df[test_df['date'].dt.month == m]['pred_power'].sum())
+            m_past = float(train_df[(train_df['date'].dt.year == 2025) & (train_df['month'] == m)]['target_power'].sum())
+            m_pred = float(test_df[test_df['month'] == m]['pred_power'].sum())
             records.append({ "month": f"{m}월", "past_kwh": m_past, "pred_kwh": m_pred })
             
         return {
-            "summary": { "last_tot": lt, "tot_future": ft, "last_peak": train_last_year_df['target_power'].max() if not train_last_year_df.empty else 0, "peak_future": test_df['pred_power'].max(), "acc": r2_acc }, 
+            "summary": { "last_tot": lt, "tot_future": ft, "last_peak": train_df['target_power'].max(), "peak_future": test_df['pred_power'].max(), "acc": r2_acc }, 
             "chart_data": records, "feat_data": top_feats
         }
     except Exception as e:
-        # 🚨 배포 서버에서 에러가 발생해도 통신 끊김 없이 정확한 에러 메시지를 반환함
-        return {"error": f"AI 분석 중 내부 서버 에러 발생: {str(e)}\n\n{traceback.format_exc()}"}
+        # 🚨 서버가 뻗기 전에 브라우저로 텍스트 로그를 리턴하여 무한 로딩/통신 오류 차단
+        return {"error": f"AI 분석 중 백엔드 서버 에러 발생: {str(e)}\n\n{traceback.format_exc()}"}
