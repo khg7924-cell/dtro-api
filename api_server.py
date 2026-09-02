@@ -12,7 +12,6 @@ import traceback
 import holidays
 import urllib3
 
-# 한전 API의 사설 인증서 SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
@@ -28,6 +27,19 @@ app.add_middleware(
 DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e20f5cb"
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 LINE1_CUST_NO = "0526314773"
+
+# 🌟 여기에 화면에 뜬 한전 실제 계기번호(meterNo)를 입력하시면 개별 데이터만 필터링됩니다.
+STATION_METER_MAP = {
+    '설화명곡': '',  # 예: '12345678901'
+    '월배기지': '',
+    '서부정류장': '',
+    '반월당': '',
+    '신천': '',
+    '방촌': '',
+    '안심': '',
+    '숙천': '',
+    '금락': '',
+}
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -54,7 +66,6 @@ def load_excel_dataset():
                 df_pm = pd.read_excel(xls, sheet_name=sheet)
                 df_pm = df_pm.iloc[1:].copy() 
                 df_pm['일자'] = pd.to_datetime(df_pm['일자'].astype(str).str.split(' ').str[0], errors='coerce')
-                
                 col_pm = [c for c in df_pm.columns if '수창동' in str(c)]
                 if len(col_pm) > 0:
                     idx = df_pm.columns.get_loc(col_pm[0])
@@ -62,7 +73,6 @@ def load_excel_dataset():
                     df_pm['pm25'] = pd.to_numeric(df_pm[val_col], errors='coerce')
                 else:
                     df_pm['pm25'] = np.nan
-                    
                 pm25_dfs.append(df_pm[['일자', 'pm25']])
         
         if pm25_dfs:
@@ -71,7 +81,6 @@ def load_excel_dataset():
         
         return df_main
     except Exception as e:
-        print(f"엑셀 로드 에러: {e}")
         return None
 
 def fetch_kma_asos_daily(start_date: str, end_date: str, stn_id: str = "143"):
@@ -83,34 +92,30 @@ def fetch_kma_asos_daily(start_date: str, end_date: str, stn_id: str = "143"):
         y_s = max(s_dt, datetime(year, 1, 1)).strftime("%Y%m%d")
         y_e = min(e_dt, datetime(year, 12, 31)).strftime("%Y%m%d")
         params = {
-            "serviceKey": DATA_GO_KR_API_KEY,
-            "pageNo": "1", "numOfRows": "999", "dataType": "JSON",
+            "serviceKey": DATA_GO_KR_API_KEY, "pageNo": "1", "numOfRows": "999", "dataType": "JSON",
             "dataCd": "ASOS", "dateCd": "DAY", "startDt": y_s, "endDt": y_e, "stnIds": str(stn_id)
         }
         try:
             r = requests.get(url, params=params, timeout=5)
             data = r.json()
             if "response" in data and "body" in data["response"] and "items" in data["response"]["body"]:
-                items_data = data["response"]["body"]["items"]
-                if items_data and "item" in items_data:
-                    items = items_data["item"]
-                    if isinstance(items, dict): items = [items] 
-                    for item in items:
-                        d_str = item.get("tm") 
-                        if not d_str: continue
-                        row = {}
-                        try:
-                            if item.get("maxTa") not in [None, '']: row["tmax"] = float(item["maxTa"])
-                            if item.get("minTa") not in [None, '']: row["tmin"] = float(item["minTa"])
-                            if item.get("avgTa") not in [None, '']: row["tavg"] = float(item["avgTa"])
-                            if item.get("avgRhm") not in [None, '']: row["humi"] = float(item["avgRhm"])
-                            res[d_str] = row
-                        except ValueError: pass
+                items = data["response"]["body"]["items"].get("item", [])
+                if isinstance(items, dict): items = [items] 
+                for item in items:
+                    d_str = item.get("tm") 
+                    if not d_str: continue
+                    row = {}
+                    try:
+                        if item.get("maxTa") not in [None, '']: row["tmax"] = float(item["maxTa"])
+                        if item.get("minTa") not in [None, '']: row["tmin"] = float(item["minTa"])
+                        if item.get("avgTa") not in [None, '']: row["tavg"] = float(item["avgTa"])
+                        if item.get("avgRhm") not in [None, '']: row["humi"] = float(item["avgRhm"])
+                        res[d_str] = row
+                    except ValueError: pass
         except: pass
     if not res and str(stn_id) != "143": return fetch_kma_asos_daily(start_date, end_date, "143")
     return res
 
-# 🌟 한전 OpenAPI 15분 단위 데이터 호출 (1호선 전체 합산용)
 def fetch_kepco_day_lp(cust_no: str, date_str: str):
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
     params = {
@@ -129,53 +134,55 @@ def fetch_kepco_day_lp(cust_no: str, date_str: str):
         print("KEPCO API Error:", e)
     return None
 
-def process_kepco_day_data(day_list):
-    if not day_list: return 0.0, 0.0, []
+def process_kepco_day_data(day_list, target_meter_no):
+    if not day_list: return 0.0, 0.0, [], set()
     
     interval_usage = [0.0] * 96
+    available_meters = set()
     
-    # 대표 고객번호 산하의 모든 계기번호(1호선 전체 역사) 데이터를 합산
     for item in day_list:
+        meter_no = item.get("meterNo", "")
+        if meter_no: available_meters.add(meter_no)
+        
+        # 🌟 핵심 로직: 타겟 계기번호가 설정되어 있는데, 현재 배열의 번호와 다르면 무시함
+        if target_meter_no and target_meter_no != "전체" and meter_no != target_meter_no:
+            continue
+            
         for k, v in item.items():
             if k.startswith("pwr_qty") and k != "pwr_qty":
                 try:
                     time_str = k[-4:]
                     hh = int(time_str[:2])
                     mm = int(time_str[2:])
-                    if hh == 24 and mm == 0:
-                        idx = 95
-                    else:
-                        idx = hh * 4 + (mm // 15) - 1
-                        
+                    idx = 95 if (hh == 24 and mm == 0) else hh * 4 + (mm // 15) - 1
                     if 0 <= idx < 96:
                         interval_usage[idx] += float(v)
-                except:
-                    pass
+                except: pass
                     
     total_usage = sum(interval_usage)
-    # 15분 사용량(kWh)을 1시간 기준 평균전력(kW)으로 환산하여 최대 수요(Peak) 도출
     max_peak = max(interval_usage) * 4 if interval_usage else 0.0
     
     details = []
     for i, val in enumerate(interval_usage):
         hh = i // 4
         mm = (i % 4) * 15
-        peak_kw = val * 4
         details.append({
             "time": f"{hh:02d}:{mm:02d}", 
             "usage_kwh": round(val, 1), 
-            "peak_kw": round(peak_kw, 1)
+            "peak_kw": round(val * 4, 1)
         })
         
-    return total_usage, max_peak, details
+    return total_usage, max_peak, details, available_meters
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (한전 OpenAPI 생중계 연결)
+# 🚀 1. 통합 대시보드 (계기번호 매핑 안내 기능 포함)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
+    target_meter = "전체" if station in ['전체', '1호선', '2호선', '3호선', '종합청사'] else STATION_METER_MAP.get(station, "")
+    
     start_dt, end_dt = datetime.strptime(start, "%Y-%m-%d"), datetime.strptime(end, "%Y-%m-%d")
-    diff = min((end_dt - start_dt).days + 1, 31) # API 부하 방지를 위해 최대 31일 제한
+    diff = min((end_dt - start_dt).days + 1, 31)
     
     records, total_usage_all, max_peak_all, total_co2_all = [], 0.0, 0.0, 0.0
     kma_temp = fetch_kma_asos_daily(start, end, "143")
@@ -184,20 +191,23 @@ def get_dashboard_data(station: str, start: str, end: str):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        # 한전 API 100% 팩트 데이터 호출
         day_list = fetch_kepco_day_lp(LINE1_CUST_NO, date_str)
         if day_list is None:
-            return {"error": f"한전 OpenAPI 통신 실패 ({date_str}): Render 해외 IP 차단 또는 한전 서버 지연으로 팩트 데이터를 가져올 수 없습니다."}
+            return {"error": f"한전 OpenAPI 통신 실패 ({date_str}): 데이터를 가져올 수 없습니다."}
             
-        day_usage, day_peak, details = process_kepco_day_data(day_list)
+        day_usage, day_peak, details, available_meters = process_kepco_day_data(day_list, target_meter)
         
+        # 🌟 계기번호가 입력되어 있지 않은 경우, 한전에서 받아온 전체 목록을 화면에 띄워줌
+        if target_meter == "" and station not in ['전체', '1호선', '2호선', '3호선', '종합청사']:
+            meters_str = ", ".join(list(available_meters))
+            return {"error": f"[{station}]의 정확한 한전 계기번호(meterNo) 매핑이 필요합니다.\n\n백엔드 코드의 STATION_METER_MAP에 다음 목록 중 하나를 입력해 주세요.\n\n수신된 계기번호 목록:\n[{meters_str}]"}
+            
         total_usage_all += day_usage
         if day_peak > max_peak_all: max_peak_all = day_peak
         day_co2 = day_usage * 0.466 / 1000
         total_co2_all += day_co2
         
         kma = kma_temp.get(date_str, {})
-        
         records.append({
             "date": date_str, "usage_kwh": round(day_usage, 1), "peak_kw": round(day_peak, 1),
             "varLag": round(day_usage * 0.1, 1), "varLead": round(day_usage * 0.02, 1),
@@ -207,7 +217,7 @@ def get_dashboard_data(station: str, start: str, end: str):
         })
         
     return {
-        "station_name": station, "mapped_location": "1호선 전체 (한전 OpenAPI 연동됨)",
+        "station_name": station, "mapped_location": f"{station} (한전 OpenAPI 실측 연동)",
         "summary": { "total_usage": round(total_usage_all), "max_peak": round(max_peak_all, 1), "total_co2": round(total_co2_all, 1) },
         "daily_records": records
     }
@@ -215,32 +225,33 @@ def get_dashboard_data(station: str, start: str, end: str):
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
     today_str = datetime.now().strftime("%Y-%m-%d")
+    target_meter = "전체" if station in ['전체', '1호선', '2호선', '3호선', '종합청사'] else STATION_METER_MAP.get(station, "")
     
     day_list = fetch_kepco_day_lp(LINE1_CUST_NO, today_str)
-    if day_list is None:
-        return {"error": "한전 OpenAPI 통신 실패: 당일 실시간 팩트 데이터를 수신하지 못했습니다."}
+    if day_list is None: return {"error": "한전 OpenAPI 통신 실패: 당일 실시간 데이터를 수신하지 못했습니다."}
         
-    _, _, details = process_kepco_day_data(day_list)
+    day_usage, day_peak, details, available_meters = process_kepco_day_data(day_list, target_meter)
+    
+    if target_meter == "" and station not in ['전체', '1호선', '2호선', '3호선', '종합청사']:
+        return {"error": f"[{station}]의 정확한 한전 계기번호(meterNo) 매핑이 필요합니다.\n수신된 계기번호: {list(available_meters)}"}
     
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
-        time_minutes = hh * 60 + mm
-        if time_minutes > now_minutes:
+        if hh * 60 + mm > now_minutes:
             d["usage_kwh"] = None
             d["peak_kw"] = None
             
     return {"station_name": station, "date": today_str, "records": details}
 
 # =========================================================================
-# 🚀 2. 연도별 비교 분석 (DTRO 절전 아이템 심층 분석)
+# 🚀 2. 연도별 비교 분석 (기존 팩트 로직 유지)
 # =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
     try:
         df = load_excel_dataset()
-        if df is None:
-            return {"error": "과거 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
+        if df is None: return {"error": "과거 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
         
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
@@ -283,8 +294,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         off_diff = c_total_off - b_total_off
 
         asos_data = fetch_kma_asos_daily("2023-01-01", "2025-12-31", "143")
-        if not asos_data:
-            return {"error": "기상청 공공데이터포털 통신 오류. 정확한 팩트 기반 비교 분석을 위해 데이터 삽입을 중단합니다."}
+        if not asos_data: return {"error": "기상청 공공데이터포털 통신 오류. 정확한 팩트 기반 비교 분석을 위해 데이터 삽입을 중단합니다."}
             
         def get_stats(year_str):
             hw, cw = 0, 0
@@ -296,19 +306,14 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                     m = int(date_str[5:7])
                     tmax = v.get("tmax")
                     tmin = v.get("tmin")
-                    
                     if tmax is not None:
                         if tmax >= 33.0: hw += 1
                         if m in [6, 7, 8]:
-                            summer_tmax_sum += tmax
-                            summer_tmax_cnt += 1
-                            
+                            summer_tmax_sum += tmax; summer_tmax_cnt += 1
                     if tmin is not None:
                         if tmin <= -10.0: cw += 1
                         if m in [12, 1, 2]:
-                            winter_tmin_sum += tmin
-                            winter_tmin_cnt += 1
-                            
+                            winter_tmin_sum += tmin; winter_tmin_cnt += 1
             s_avg_tmax = (summer_tmax_sum / summer_tmax_cnt) if summer_tmax_cnt > 0 else 0.0
             w_avg_tmin = (winter_tmin_sum / winter_tmin_cnt) if winter_tmin_cnt > 0 else 0.0
             return hw, cw, s_avg_tmax, w_avg_tmin
@@ -347,7 +352,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
 
         if diff_total < 0 and (is_climate_harsher or is_passenger_up or off_diff < 0):
             ai_report_text += f"🚨 [주목] 전력 부하가 가중될 조건임에도, 총 전력량은 오히려 감소({diff_pct_total:+.1f}%)하는 긍정적 결과가 도출되었습니다.\n\n"
-            
             climate_str = []
             if s_tmax_diff > 0.3 or hw_diff > 0: climate_str.append("하절기 기온/폭염 상승")
             if w_tmin_diff < -0.3 or cw_diff > 0: climate_str.append("동절기 한파 심화")
@@ -358,35 +362,26 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             ai_report_text += f"{', '.join(climate_str)} 등으로 역사 및 열차의 공조/동력 부하가 팩트 데이터상 명확히 가중될 조건이었습니다. 그럼에도 불구하고 전력량이 총 {abs(diff_total):,.0f} kWh 줄어든 원인은, 당 공사가 23년부터 전사적으로 추진해 온 '절전 아이템 발굴 및 운영 최적화' 노력이 환경적 악조건을 완벽히 극복하고 상쇄한 성과로 AI는 분석합니다.\n\n"
             
             ai_report_text += "② 캘린더 부하 효과 판단: \n"
-            if off_diff > 0:
-                ai_report_text += f"휴일이 전년 대비 {off_diff}일 늘어나 열차 운행 횟수(다이아)가 줄어든 점도, 공사의 절전 노력과 시너지를 일으켜 전력 절감에 긍정적으로 작용했습니다."
-            elif off_diff < 0:
-                ai_report_text += f"심지어 휴일 일수마저 감소하여 평일 열차 운행 횟수가 증가하는 악조건이었으나, 전사적인 절전 성과가 이를 모두 성공적으로 방어해 냈습니다."
-            else:
-                ai_report_text += "휴일 일수는 전년과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
+            if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 늘어나 열차 운행 횟수(다이아)가 줄어든 점도, 공사의 절전 노력과 시너지를 일으켜 전력 절감에 긍정적으로 작용했습니다."
+            elif off_diff < 0: ai_report_text += f"심지어 휴일 일수마저 감소하여 평일 열차 운행 횟수가 증가하는 악조건이었으나, 전사적인 절전 성과가 이를 모두 성공적으로 방어해 냈습니다."
+            else: ai_report_text += "휴일 일수는 전년과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
         else:
             direction = "증가" if diff_total > 0 else "감소"
             ai_report_text += f"XGBoost 알고리즘 분석 결과, 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
             
             ai_report_text += "① 캘린더 및 열차 운행(다이아) 요인: \n"
-            if off_diff > 0:
-                ai_report_text += f"휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
-            elif off_diff < 0:
-                ai_report_text += f"휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
-            else:
-                ai_report_text += "휴일 일수가 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
+            if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
+            elif off_diff < 0: ai_report_text += f"휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
+            else: ai_report_text += "휴일 일수가 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
 
             ai_report_text += "\n\n② 계절별 기상 및 공조 설비 부하 요인: \n"
             ai_report_text += f"[하절기 냉방] 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다. "
             ai_report_text += f"\n[동절기 난방] 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다."
                 
             ai_report_text += "\n\n③ 여객 동선 및 편의 설비 요인: \n"
-            if p_diff > 0:
-                ai_report_text += f"승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
-            elif p_diff < 0:
-                ai_report_text += f"승객수가 {abs(p_diff):,.0f}명 감소하여 전체적인 동력 전력 감소에 기여했습니다."
-            else:
-                ai_report_text += "승객수 변동폭이 작아 유의미한 여객 전력 변동은 관찰되지 않았습니다."
+            if p_diff > 0: ai_report_text += f"승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
+            elif p_diff < 0: ai_report_text += f"승객수가 {abs(p_diff):,.0f}명 감소하여 전체적인 동력 전력 감소에 기여했습니다."
+            else: ai_report_text += "승객수 변동폭이 작아 유의미한 여객 전력 변동은 관찰되지 않았습니다."
 
         return {
             "summary": { "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, "cost": diff_total*price, "ai_report": ai_report_text }, 
