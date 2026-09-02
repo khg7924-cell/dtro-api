@@ -28,9 +28,9 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 LINE1_CUST_NO = "0526314773"
 
-# 🌟 여기에 화면에 뜬 한전 실제 계기번호(meterNo)를 입력하시면 개별 데이터만 필터링됩니다.
+# 🌟 파워플래너와 전력량을 비교한 후, 여기에 한전의 실제 계기번호(숫자)를 적어주시면 매핑이 끝납니다!
 STATION_METER_MAP = {
-    '설화명곡': '',  # 예: '12345678901'
+    '설화명곡': '', 
     '월배기지': '',
     '서부정류장': '',
     '반월당': '',
@@ -87,7 +87,6 @@ def fetch_kma_asos_daily(start_date: str, end_date: str, stn_id: str = "143"):
     s_dt, e_dt = datetime.strptime(start_date, "%Y-%m-%d"), datetime.strptime(end_date, "%Y-%m-%d")
     res = {}
     url = "http://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList"
-    
     for year in range(s_dt.year, e_dt.year + 1):
         y_s = max(s_dt, datetime(year, 1, 1)).strftime("%Y%m%d")
         y_e = min(e_dt, datetime(year, 12, 31)).strftime("%Y%m%d")
@@ -135,29 +134,36 @@ def fetch_kepco_day_lp(cust_no: str, date_str: str):
     return None
 
 def process_kepco_day_data(day_list, target_meter_no):
-    if not day_list: return 0.0, 0.0, [], set()
+    # 🌟 탐지된 계기번호와 전력량 합산을 딕셔너리로 저장
+    available_meters = {} 
     
+    if not day_list: return 0.0, 0.0, [], available_meters
     interval_usage = [0.0] * 96
-    available_meters = set()
     
     for item in day_list:
-        meter_no = item.get("meterNo", "")
-        if meter_no: available_meters.add(meter_no)
-        
-        # 🌟 핵심 로직: 타겟 계기번호가 설정되어 있는데, 현재 배열의 번호와 다르면 무시함
-        if target_meter_no and target_meter_no != "전체" and meter_no != target_meter_no:
-            continue
+        meter_no = item.get("meterNo", "알수없음")
+        if meter_no not in available_meters:
+            available_meters[meter_no] = 0.0
             
+        meter_daily_sum = 0.0
         for k, v in item.items():
             if k.startswith("pwr_qty") and k != "pwr_qty":
                 try:
-                    time_str = k[-4:]
-                    hh = int(time_str[:2])
-                    mm = int(time_str[2:])
-                    idx = 95 if (hh == 24 and mm == 0) else hh * 4 + (mm // 15) - 1
-                    if 0 <= idx < 96:
-                        interval_usage[idx] += float(v)
+                    val = float(v)
+                    meter_daily_sum += val
+                    
+                    # '전체'이거나 내 계기번호와 일치할 때만 차트/테이블 데이터에 합산
+                    if target_meter_no in ["", "전체"] or meter_no == target_meter_no:
+                        time_str = k[-4:]
+                        hh = int(time_str[:2])
+                        mm = int(time_str[2:])
+                        idx = 95 if (hh == 24 and mm == 0) else hh * 4 + (mm // 15) - 1
+                        if 0 <= idx < 96:
+                            interval_usage[idx] += val
                 except: pass
+                
+        # 🌟 계기번호별 일일 전력량 누적 (팝업창 표시용)
+        available_meters[meter_no] += meter_daily_sum
                     
     total_usage = sum(interval_usage)
     max_peak = max(interval_usage) * 4 if interval_usage else 0.0
@@ -175,7 +181,7 @@ def process_kepco_day_data(day_list, target_meter_no):
     return total_usage, max_peak, details, available_meters
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (계기번호 매핑 안내 기능 포함)
+# 🚀 1. 통합 대시보드 (계기번호 & 전력량 탐지 팝업 연동)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -197,10 +203,10 @@ def get_dashboard_data(station: str, start: str, end: str):
             
         day_usage, day_peak, details, available_meters = process_kepco_day_data(day_list, target_meter)
         
-        # 🌟 계기번호가 입력되어 있지 않은 경우, 한전에서 받아온 전체 목록을 화면에 띄워줌
+        # 🌟 계기번호가 비어있으면, 해당 일자의 전력량 목록을 예쁘게 뽑아서 에러 메시지로 넘겨줍니다.
         if target_meter == "" and station not in ['전체', '1호선', '2호선', '3호선', '종합청사']:
-            meters_str = ", ".join(list(available_meters))
-            return {"error": f"[{station}]의 정확한 한전 계기번호(meterNo) 매핑이 필요합니다.\n\n백엔드 코드의 STATION_METER_MAP에 다음 목록 중 하나를 입력해 주세요.\n\n수신된 계기번호 목록:\n[{meters_str}]"}
+            meters_info = "\n".join([f"▶ 계기번호: {m} (일일 사용량: {round(kwh, 1):,} kWh)" for m, kwh in available_meters.items()])
+            return {"error": f"🚨 [{station}]의 한전 계기번호 매핑이 필요합니다.\n\n파워플래너에서 [{date_str}] 일자의 전력량과 아래 수신된 값을 비교하여, 어떤 번호가 {station}인지 백엔드 코드의 STATION_METER_MAP에 입력해 주세요.\n\n[한전 수신 데이터]\n{meters_info}"}
             
         total_usage_all += day_usage
         if day_peak > max_peak_all: max_peak_all = day_peak
@@ -233,7 +239,8 @@ def get_realtime_data(station: str):
     day_usage, day_peak, details, available_meters = process_kepco_day_data(day_list, target_meter)
     
     if target_meter == "" and station not in ['전체', '1호선', '2호선', '3호선', '종합청사']:
-        return {"error": f"[{station}]의 정확한 한전 계기번호(meterNo) 매핑이 필요합니다.\n수신된 계기번호: {list(available_meters)}"}
+        meters_info = "\n".join([f"▶ 계기번호: {m} (일일 사용량: {round(kwh, 1):,} kWh)" for m, kwh in available_meters.items()])
+        return {"error": f"🚨 [{station}]의 한전 계기번호 매핑이 필요합니다.\n파워플래너와 값을 비교하여 코드를 수정해 주세요.\n\n[당일 한전 수신 데이터]\n{meters_info}"}
     
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
     for d in details:
@@ -245,7 +252,7 @@ def get_realtime_data(station: str):
     return {"station_name": station, "date": today_str, "records": details}
 
 # =========================================================================
-# 🚀 2. 연도별 비교 분석 (기존 팩트 로직 유지)
+# 🚀 2. 연도별 비교 분석
 # =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
