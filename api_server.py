@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -14,7 +14,6 @@ import urllib3
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-# HTTPS 인증서 경고 숨김
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
@@ -30,6 +29,10 @@ app.add_middleware(
 DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e20f5cb"
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
+
+# 🌟 [수정] 클라우드 서버의 UTC 시간을 완전히 무시하고 오직 한국시간(KST)만 반환하는 전용 함수
+def get_kst_now():
+    return datetime.utcnow() + timedelta(hours=9)
 
 STATION_CUST_MAP = {
     '설화명곡': '0526314773', '월배기지': '0526314773', '서부정류장': '0526314773', 
@@ -134,6 +137,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
         "hourly": "pm2_5",
         "timezone": "Asia/Seoul"
     }
+    # 🌟 타임아웃 10초로 복구 (클라우드 환경 대응)
     try:
         r_a = requests.get(url_a, params=params_a, timeout=10)
         if r_a.status_code == 200:
@@ -182,19 +186,21 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
 
     return env_data
 
-# 🌟 [초강력 패치] 회원님이 발굴하신 sfc_aws_day.php 전용 동네 관측소 다중 스레드 파싱 엔진!
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    yesterday = datetime.now() - timedelta(days=1)
-    if e_dt > yesterday: e_dt = yesterday
+    
+    # 🌟 KST 강제 적용
+    yesterday_dt = get_kst_now() - timedelta(days=1)
+    yesterday_midnight = datetime(yesterday_dt.year, yesterday_dt.month, yesterday_dt.day)
+    
+    if e_dt > yesterday_midnight: e_dt = yesterday_midnight
     if s_dt > e_dt: return {} 
 
     res = {}
     diff = (e_dt - s_dt).days + 1
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
-    # KMA sfc_aws_day.php 에 단일 항목 조회 찌르기
     def fetch_single_element(d_str, tm2, obs, key):
         url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
         for attempt in range(2):
@@ -202,20 +208,18 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
                 r = requests.get(url, headers=headers, verify=False, timeout=5)
                 lines = r.text.split('\n')
                 for line in lines:
-                    # 응답 포맷: "870  28.5" (도움말 제거 disp=0, help=0 설정 시)
                     if line.strip() and not line.startswith('#'):
                         parts = line.split()
                         if len(parts) >= 2 and parts[0] == stn_id:
                             try:
                                 fv = float(parts[1])
-                                if fv > -50.0:  # -99.0 등 기상청 결측코드 필터링
+                                if fv > -50.0:  
                                     return key, fv
                             except: pass
                 break
             except: time.sleep(0.5)
         return key, "--"
 
-    # 여러 날짜, 여러 요소를 병렬 초고속으로 수집
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for i in range(diff):
@@ -224,7 +228,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
             tm2 = curr.strftime("%Y%m%d")
             res[d_str] = {"tmax": "--", "tmin": "--", "humi": "--"}
             
-            # 최고기온, 최저기온, 평균습도 각각 호출
             futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_max", "tmax")))
             futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_min", "tmin")))
             futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "hm_avg", "humi")))
@@ -239,8 +242,12 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
 def fetch_asos_daily(start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    yesterday = datetime.now() - timedelta(days=1)
-    if e_dt > yesterday: e_dt = yesterday
+    
+    # 🌟 KST 강제 적용
+    yesterday_dt = get_kst_now() - timedelta(days=1)
+    yesterday_midnight = datetime(yesterday_dt.year, yesterday_dt.month, yesterday_dt.day)
+    
+    if e_dt > yesterday_midnight: e_dt = yesterday_midnight
     if s_dt > e_dt: return {} 
 
     res = {}
@@ -251,7 +258,7 @@ def fetch_asos_daily(start_date: str, end_date: str):
     
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=headers, verify=False, timeout=30)
+            r = requests.get(url, headers=headers, verify=False, timeout=10)
             r.encoding = 'EUC-KR'
             lines = r.text.split('\n')
             headers_list = []
@@ -282,15 +289,17 @@ def fetch_asos_daily(start_date: str, end_date: str):
                                 "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
                             }
             if res: break 
-        except: time.sleep(1.5)
+        except: time.sleep(1)
     return res
 
 def fetch_kepco_day_lp(cust_no: str, date_str: str):
+    # 🚨 [가장 중요한 패치] 한전은 반드시 11080 포트를 사용해야 합니다! 
+    # (클라우드 환경에 따라 방화벽이 막혀 있을 수 있으나, Render 등에서는 동작 가능성이 높습니다)
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
     params = {"custNo": cust_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
     for _ in range(2):
         try:
-            res = requests.get(url, params=params, verify=False, timeout=5)
+            res = requests.get(url, params=params, verify=False, timeout=10)
             if res.status_code == 200:
                 data = res.json()
                 if "dayLpDataInfoList" in data: return data["dayLpDataInfoList"]
@@ -360,14 +369,12 @@ def get_dashboard_data(station: str, start: str, end: str):
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     openmeteo_data = fetch_openmeteo_env(lat, lon, start, end)
     
-    # 🌟 1. 동네별 기상청 AWS 데이터 호출
     aws_stn = STATION_AWS_MAP.get(station, '143')
     aws_data = fetch_aws_daily_for_dashboard(aws_stn, start, end)
-    
-    # 🌟 2. 대구 대표 기상청 ASOS(143) 데이터 동시 호출 (AWS 습도 보완용)
     asos_data = fetch_asos_daily(start, end)
     
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 🌟 KST 강제 적용
+    today_str = get_kst_now().strftime("%Y-%m-%d")
 
     def process_day(i):
         curr_date = start_dt + timedelta(days=i)
@@ -381,18 +388,16 @@ def get_dashboard_data(station: str, start: str, end: str):
         env_o = openmeteo_data.get(date_str, {})
         env_a = aws_data.get(date_str, {})
         
-        # 1. AWS 데이터 최우선
         tmax = env_a.get("tmax", "--")
         tmin = env_a.get("tmin", "--")
         humi = env_a.get("humi", "--")
         
-        # 2. AWS 결측치 혹은 습도 센서가 없는 동네는 기상청 ASOS(143번) 팩트 데이터로 철통 보완
         if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
         if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
         if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
         
-        # 3. 과거 날짜에는 Open-Meteo 땜빵 원천 차단. 오직 오늘/미래 날짜에만 예보값 허용
-        if date_str >= today_str:
+        # 🌟 확실한 보완: 오늘이거나, 아예 통신이 막혀 다 뚫렸을 경우 Open-Meteo 예보값으로 최종 방어
+        if date_str >= today_str or (tmax == "--" and tmin == "--"):
             if tmax == "--": tmax = env_o.get("tmax", "--")
             if tmin == "--": tmin = env_o.get("tmin", "--")
             if humi == "--": humi = env_o.get("humi", "--")
@@ -428,7 +433,10 @@ def get_dashboard_data(station: str, start: str, end: str):
 
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 🌟 KST 강제 적용
+    kst_now = get_kst_now()
+    today_str = kst_now.strftime("%Y-%m-%d")
+    
     kepco_data = get_kepco_data_for_station(station, today_str)
     day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
@@ -440,7 +448,8 @@ def get_realtime_data(station: str):
             if mm == 60: hh += 1; mm = 0
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
-    now_minutes = datetime.now().hour * 60 + datetime.now().minute
+    # 🌟 KST 강제 적용
+    now_minutes = kst_now.hour * 60 + kst_now.minute
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
         time_m = hh * 60 + mm if hh != 24 else 24 * 60
@@ -451,7 +460,7 @@ def get_realtime_data(station: str):
     return {"station_name": station, "date": today_str, "records": details}
 
 # =========================================================================
-# 🚀 2. 연도별 비교 분석 (수정 금지 원칙 준수 - ASOS 143 유지)
+# 🚀 2. 연도별 비교 분석
 # =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
@@ -744,6 +753,7 @@ def get_bill_data(station: str, year: str):
     if not target_cust:
         return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 없습니다."}
         
+    # 🌟 11080 포트 복구
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getCustBillData.do"
     records = []
     
