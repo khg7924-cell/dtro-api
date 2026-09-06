@@ -1,6 +1,6 @@
-import hashlib
-from datetime import datetime, timedelta
 import os
+import time
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -11,9 +11,10 @@ from sklearn.metrics import r2_score
 import traceback
 import holidays
 import urllib3
-import time
+import re
 from concurrent.futures import ThreadPoolExecutor
 
+# HTTPS 인증서 경고 숨김
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
@@ -28,6 +29,7 @@ app.add_middleware(
 
 DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e20f5cb"
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
+KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
 STATION_CUST_MAP = {
     '설화명곡': '0526314773', '월배기지': '0526314773', '서부정류장': '0526314773', 
@@ -54,36 +56,30 @@ LINE_STATIONS = {
     '3호선': ['칠곡기지', '팔달시장', '남산', '범물기지']
 }
 
-# 🌟 [적용: 1번] 개소별 기상청(AWS/ASOS) 및 에어코리아 측정소 동적 맵핑 딕셔너리 구축
-STATION_LOC_MAP = {
-    '전체': {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'},
-    '1호선': {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'},
-    '2호선': {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'},
-    '3호선': {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'},
-    '종합청사': {'kma_id': '863', 'is_aws': True, 'air_stn': '진천동'},
-    '설화명곡': {'kma_id': '277', 'is_aws': True, 'air_stn': '현풍읍'},
-    '월배기지': {'kma_id': '863', 'is_aws': True, 'air_stn': '진천동'},
-    '서부정류장': {'kma_id': '856', 'is_aws': True, 'air_stn': '대명동'},
-    '반월당': {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'},
-    '신천': {'kma_id': '853', 'is_aws': True, 'air_stn': '신암동'},
-    '방촌': {'kma_id': '853', 'is_aws': True, 'air_stn': '율하동'},
-    '안심': {'kma_id': '853', 'is_aws': True, 'air_stn': '서호동'},
-    '숙천': {'kma_id': '853', 'is_aws': True, 'air_stn': '서호동'},
-    '금락': {'kma_id': '278', 'is_aws': True, 'air_stn': '대명동'}, 
-    '문양기지': {'kma_id': '862', 'is_aws': True, 'air_stn': '이곡동'},
-    '대실': {'kma_id': '862', 'is_aws': True, 'air_stn': '이곡동'},
-    '성서산단': {'kma_id': '863', 'is_aws': True, 'air_stn': '호림동'},
-    '죽전': {'kma_id': '863', 'is_aws': True, 'air_stn': '이곡동'},
-    '반고개': {'kma_id': '855', 'is_aws': True, 'air_stn': '내당동'},
-    '대구은행': {'kma_id': '861', 'is_aws': True, 'air_stn': '수창동'},
-    '만촌': {'kma_id': '861', 'is_aws': True, 'air_stn': '만촌동'},
-    '수성알파시티': {'kma_id': '861', 'is_aws': True, 'air_stn': '지산동'},
-    '사월': {'kma_id': '861', 'is_aws': True, 'air_stn': '지산동'},
-    '영남대': {'kma_id': '278', 'is_aws': True, 'air_stn': '만촌동'},
-    '칠곡기지': {'kma_id': '854', 'is_aws': True, 'air_stn': '태전동'},
-    '팔달시장': {'kma_id': '854', 'is_aws': True, 'air_stn': '노원동'},
-    '남산': {'kma_id': '856', 'is_aws': True, 'air_stn': '대명동'},
-    '범물기지': {'kma_id': '861', 'is_aws': True, 'air_stn': '지산동'},
+STATION_COORD_MAP = {
+    '전체': (35.8714, 128.6014), '1호선': (35.8714, 128.6014), '2호선': (35.8714, 128.6014), '3호선': (35.8714, 128.6014),
+    '종합청사': (35.8200, 128.5300),
+    '설화명곡': (35.7988, 128.4898), '월배기지': (35.8153, 128.5233), '서부정류장': (35.8360, 128.5560),
+    '반월당': (35.8648, 128.5933), '신천': (35.8744, 128.6186), '방촌': (35.8770, 128.6657),
+    '안심': (35.8718, 128.7183), '숙천': (35.8730, 128.7250), '금락': (35.8750, 128.7300),
+    '문양기지': (35.8600, 128.4650), '대실': (35.8580, 128.4810), '성서산단': (35.8520, 128.5080),
+    '죽전': (35.8490, 128.5350), '반고개': (35.8590, 128.5720), '대구은행': (35.8590, 128.6120),
+    '만촌': (35.8580, 128.6430), '수성알파시티': (35.8400, 128.6810), '사월': (35.8350, 128.7050),
+    '영남대': (35.8290, 128.7530), '칠곡기지': (35.9520, 128.5580), '팔달시장': (35.8900, 128.5630),
+    '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
+}
+
+STATION_AWS_MAP = {
+    '설화명곡': '870', '월배기지': '870', '서부정류장': '870', 
+    '반월당': '143', '신천': '827', '방촌': '827', 
+    '안심': '868', '숙천': '868', '금락': '816',
+    '문양기지': '814', '대실': '814', '성서산단': '870', 
+    '죽전': '870', '반고개': '829', '대구은행': '143', 
+    '만촌': '143', '수성알파시티': '143', '사월': '143', 
+    '영남대': '277',
+    '칠곡기지': '854', '팔달시장': '829', '남산': '143', 
+    '범물기지': '143', '종합청사': '143',
+    '전체': '143', '1호선': '143', '2호선': '143', '3호선': '143'
 }
 
 @app.post("/api/upload")
@@ -102,249 +98,209 @@ def load_excel_dataset():
     try:
         xls = pd.ExcelFile(file_path)
         df_main = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
-        df_main['date'] = pd.to_datetime(df_main['date'])
+        date_col = next((c for c in df_main.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
+        df_main['date'] = pd.to_datetime(df_main[date_col]).dt.normalize()
+        
+        all_pm25 = []
+        for sheet in xls.sheet_names:
+            if '초미세먼지' in sheet or '미세먼지' in sheet:
+                df_pm = pd.read_excel(xls, sheet_name=sheet)
+                df_pm = df_pm.iloc[1:].copy() 
+                pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
+                
+                if pm_date_col:
+                    df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
+                    num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
+                    for c in num_cols:
+                        df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
+                    df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
+                    all_pm25.append(df_pm[['date', 'pm25_merged']])
+        
+        if all_pm25:
+            pm25_df = pd.concat(all_pm25).dropna(subset=['date']).groupby('date')['pm25_merged'].mean().reset_index()
+            df_main = df_main.merge(pm25_df, on='date', how='left')
+            df_main['pm25_val'] = df_main['pm25_merged']
+            
         return df_main
-    except Exception: return None
+    except Exception as e: 
+        return None
 
-# 🌟 [적용: 3번] 기상청(KMA) 방재기상관측(AWS) 동적 활용 (실패 시 ASOS 143번 안전 폴백)
-def fetch_kma_daily(start_date: str, end_date: str, kma_id: str, is_aws: bool):
+def fetch_openmeteo_env(lat, lon, start_date, end_date):
+    env_data = {}
+    url_a = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    params_a = {
+        "latitude": lat, "longitude": lon,
+        "start_date": start_date, "end_date": end_date,
+        "hourly": "pm2_5",
+        "timezone": "Asia/Seoul"
+    }
+    try:
+        r_a = requests.get(url_a, params=params_a, timeout=10)
+        if r_a.status_code == 200:
+            data = r_a.json()
+            h_times = data.get("hourly", {}).get("time", [])
+            pm25s = data.get("hourly", {}).get("pm2_5", [])
+            pm_dict = {}
+            for i, ht in enumerate(h_times):
+                d_str = ht[:10]
+                if pm25s[i] is not None:
+                    pm_dict.setdefault(d_str, []).append(pm25s[i])
+            for d_str, p_list in pm_dict.items():
+                env_data.setdefault(d_str, {})["pm25"] = round(sum(p_list)/len(p_list), 1)
+    except: pass
+
+    url_w = "https://api.open-meteo.com/v1/forecast"
+    params_w = {
+        "latitude": lat, "longitude": lon,
+        "start_date": start_date, "end_date": end_date,
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "hourly": "relative_humidity_2m",
+        "timezone": "Asia/Seoul"
+    }
+    try:
+        r_w = requests.get(url_w, params=params_w, timeout=10)
+        if r_w.status_code == 200:
+            data = r_w.json()
+            d_times = data.get("daily", {}).get("time", [])
+            tmaxs = data.get("daily", {}).get("temperature_2m_max", [])
+            tmins = data.get("daily", {}).get("temperature_2m_min", [])
+            h_times = data.get("hourly", {}).get("time", [])
+            humis = data.get("hourly", {}).get("relative_humidity_2m", [])
+            
+            humi_dict = {}
+            for i, ht in enumerate(h_times):
+                d_str = ht[:10]
+                if humis[i] is not None:
+                    humi_dict.setdefault(d_str, []).append(humis[i])
+                    
+            for i, t in enumerate(d_times):
+                env_data.setdefault(t, {})
+                if tmaxs and i < len(tmaxs) and tmaxs[i] is not None: env_data[t]["tmax"] = round(tmaxs[i], 1)
+                if tmins and i < len(tmins) and tmins[i] is not None: env_data[t]["tmin"] = round(tmins[i], 1)
+                if t in humi_dict: env_data[t]["humi"] = round(sum(humi_dict[t])/len(humi_dict[t]), 1)
+    except: pass
+
+    return env_data
+
+# 🌟 [초강력 패치] 회원님이 발굴하신 sfc_aws_day.php 전용 동네 관측소 다중 스레드 파싱 엔진!
+def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    
     yesterday = datetime.now() - timedelta(days=1)
     if e_dt > yesterday: e_dt = yesterday
     if s_dt > e_dt: return {} 
 
     res = {}
-    url = "http://apis.data.go.kr/1360000/AwsDalyInfoService/getWthrDataList" if is_aws else "http://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList"
-    data_cd = "AWS" if is_aws else "ASOS"
+    diff = (e_dt - s_dt).days + 1
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
-    for year in range(s_dt.year, e_dt.year + 1):
-        y_s = max(s_dt, datetime(year, 1, 1)).strftime("%Y%m%d")
-        y_e = min(e_dt, datetime(year, 12, 31)).strftime("%Y%m%d")
-        params = {
-            "serviceKey": DATA_GO_KR_API_KEY, "pageNo": "1", "numOfRows": "999", "dataType": "JSON",
-            "dataCd": data_cd, "dateCd": "DAY", "startDt": y_s, "endDt": y_e, "stnIds": str(kma_id)
-        }
-        
-        success = False
-        for _ in range(2):
+    # KMA sfc_aws_day.php 에 단일 항목 조회 찌르기
+    def fetch_single_element(d_str, tm2, obs, key):
+        url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
+        for attempt in range(2):
             try:
-                r = requests.get(url, params=params, timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
-                    if isinstance(items, dict): items = [items] 
-                    if items:
-                        for item in items:
-                            d_str = item.get("tm") 
-                            if not d_str: continue
-                            row = {}
+                r = requests.get(url, headers=headers, verify=False, timeout=5)
+                lines = r.text.split('\n')
+                for line in lines:
+                    # 응답 포맷: "870  28.5" (도움말 제거 disp=0, help=0 설정 시)
+                    if line.strip() and not line.startswith('#'):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[0] == stn_id:
                             try:
-                                if item.get("maxTa"): row["tmax"] = float(item["maxTa"])
-                                if item.get("minTa"): row["tmin"] = float(item["minTa"])
-                                if item.get("avgTa"): row["tavg"] = float(item["avgTa"])
-                                if item.get("avgRhm"): row["humi"] = float(item["avgRhm"])
-                                res[d_str] = row
+                                fv = float(parts[1])
+                                if fv > -50.0:  # -99.0 등 기상청 결측코드 필터링
+                                    return key, fv
                             except: pass
-                        success = True
-                        break 
-            except: time.sleep(1)
+                break
+            except: time.sleep(0.5)
+        return key, "--"
+
+    # 여러 날짜, 여러 요소를 병렬 초고속으로 수집
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for i in range(diff):
+            curr = s_dt + timedelta(days=i)
+            d_str = curr.strftime("%Y-%m-%d")
+            tm2 = curr.strftime("%Y%m%d")
+            res[d_str] = {"tmax": "--", "tmin": "--", "humi": "--"}
             
-        # 🚨 AWS 서버 점검/권한 에러 발생 시 즉각적으로 대구 대표관측소(ASOS 143)로 우회 호출
-        if not success and is_aws:
-            fb_url = "http://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList"
-            fb_params = {**params, "dataCd": "ASOS", "stnIds": "143"}
-            try:
-                r = requests.get(fb_url, params=fb_params, timeout=10)
-                if r.status_code == 200:
-                    items = r.json().get("response", {}).get("body", {}).get("items", {}).get("item", [])
-                    if isinstance(items, dict): items = [items] 
-                    if items:
-                        for item in items:
-                            d_str = item.get("tm") 
-                            if d_str:
-                                row = {}
-                                if item.get("maxTa"): row["tmax"] = float(item["maxTa"])
-                                if item.get("minTa"): row["tmin"] = float(item["minTa"])
-                                if item.get("avgTa"): row["tavg"] = float(item["avgTa"])
-                                if item.get("avgRhm"): row["humi"] = float(item["avgRhm"])
-                                res[d_str] = row
-            except: pass
+            # 최고기온, 최저기온, 평균습도 각각 호출
+            futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_max", "tmax")))
+            futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_min", "tmin")))
+            futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "hm_avg", "humi")))
+            
+        for d_str, future in futures:
+            key, val = future.result()
+            if val != "--":
+                res[d_str][key] = val
             
     return res
 
-# 🌟 [적용: 4번] 에어코리아 동적 측정소 할당 (실패 시 수창동 안전 폴백)
-def fetch_airkorea_pm25(air_stn_name: str):
+def fetch_asos_daily(start_date: str, end_date: str):
+    s_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    e_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    yesterday = datetime.now() - timedelta(days=1)
+    if e_dt > yesterday: e_dt = yesterday
+    if s_dt > e_dt: return {} 
+
     res = {}
-    url = "http://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty"
-    params = {
-        "serviceKey": DATA_GO_KR_API_KEY, "returnType": "json", "numOfRows": "3000",  
-        "pageNo": "1", "stationName": air_stn_name, "dataTerm": "3MONTH", "ver": "1.3"
-    }
+    y_s = s_dt.strftime("%Y%m%d")
+    y_e = e_dt.strftime("%Y%m%d")
+    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={y_s}&tm2={y_e}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
-    success = False
-    for _ in range(3):
+    for attempt in range(3):
         try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                items = data.get("response", {}).get("body", {}).get("items", [])
-                if items:
-                    daily_pm25_lists = {}
-                    for item in items:
-                        dt_str = item.get("dataTime", "")[:10] 
-                        val = item.get("pm25Value")
-                        if dt_str and val and str(val).strip() not in ["", "-"]:
-                            try:
-                                v = float(val)
-                                if dt_str not in daily_pm25_lists:
-                                    daily_pm25_lists[dt_str] = []
-                                daily_pm25_lists[dt_str].append(v)
-                            except: pass
-                    for dt, vals in daily_pm25_lists.items():
-                        if vals:
-                            res[dt] = round(sum(vals) / len(vals), 1)
-                    if res:
-                        success = True
-                        break
-        except: time.sleep(1)
-        
-    # 🚨 타겟 측정소가 먹통일 경우 즉각 대구 대표 관측소(수창동)로 우회
-    if not success and air_stn_name != "수창동":
-        params["stationName"] = "수창동"
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                items = r.json().get("response", {}).get("body", {}).get("items", [])
-                if items:
-                    daily_pm25_lists = {}
-                    for item in items:
-                        dt_str = item.get("dataTime", "")[:10] 
-                        val = item.get("pm25Value")
-                        if dt_str and val and str(val).strip() not in ["", "-"]:
-                            try:
-                                v = float(val)
-                                if dt_str not in daily_pm25_lists: daily_pm25_lists[dt_str] = []
-                                daily_pm25_lists[dt_str].append(v)
-                            except: pass
-                    for dt, vals in daily_pm25_lists.items():
-                        if vals: res[dt] = round(sum(vals) / len(vals), 1)
-        except: pass
-        
-    return res
-
-# 🌟 [적용: 2번(제외), 4번(적용)] Open-Meteo는 기존 좌표 유지, 에어코리아만 측정소 매핑 연동
-def fetch_today_realtime_weather_and_dust(air_stn_name: str):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    res = {"tmax": "--", "tmin": "--", "humi": "--", "pm25": "--"}
-    
-    om_success = False
-    url_om = "https://api.open-meteo.com/v1/forecast"
-    params_om = {
-        "latitude": 35.8714, "longitude": 128.6014,
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "hourly": "relative_humidity_2m",
-        "timezone": "Asia/Seoul", "start_date": today_str, "end_date": today_str
-    }
-    for _ in range(3):
-        try:
-            r = requests.get(url_om, params=params_om, timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                daily = data.get("daily", {})
-                if daily.get("temperature_2m_max") and daily["temperature_2m_max"][0] is not None:
-                    res["tmax"] = round(daily["temperature_2m_max"][0], 1)
-                    om_success = True
-                if daily.get("temperature_2m_min") and daily["temperature_2m_min"][0] is not None:
-                    res["tmin"] = round(daily["temperature_2m_min"][0], 1)
-                hourly_humi = data.get("hourly", {}).get("relative_humidity_2m", [])
-                valid_humi = [h for h in hourly_humi if h is not None]
-                if valid_humi: res["humi"] = round(sum(valid_humi) / len(valid_humi), 1)
-                if om_success: break
-        except: time.sleep(1)
-
-    if not om_success or res["tmax"] == "--":
-        try:
-            today_kma = datetime.now().strftime("%Y%m%d")
-            obs_time = datetime.now() - timedelta(hours=1)
-            end_hh = "00" if obs_time.strftime("%Y%m%d") != today_kma else obs_time.strftime("%H")
-            url_kma = "http://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList"
-            params_kma = {
-                "serviceKey": DATA_GO_KR_API_KEY, "pageNo": "1", "numOfRows": "24", "dataType": "JSON",
-                "dataCd": "ASOS", "dateCd": "HR", "startDt": today_kma, "startHh": "00", "endDt": today_kma, "endHh": end_hh, "stnIds": "143"
-            }
-            r = requests.get(url_kma, params=params_kma, timeout=5)
-            if r.status_code == 200:
-                items = r.json().get("response", {}).get("body", {}).get("items", {}).get("item", [])
-                if isinstance(items, dict): items = [items]
-                temps, humis = [], []
-                for it in items:
-                    if it.get("ta"): temps.append(float(it["ta"]))
-                    if it.get("hm"): humis.append(float(it["hm"]))
-                if temps:
-                    res["tmax"] = round(max(temps), 1)
-                    res["tmin"] = round(min(temps), 1)
-                if humis:
-                    res["humi"] = round(sum(humis)/len(humis), 1)
-        except: pass
-
-    # 실시간 초미세먼지도 맵핑된 측정소를 조회
-    url_air = "http://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty"
-    params_air = {
-        "serviceKey": DATA_GO_KR_API_KEY, "returnType": "json", "numOfRows": "24", 
-        "pageNo": "1", "stationName": air_stn_name, "dataTerm": "DAILY", "ver": "1.3"
-    }
-    
-    success = False
-    for _ in range(3):
-        try:
-            r = requests.get(url_air, params=params_air, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                items = data.get("response", {}).get("body", {}).get("items", [])
-                if items:
-                    pm25_vals = []
-                    for it in items:
-                        val = it.get("pm25Value")
-                        if val and str(val).strip() not in ["", "-"]:
-                            try: pm25_vals.append(float(val))
-                            except: pass
-                    if pm25_vals:
-                        res["pm25"] = round(sum(pm25_vals)/len(pm25_vals), 1)
-                        success = True
-                    break
-        except: time.sleep(1)
-        
-    if not success and air_stn_name != "수창동":
-        params_air["stationName"] = "수창동"
-        try:
-            r = requests.get(url_air, params=params_air, timeout=5)
-            if r.status_code == 200:
-                items = r.json().get("response", {}).get("body", {}).get("items", [])
-                pm25_vals = [float(it["pm25Value"]) for it in items if it.get("pm25Value") and str(it["pm25Value"]).strip() not in ["", "-"]]
-                if pm25_vals: res["pm25"] = round(sum(pm25_vals)/len(pm25_vals), 1)
-        except: pass
-    
+            r = requests.get(url, headers=headers, verify=False, timeout=30)
+            r.encoding = 'EUC-KR'
+            lines = r.text.split('\n')
+            headers_list = []
+            for line in lines:
+                if line.startswith('#') and ':' in line and '.' in line:
+                    left_side = line.split(':')[0].strip()
+                    if left_side.replace('#', '').strip()[0].isdigit():
+                        col_name = left_side.split('.')[1].strip().split()[0]
+                        if col_name not in headers_list: headers_list.append(col_name)
+                elif line.strip() and not line.startswith('#') and headers_list:
+                    parts = line.split()
+                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
+                        row_dict = dict(zip(headers_list, parts))
+                        date_key = row_dict.get('TM')
+                        if date_key and len(date_key) >= 8:
+                            d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                            def parse_val(v):
+                                if not v: return "--"
+                                try:
+                                    fv = float(v)
+                                    if fv <= -50.0: return "--"
+                                    return fv
+                                except: return "--"
+                            res[d_str] = {
+                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                            }
+            if res: break 
+        except: time.sleep(1.5)
     return res
 
 def fetch_kepco_day_lp(cust_no: str, date_str: str):
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
     params = {"custNo": cust_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
-    for _ in range(3):
+    for _ in range(2):
         try:
-            res = requests.get(url, params=params, verify=False, timeout=8)
+            res = requests.get(url, params=params, verify=False, timeout=5)
             if res.status_code == 200:
                 data = res.json()
                 if "dayLpDataInfoList" in data: return data["dayLpDataInfoList"]
                 elif "header" in data: return []
-        except: time.sleep(1)
+        except: time.sleep(0.5)
     return None
 
 def process_kepco_day_data(day_list, target_meter_no):
     interval_usage = [0.0] * 96
     if not day_list: return interval_usage
-    
     for item in day_list:
         meter_no = item.get("meterNo", "")
         for k, v in item.items():
@@ -356,8 +312,7 @@ def process_kepco_day_data(day_list, target_meter_no):
                         hh = int(time_str[:2])
                         mm = int(time_str[2:])
                         idx = 95 if (hh == 24 and mm == 0) else hh * 4 + (mm // 15) - 1
-                        if 0 <= idx < 96:
-                            interval_usage[idx] += val
+                        if 0 <= idx < 96: interval_usage[idx] += val
                 except: pass
     return interval_usage
 
@@ -365,16 +320,12 @@ def get_kepco_data_for_station(station: str, date_str: str):
     cust_nos = []
     target_meter_no = "전체"
     
-    if station == '전체':
-        cust_nos = list(set(STATION_CUST_MAP.values()))
-    elif station in LINE_STATIONS:
-        cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
-    elif station == '종합청사':
-        cust_nos = [STATION_CUST_MAP['종합청사']]
+    if station == '전체': cust_nos = list(set(STATION_CUST_MAP.values()))
+    elif station in LINE_STATIONS: cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
+    elif station == '종합청사': cust_nos = [STATION_CUST_MAP['종합청사']]
     else:
         cust_nos = [STATION_CUST_MAP.get(station)]
-        if station in LINE_STATIONS['1호선']:
-            target_meter_no = STATION_METER_MAP.get(station, "")
+        if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
             
     total_interval_usage = [0.0] * 96
     
@@ -384,23 +335,17 @@ def get_kepco_data_for_station(station: str, date_str: str):
         if day_list is None: day_list = []
         m_target = target_meter_no if c_no == '0526314773' else "전체"
         int_u = process_kepco_day_data(day_list, m_target)
-        for i, val in enumerate(int_u):
-            total_interval_usage[i] += val
+        for i, val in enumerate(int_u): total_interval_usage[i] += val
             
     total_usage = sum(total_interval_usage)
     max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
     
     details = []
-    for i, val in enumerate(total_interval_usage):
-        hh = i // 4
-        mm = (i % 4) * 15 + 15
-        if mm == 60:
-            hh += 1; mm = 0
-        details.append({
-            "time": f"{hh:02d}:{mm:02d}", 
-            "usage_kwh": round(val, 1), 
-            "peak_kw": round(val * 4, 1)
-        })
+    for m in range(96):
+        hh = m // 4
+        mm = (m % 4) * 15 + 15
+        if mm == 60: hh += 1; mm = 0
+        details.append({ "time": f"{hh:02d}:{mm:02d}", "usage_kwh": round(total_interval_usage[m], 1), "peak_kw": round(total_interval_usage[m] * 4, 1) })
         
     return total_usage, max_peak, details
 
@@ -410,48 +355,50 @@ def get_kepco_data_for_station(station: str, date_str: str):
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
     start_dt, end_dt = datetime.strptime(start, "%Y-%m-%d"), datetime.strptime(end, "%Y-%m-%d")
-    min_allowable_dt = datetime.now() - timedelta(days=93)
-    if start_dt < min_allowable_dt: start_dt = min_allowable_dt
-    diff = min((end_dt - start_dt).days + 1, 93)
+    diff = (end_dt - start_dt).days + 1
     
-    records = []
-    total_usage_all, max_peak_all, total_co2_all = 0.0, 0.0, 0.0
+    lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
+    openmeteo_data = fetch_openmeteo_env(lat, lon, start, end)
     
-    # 🌟 개소별 맵핑정보 할당
-    loc_info = STATION_LOC_MAP.get(station, {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'})
+    # 🌟 1. 동네별 기상청 AWS 데이터 호출
+    aws_stn = STATION_AWS_MAP.get(station, '143')
+    aws_data = fetch_aws_daily_for_dashboard(aws_stn, start, end)
     
-    kma_temp = fetch_kma_daily(start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), loc_info['kma_id'], loc_info['is_aws'])
-    airkorea_pm25 = fetch_airkorea_pm25(loc_info['air_stn'])
+    # 🌟 2. 대구 대표 기상청 ASOS(143) 데이터 동시 호출 (AWS 습도 보완용)
+    asos_data = fetch_asos_daily(start, end)
     
     today_str = datetime.now().strftime("%Y-%m-%d")
-    realtime_env = {}
-    if start_dt.strftime("%Y-%m-%d") <= today_str <= end_dt.strftime("%Y-%m-%d"):
-        realtime_env = fetch_today_realtime_weather_and_dust(loc_info['air_stn'])
-    
-    def process_single_day(i):
+
+    def process_day(i):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        if date_str >= "2026-09-04":
-            kepco_data = get_kepco_data_for_station(station, date_str)
-            day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
-        else:
-            day_usage, day_peak, details = 0.0, 0.0, []
+        if date_str >= "2026-09-04": usage, peak, details = get_kepco_data_for_station(station, date_str)
+        else: usage, peak, details = 0.0, 0.0, []
             
-        day_co2 = day_usage * 0.466 / 1000
+        co2 = usage * 0.466 / 1000
         
-        if date_str == today_str:
-            t_max = realtime_env.get("tmax", "--")
-            t_min = realtime_env.get("tmin", "--")
-            humi = realtime_env.get("humi", "--")
-            pm25_val = realtime_env.get("pm25", "--")
-        else:
-            kma = kma_temp.get(date_str, {})
-            t_max = kma.get("tmax", "--")
-            t_min = kma.get("tmin", "--")
-            humi = kma.get("humi", "--")
-            pm25_val = airkorea_pm25.get(date_str, "--")
-            
+        env_o = openmeteo_data.get(date_str, {})
+        env_a = aws_data.get(date_str, {})
+        
+        # 1. AWS 데이터 최우선
+        tmax = env_a.get("tmax", "--")
+        tmin = env_a.get("tmin", "--")
+        humi = env_a.get("humi", "--")
+        
+        # 2. AWS 결측치 혹은 습도 센서가 없는 동네는 기상청 ASOS(143번) 팩트 데이터로 철통 보완
+        if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
+        if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
+        if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
+        
+        # 3. 과거 날짜에는 Open-Meteo 땜빵 원천 차단. 오직 오늘/미래 날짜에만 예보값 허용
+        if date_str >= today_str:
+            if tmax == "--": tmax = env_o.get("tmax", "--")
+            if tmin == "--": tmin = env_o.get("tmin", "--")
+            if humi == "--": humi = env_o.get("humi", "--")
+        
+        pm25 = env_o.get("pm25", "--")
+
         if not details or len(details) < 96:
             details = []
             for m in range(96):
@@ -459,27 +406,23 @@ def get_dashboard_data(station: str, start: str, end: str):
                 mm = (m % 4) * 15 + 15
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
-        
-        return i, day_usage, day_peak, day_co2, {
-            "date": date_str, "usage_kwh": round(day_usage, 1), "peak_kw": round(day_peak, 1),
-            "co2": round(day_co2, 2), 
-            "temp_max": t_max, "temp_min": t_min, "humidity": humi,
-            "pm25": pm25_val, "details": details 
+
+        return {
+            "date": date_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
+            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
         }
 
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        results = list(executor.map(process_single_day, range(diff)))
-        
-    for i, day_usage, day_peak, day_co2, record in results:
-        records.append(record)
-        total_usage_all += day_usage
-        if day_peak > max_peak_all: max_peak_all = day_peak
-        total_co2_all += day_co2
-        
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        records = list(executor.map(process_day, range(diff)))
+
+    tot_usage = sum(r["usage_kwh"] for r in records)
+    max_peak = max((r["peak_kw"] for r in records), default=0.0)
+    tot_co2 = sum(r["co2"] for r in records)
+
     return {
         "station_name": station, 
-        "mapped_location": f"{station} (기상망:{loc_info['kma_id']} / 대기망:{loc_info['air_stn']})",
-        "summary": { "total_usage": round(total_usage_all), "max_peak": round(max_peak_all, 1), "total_co2": round(total_co2_all, 1) },
+        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
+        "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
         "daily_records": records
     }
 
@@ -487,7 +430,6 @@ def get_dashboard_data(station: str, start: str, end: str):
 def get_realtime_data(station: str):
     today_str = datetime.now().strftime("%Y-%m-%d")
     kepco_data = get_kepco_data_for_station(station, today_str)
-    
     day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
     if not details or len(details) < 96:
@@ -509,7 +451,7 @@ def get_realtime_data(station: str):
     return {"station_name": station, "date": today_str, "records": details}
 
 # =========================================================================
-# 🚀 2. 연도별 비교 분석
+# 🚀 2. 연도별 비교 분석 (수정 금지 원칙 준수 - ASOS 143 유지)
 # =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
@@ -528,8 +470,13 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
             df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
             
-        pass_col = next((c for c in df.columns if '승객수' in c or '수송인원' in c), None)
+        pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
         if pass_col: df['passengers'] = df[pass_col]
+
+        if 'pm25_val' in df.columns:
+            df['is_pm25_bad'] = df['pm25_val'] > 35.0
+        else:
+            df['is_pm25_bad'] = False
 
         df['target_power'] = df['target_power'].fillna(0)
         kr_holidays = holidays.KR()
@@ -558,28 +505,31 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         c_total_off = df_comp['is_offday'].sum()
         off_diff = c_total_off - b_total_off
 
-        # 🌟 맵핑정보 할당 (비교 분석용)
-        loc_info = STATION_LOC_MAP.get(station, {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'})
-        asos_data = fetch_kma_daily("2023-01-01", "2025-12-31", loc_info['kma_id'], loc_info['is_aws'])
+        asos_data = fetch_asos_daily(f"{base_year}-01-01", f"{comp_year}-12-31")
             
         def get_stats(year_str):
             hw, cw = 0, 0
             summer_tmax_sum, summer_tmax_cnt = 0.0, 0
             winter_tmin_sum, winter_tmin_cnt = 0.0, 0
-            if asos_data:
-                for date_str, v in asos_data.items():
-                    if date_str.startswith(year_str):
-                        m = int(date_str[5:7])
-                        tmax = v.get("tmax")
-                        tmin = v.get("tmin")
-                        if tmax is not None:
-                            if tmax >= 33.0: hw += 1
+            for date_str, v in asos_data.items():
+                if date_str.startswith(year_str):
+                    m = int(date_str[5:7])
+                    tmax = v.get("tmax", "--")
+                    tmin = v.get("tmin", "--")
+                    if tmax != "--":
+                        try:
+                            tmax_f = float(tmax)
+                            if tmax_f >= 33.0: hw += 1
                             if m in [6, 7, 8]:
-                                summer_tmax_sum += tmax; summer_tmax_cnt += 1
-                        if tmin is not None:
-                            if tmin <= -10.0: cw += 1
+                                summer_tmax_sum += tmax_f; summer_tmax_cnt += 1
+                        except: pass
+                    if tmin != "--":
+                        try:
+                            tmin_f = float(tmin)
+                            if tmin_f <= -10.0: cw += 1
                             if m in [12, 1, 2]:
-                                winter_tmin_sum += tmin; winter_tmin_cnt += 1
+                                winter_tmin_sum += tmin_f; winter_tmin_cnt += 1
+                        except: pass
             s_avg_tmax = (summer_tmax_sum / summer_tmax_cnt) if summer_tmax_cnt > 0 else 0.0
             w_avg_tmin = (winter_tmin_sum / winter_tmin_cnt) if winter_tmin_cnt > 0 else 0.0
             return hw, cw, s_avg_tmax, w_avg_tmin
@@ -591,10 +541,8 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         s_tmax_diff = c_s_tmax - b_s_tmax
         w_tmin_diff = c_w_tmin - b_w_tmin
 
-        base_pm25, comp_pm25 = 0, 0
-        if 'pm25' in df.columns:
-            base_pm25 = len(df_base[df_base['pm25'] > 35.0])
-            comp_pm25 = len(df_comp[df_comp['pm25'] > 35.0])
+        base_pm25 = int(df_base['is_pm25_bad'].sum())
+        comp_pm25 = int(df_comp['is_pm25_bad'].sum())
         pm_diff = comp_pm25 - base_pm25
 
         base_pass_sum = float(df_base['passengers'].sum()) if pass_col else 0.0
@@ -602,6 +550,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         p_diff = comp_pass_sum - base_pass_sum
 
         ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 전력 수요 AI 심층 분석 리포트\n\n"
+        
+        if not asos_data:
+            ai_report_text += f"⚠️ 현재 기상청 API 허브 서버의 응답이 없어 기상 지표를 불러오지 못했습니다. 백엔드 터미널 창의 로그를 확인해주세요.\n\n"
+        
         ai_report_text += f"[1] 계절별 기후 및 환경 지표 변동 현황\n"
         ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
         ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
@@ -665,7 +617,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df = load_excel_dataset()
         if df is None: return {"error": "과거 다년간의 머신러닝 학습을 위해 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
             
-        pass_col = next((c for c in df.columns if '승객수' in c or '수송인원' in c), None)
+        pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
         if pass_col is None: return {"error": "엑셀 첫번째 시트에 '승객수' 컬럼이 포함되어 있는지 확인해 주세요."}
         
         if station == '전체':
@@ -685,17 +637,18 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['is_weekend'] = df['dayofweek'].isin([5,6]).astype(int)
         df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
-        # 🌟 맵핑정보 할당 (AI 예측용)
-        loc_info = STATION_LOC_MAP.get(station, {'kma_id': '143', 'is_aws': False, 'air_stn': '수창동'})
-        asos_data = fetch_kma_daily("2023-01-01", "2025-12-31", loc_info['kma_id'], loc_info['is_aws'])
+        target_y = int(target_year)
+        asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
-        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax'))
-        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin'))
-        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg'))
-        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi'))
+        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
+        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if asos_data.get(x, {}).get('tmin') != "--" else np.nan)
+        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if asos_data.get(x, {}).get('tavg') != "--" else np.nan)
+        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if asos_data.get(x, {}).get('humi') != "--" else np.nan)
         df['passengers'] = df[pass_col]
 
-        target_y = int(target_year)
+        if 'pm25_val' in df.columns:
+            df['pm25'] = df['pm25_val']
+
         idx_target = df['date'].dt.year == target_y
         for i in df[idx_target].index:
             past_date = df.loc[i, 'date'] - pd.DateOffset(years=1)
@@ -714,7 +667,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_min'] += float(temp_adj)
             
         if df['temp_max'].isna().all():
-            return {"error": "공공데이터포털 서버와 통신할 수 없습니다. 팩트 기반 분석을 위해 가상 기상 데이터를 삽입하지 않습니다."}
+            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 백엔드 로그 확인 후 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
         
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
@@ -804,7 +757,7 @@ def get_bill_data(station: str, year: str):
         }
         for _ in range(3):
             try:
-                res = requests.get(url, params=params, verify=False, timeout=5)
+                res = requests.get(url, params=params, verify=False, timeout=10)
                 if res.status_code == 200:
                     data = res.json()
                     info_list = data.get("custBillDataInfoList")
