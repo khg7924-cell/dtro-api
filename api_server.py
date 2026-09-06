@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -16,6 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 # HTTPS 인증서 경고 숨김
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 🌟 클라우드 서버 배포 시 시간차 해결을 위한 한국 시간(KST) 강제 설정
+KST = timezone(timedelta(hours=9))
 
 app = FastAPI()
 
@@ -182,19 +185,18 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
 
     return env_data
 
-# 🌟 [초강력 패치] 회원님이 발굴하신 sfc_aws_day.php 전용 동네 관측소 다중 스레드 파싱 엔진!
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    yesterday = datetime.now() - timedelta(days=1)
-    if e_dt > yesterday: e_dt = yesterday
+    # 🌟 KST 변수 적용
+    yesterday = datetime.now(KST) - timedelta(days=1)
+    if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
     if s_dt > e_dt: return {} 
 
     res = {}
     diff = (e_dt - s_dt).days + 1
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
-    # KMA sfc_aws_day.php 에 단일 항목 조회 찌르기
     def fetch_single_element(d_str, tm2, obs, key):
         url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
         for attempt in range(2):
@@ -202,20 +204,18 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
                 r = requests.get(url, headers=headers, verify=False, timeout=5)
                 lines = r.text.split('\n')
                 for line in lines:
-                    # 응답 포맷: "870  28.5" (도움말 제거 disp=0, help=0 설정 시)
                     if line.strip() and not line.startswith('#'):
                         parts = line.split()
                         if len(parts) >= 2 and parts[0] == stn_id:
                             try:
                                 fv = float(parts[1])
-                                if fv > -50.0:  # -99.0 등 기상청 결측코드 필터링
+                                if fv > -50.0:  
                                     return key, fv
                             except: pass
                 break
             except: time.sleep(0.5)
         return key, "--"
 
-    # 여러 날짜, 여러 요소를 병렬 초고속으로 수집
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for i in range(diff):
@@ -224,7 +224,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
             tm2 = curr.strftime("%Y%m%d")
             res[d_str] = {"tmax": "--", "tmin": "--", "humi": "--"}
             
-            # 최고기온, 최저기온, 평균습도 각각 호출
             futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_max", "tmax")))
             futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_min", "tmin")))
             futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "hm_avg", "humi")))
@@ -239,8 +238,9 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
 def fetch_asos_daily(start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    yesterday = datetime.now() - timedelta(days=1)
-    if e_dt > yesterday: e_dt = yesterday
+    # 🌟 KST 변수 적용
+    yesterday = datetime.now(KST) - timedelta(days=1)
+    if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
     if s_dt > e_dt: return {} 
 
     res = {}
@@ -360,14 +360,12 @@ def get_dashboard_data(station: str, start: str, end: str):
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     openmeteo_data = fetch_openmeteo_env(lat, lon, start, end)
     
-    # 🌟 1. 동네별 기상청 AWS 데이터 호출
     aws_stn = STATION_AWS_MAP.get(station, '143')
     aws_data = fetch_aws_daily_for_dashboard(aws_stn, start, end)
-    
-    # 🌟 2. 대구 대표 기상청 ASOS(143) 데이터 동시 호출 (AWS 습도 보완용)
     asos_data = fetch_asos_daily(start, end)
     
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 🌟 KST 변수 적용
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
 
     def process_day(i):
         curr_date = start_dt + timedelta(days=i)
@@ -381,17 +379,14 @@ def get_dashboard_data(station: str, start: str, end: str):
         env_o = openmeteo_data.get(date_str, {})
         env_a = aws_data.get(date_str, {})
         
-        # 1. AWS 데이터 최우선
         tmax = env_a.get("tmax", "--")
         tmin = env_a.get("tmin", "--")
         humi = env_a.get("humi", "--")
         
-        # 2. AWS 결측치 혹은 습도 센서가 없는 동네는 기상청 ASOS(143번) 팩트 데이터로 철통 보완
         if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
         if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
         if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
         
-        # 3. 과거 날짜에는 Open-Meteo 땜빵 원천 차단. 오직 오늘/미래 날짜에만 예보값 허용
         if date_str >= today_str:
             if tmax == "--": tmax = env_o.get("tmax", "--")
             if tmin == "--": tmin = env_o.get("tmin", "--")
@@ -428,7 +423,8 @@ def get_dashboard_data(station: str, start: str, end: str):
 
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 🌟 KST 변수 적용
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
     kepco_data = get_kepco_data_for_station(station, today_str)
     day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
@@ -440,7 +436,8 @@ def get_realtime_data(station: str):
             if mm == 60: hh += 1; mm = 0
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
-    now_minutes = datetime.now().hour * 60 + datetime.now().minute
+    # 🌟 KST 변수 적용
+    now_minutes = datetime.now(KST).hour * 60 + datetime.now(KST).minute
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
         time_m = hh * 60 + mm if hh != 24 else 24 * 60
@@ -451,7 +448,7 @@ def get_realtime_data(station: str):
     return {"station_name": station, "date": today_str, "records": details}
 
 # =========================================================================
-# 🚀 2. 연도별 비교 분석 (수정 금지 원칙 준수 - ASOS 143 유지)
+# 🚀 2. 연도별 비교 분석
 # =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
