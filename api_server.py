@@ -1,9 +1,11 @@
 import os
 import time
+import io
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import xgboost as xgb
@@ -11,7 +13,6 @@ from sklearn.metrics import r2_score
 import traceback
 import holidays
 import urllib3
-import re
 from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -30,7 +31,6 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
-# 🌟 [수정] 클라우드 서버의 UTC 시간을 완전히 무시하고 오직 한국시간(KST)만 반환하는 전용 함수
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
 
@@ -100,32 +100,34 @@ def load_excel_dataset():
     if not os.path.exists(file_path): return None
     try:
         xls = pd.ExcelFile(file_path)
-        df_main = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+        df_main = pd.read_excel(xls, sheet_name=0)
         date_col = next((c for c in df_main.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df_main['date'] = pd.to_datetime(df_main[date_col]).dt.normalize()
         
-        all_pm25 = []
-        for sheet in xls.sheet_names:
-            if '초미세먼지' in sheet or '미세먼지' in sheet:
-                df_pm = pd.read_excel(xls, sheet_name=sheet)
-                df_pm = df_pm.iloc[1:].copy() 
-                pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
-                
-                if pm_date_col:
-                    df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
-                    num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
-                    for c in num_cols:
-                        df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
-                    df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
-                    all_pm25.append(df_pm[['date', 'pm25_merged']])
-        
-        if all_pm25:
-            pm25_df = pd.concat(all_pm25).dropna(subset=['date']).groupby('date')['pm25_merged'].mean().reset_index()
-            df_main = df_main.merge(pm25_df, on='date', how='left')
-            df_main['pm25_val'] = df_main['pm25_merged']
+        if 'pm25_val' not in df_main.columns:
+            all_pm25 = []
+            for sheet in xls.sheet_names:
+                if '초미세먼지' in sheet or '미세먼지' in sheet:
+                    df_pm = pd.read_excel(xls, sheet_name=sheet)
+                    df_pm = df_pm.iloc[1:].copy() 
+                    pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
+                    
+                    if pm_date_col:
+                        df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
+                        num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
+                        for c in num_cols:
+                            df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
+                        df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
+                        all_pm25.append(df_pm[['date', 'pm25_merged']])
             
+            if all_pm25:
+                pm25_df = pd.concat(all_pm25).dropna(subset=['date']).groupby('date')['pm25_merged'].mean().reset_index()
+                df_main = df_main.merge(pm25_df, on='date', how='left')
+                df_main['pm25_val'] = df_main['pm25_merged']
+                
         return df_main
     except Exception as e: 
+        print(f"엑셀 로드 에러: {e}")
         return None
 
 def fetch_openmeteo_env(lat, lon, start_date, end_date):
@@ -137,7 +139,6 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
         "hourly": "pm2_5",
         "timezone": "Asia/Seoul"
     }
-    # 🌟 타임아웃 10초로 복구 (클라우드 환경 대응)
     try:
         r_a = requests.get(url_a, params=params_a, timeout=10)
         if r_a.status_code == 200:
@@ -189,12 +190,8 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    
-    # 🌟 KST 강제 적용
-    yesterday_dt = get_kst_now() - timedelta(days=1)
-    yesterday_midnight = datetime(yesterday_dt.year, yesterday_dt.month, yesterday_dt.day)
-    
-    if e_dt > yesterday_midnight: e_dt = yesterday_midnight
+    yesterday = get_kst_now() - timedelta(days=1)
+    if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
     if s_dt > e_dt: return {} 
 
     res = {}
@@ -242,12 +239,8 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
 def fetch_asos_daily(start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    
-    # 🌟 KST 강제 적용
-    yesterday_dt = get_kst_now() - timedelta(days=1)
-    yesterday_midnight = datetime(yesterday_dt.year, yesterday_dt.month, yesterday_dt.day)
-    
-    if e_dt > yesterday_midnight: e_dt = yesterday_midnight
+    yesterday = get_kst_now() - timedelta(days=1)
+    if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
     if s_dt > e_dt: return {} 
 
     res = {}
@@ -293,8 +286,6 @@ def fetch_asos_daily(start_date: str, end_date: str):
     return res
 
 def fetch_kepco_day_lp(cust_no: str, date_str: str):
-    # 🚨 [가장 중요한 패치] 한전은 반드시 11080 포트를 사용해야 합니다! 
-    # (클라우드 환경에 따라 방화벽이 막혀 있을 수 있으나, Render 등에서는 동작 가능성이 높습니다)
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
     params = {"custNo": cust_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
     for _ in range(2):
@@ -373,7 +364,6 @@ def get_dashboard_data(station: str, start: str, end: str):
     aws_data = fetch_aws_daily_for_dashboard(aws_stn, start, end)
     asos_data = fetch_asos_daily(start, end)
     
-    # 🌟 KST 강제 적용
     today_str = get_kst_now().strftime("%Y-%m-%d")
 
     def process_day(i):
@@ -396,7 +386,6 @@ def get_dashboard_data(station: str, start: str, end: str):
         if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
         if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
         
-        # 🌟 확실한 보완: 오늘이거나, 아예 통신이 막혀 다 뚫렸을 경우 Open-Meteo 예보값으로 최종 방어
         if date_str >= today_str or (tmax == "--" and tmin == "--"):
             if tmax == "--": tmax = env_o.get("tmax", "--")
             if tmin == "--": tmin = env_o.get("tmin", "--")
@@ -433,7 +422,6 @@ def get_dashboard_data(station: str, start: str, end: str):
 
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
-    # 🌟 KST 강제 적용
     kst_now = get_kst_now()
     today_str = kst_now.strftime("%Y-%m-%d")
     
@@ -448,7 +436,6 @@ def get_realtime_data(station: str):
             if mm == 60: hh += 1; mm = 0
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
-    # 🌟 KST 강제 적용
     now_minutes = kst_now.hour * 60 + kst_now.minute
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
@@ -740,7 +727,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         return {"error": f"서버 내부 오류로 예측에 실패했습니다: {str(e)}\n\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 4. 전기요금 청구정보 (월별) API 연동
+# 🚀 4. 전기요금 청구정보
 # =========================================================================
 @app.get("/api/bill/{station}")
 def get_bill_data(station: str, year: str):
@@ -753,17 +740,13 @@ def get_bill_data(station: str, year: str):
     if not target_cust:
         return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 없습니다."}
         
-    # 🌟 11080 포트 복구
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getCustBillData.do"
     records = []
     
     for m in range(1, 13):
         data_month = f"{year}{m:02d}"
         params = {
-            "custNo": target_cust,
-            "dataMonth": data_month,
-            "serviceKey": KEPCO_API_KEY,
-            "returnType": "02"
+            "custNo": target_cust, "dataMonth": data_month, "serviceKey": KEPCO_API_KEY, "returnType": "02"
         }
         for _ in range(3):
             try:
@@ -775,13 +758,11 @@ def get_bill_data(station: str, year: str):
                         for item in info_list:
                             def parse_float(val):
                                 try:
-                                    if isinstance(val, str):
-                                        val = val.replace(',', '').strip()
+                                    if isinstance(val, str): val = val.replace(',', '').strip()
                                     return float(val)
                                 except: return 0.0
                             
                             lower_item = {k.lower(): v for k, v in item.items()}
-                                
                             mapped = {
                                 "bill_ym": str(lower_item.get("billym", lower_item.get("bill_ym", ""))),
                                 "mr_ymd": str(lower_item.get("mrymd", lower_item.get("mr_ymd", ""))),
@@ -799,7 +780,110 @@ def get_bill_data(station: str, year: str):
                             }
                             records.append(mapped)
                     break
-            except:
-                time.sleep(1)
+            except: time.sleep(1)
             
     return {"station_name": station, "cust_no": target_cust, "records": records}
+
+
+# =========================================================================
+# 🚀 5. [단일 백업 아키텍처] 기존 엑셀 탭 100% 보존 + 한전 전력량만 누적 수집
+# =========================================================================
+@app.get("/api/backup")
+def export_master_backup():
+    file_path = "uploaded_dataset.xlsx"
+    if not os.path.exists(file_path):
+        return {"error": "기본이 될 과거 데이터베이스(Excel)가 업로드되어 있지 않습니다."}
+
+    try:
+        # 1. 사용자가 업로드한 엑셀 파일의 '모든 시트'를 메모리로 그대로 퍼옵니다.
+        xls_dict = pd.read_excel(file_path, sheet_name=None)
+        sheet_names = list(xls_dict.keys())
+        main_sheet_name = sheet_names[0] # 첫 번째 시트 (전력량 및 승객수)
+        df = xls_dict[main_sheet_name]
+
+        date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
+        df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
+
+        # 어제 자정 기준
+        yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        last_date = pd.to_datetime(df[date_col].max())
+        
+        if pd.isna(last_date):
+            return {"error": "엑셀 파일에서 날짜 데이터를 찾을 수 없습니다."}
+            
+        new_rows = []
+        curr_date = last_date + timedelta(days=1)
+        
+        # 2. 마지막 작성일 다음날부터 어제까지 한전 API로 비어있는 날짜만 수집합니다.
+        days_to_fetch = (yesterday - curr_date).days + 1
+        
+        if days_to_fetch > 0:
+            if days_to_fetch > 30: 
+                days_to_fetch = 30 # 서버 과부하 방지 (최대 30일치씩만 백업 권장)
+                
+            col_map = {}
+            for c in df.columns:
+                for st in STATION_CUST_MAP.keys():
+                    if st != '전체' and st in str(c):
+                        if 'total_kwh' in str(c): col_map.setdefault(st, {})['kwh'] = c
+                        if 'peak_kw' in str(c): col_map.setdefault(st, {})['peak'] = c
+                        
+            for i in range(days_to_fetch):
+                target_dt = curr_date + timedelta(days=i)
+                d_str = target_dt.strftime("%Y-%m-%d")
+                row = {date_col: target_dt}
+                
+                # 🌟 회원님 아이디어 적용: 기상은 ASOS로 대체되므로 날씨/미세먼지 수집 코드를 완전히 날렸습니다.
+                # 오직 '한전 전력량(kWh)'과 '최대수요(peak)'만 수집합니다.
+                def fetch_st(st):
+                    usage, peak, _ = get_kepco_data_for_station(st, d_str)
+                    return st, usage, peak
+                    
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    results = list(executor.map(fetch_st, [s for s in STATION_CUST_MAP.keys() if s != '전체']))
+                    
+                for st, usage, peak in results:
+                    if st in col_map:
+                        if 'kwh' in col_map[st]: row[col_map[st]['kwh']] = usage
+                        if 'peak' in col_map[st]: row[col_map[st]['peak']] = peak
+                
+                new_rows.append(row)
+                
+        # 3. 수집된 데이터를 메인 시트 밑바닥에 이어 붙입니다.
+        if new_rows:
+            df_new = pd.DataFrame(new_rows)
+            df = pd.concat([df, df_new], ignore_index=True)
+            
+            # 승객수와 미세먼지는 사용자가 수동으로 채우기 위해 빈칸으로 둡니다.
+            # (단, 휴일 여부는 자동으로 계산해서 넣어줍니다)
+            holi_col = next((c for c in df.columns if '휴일' in str(c)), None)
+            if holi_col:
+                kr_holidays = holidays.KR()
+                df[holi_col] = df[date_col].apply(lambda x: 1 if x.dayofweek >= 5 or x in kr_holidays else 0)
+
+        if df[date_col].dt.tz is not None:
+            df[date_col] = df[date_col].dt.tz_localize(None)
+
+        # 4. 업데이트된 메인 시트를 딕셔너리에 다시 덮어씁니다.
+        xls_dict[main_sheet_name] = df
+
+        # 5. 기존 초미세먼지 탭들을 하나도 잃어버리지 않고, 엑셀 파일로 다시 통째로 굽습니다!
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            for sheet_name, sheet_df in xls_dict.items():
+                if date_col in sheet_df.columns and pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
+                    sheet_df[date_col] = sheet_df[date_col].dt.strftime('%Y-%m-%d')
+                if '일자' in sheet_df.columns and pd.api.types.is_datetime64_any_dtype(sheet_df['일자']):
+                    sheet_df['일자'] = sheet_df['일자'].dt.strftime('%Y-%m-%d')
+                
+                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+        output.seek(0)
+        
+        return StreamingResponse(
+            output, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=DTRO_Master_Backup_{yesterday.strftime('%Y%m%d')}.xlsx"}
+        )
+    except Exception as e:
+        return {"error": f"백업 파일 생성 중 서버 에러 발생: {str(e)}"}
