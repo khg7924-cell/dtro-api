@@ -39,7 +39,6 @@ http_session.verify = False
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 
-# 🌟 [초고속 최적화 핵심] 무거운 엑셀 파일을 RAM(메모리)에 캐싱합니다.
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
 def get_kst_now():
@@ -114,7 +113,6 @@ def load_excel_dataset():
     file_path = "uploaded_dataset.xlsx"
     if not os.path.exists(file_path): return None
     
-    # 🌟 엑셀 캐싱 시스템: 파일이 변경되지 않았다면 기존 메모리 데이터를 0.001초만에 즉시 반환
     mtime = os.path.getmtime(file_path)
     if GLOBAL_EXCEL_CACHE["mtime"] == mtime and GLOBAL_EXCEL_CACHE["df"] is not None:
         return GLOBAL_EXCEL_CACHE["df"].copy()
@@ -143,7 +141,6 @@ def load_excel_dataset():
             df_main = df_main.merge(pm25_df, on='date', how='left')
             df_main['pm25_val'] = df_main['pm25_merged']
             
-        # 처음 한 번 읽은 결과를 영구 저장
         GLOBAL_EXCEL_CACHE["df"] = df_main
         GLOBAL_EXCEL_CACHE["mtime"] = mtime
         return df_main.copy()
@@ -227,7 +224,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
             except: time.sleep(0.2)
         return key, "--"
 
-    # 스레드 제한으로 서버 다운 방지 (기존 20 -> 10)
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for i in range(diff):
@@ -349,7 +345,6 @@ def get_kepco_data_for_station(station: str, date_str: str):
         m_target = target_meter_no if c_no == '0526314773' else "전체"
         return process_kepco_day_data(day_list, m_target)
 
-    # 이너 스레드 풀 제한하여 CPU 병목 방지
     with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(fetch_and_process, cust_nos))
         
@@ -370,7 +365,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (기상청 API 3종 병렬 호출 + 엑셀 메모리 캐시 적용)
+# 🚀 1. 통합 대시보드 
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -464,7 +459,6 @@ def get_dashboard_data(station: str, start: str, end: str):
             "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
         }
 
-    # 아우터 스레드 제한하여 서버 CPU 보호 (기존 30 -> 15)
     with ThreadPoolExecutor(max_workers=15) as executor:
         records = list(executor.map(process_day, range(diff)))
 
@@ -820,7 +814,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         return {"error": f"서버 내부 오류로 예측에 실패했습니다: {str(e)}\n\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 4. 전기요금 청구정보
+# 🚀 4. 전기요금 청구정보 (지침 정보 추가 수집)
 # =========================================================================
 @app.get("/api/bill/{station}")
 def get_bill_data(station: str, year: str):
@@ -868,6 +862,10 @@ def get_bill_data(station: str, year: str):
                                 "lload_usekwh": parse_float(lower_item.get("lloadusekwh", lower_item.get("lload_usekwh"))),
                                 "mload_usekwh": parse_float(lower_item.get("mloadusekwh", lower_item.get("mload_usekwh"))),
                                 "maxload_usekwh": parse_float(lower_item.get("maxloadusekwh", lower_item.get("maxload_usekwh"))),
+                                # 🌟 [신규] 지침 정보 파싱 추가
+                                "lload_needle": parse_float(lower_item.get("lloadneedle", lower_item.get("lload_needle"))),
+                                "mload_needle": parse_float(lower_item.get("mloadneedle", lower_item.get("mload_needle"))),
+                                "maxload_needle": parse_float(lower_item.get("maxloadneedle", lower_item.get("maxload_needle"))),
                                 "ji_pwrfact": parse_float(lower_item.get("jipwrfact", lower_item.get("ji_pwrfact"))),
                                 "jn_pwrfact": parse_float(lower_item.get("jnpwrfact", lower_item.get("jn_pwrfact")))
                             }
@@ -879,7 +877,7 @@ def get_bill_data(station: str, year: str):
 
 
 # =========================================================================
-# 🚀 5. [단일 백업 아키텍처] 진짜 데이터가 있는 마지막 날짜를 찾는 스마트 엔진
+# 🚀 5. [단일 백업 아키텍처]
 # =========================================================================
 @app.get("/api/backup")
 def export_master_backup():
