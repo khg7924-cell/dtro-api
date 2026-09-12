@@ -39,6 +39,9 @@ http_session.verify = False
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 
+# 🌟 [초고속 최적화 핵심] 무거운 엑셀 파일을 RAM(메모리)에 캐싱합니다.
+GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
+
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
 
@@ -110,6 +113,12 @@ def check_dataset_status():
 def load_excel_dataset():
     file_path = "uploaded_dataset.xlsx"
     if not os.path.exists(file_path): return None
+    
+    # 🌟 엑셀 캐싱 시스템: 파일이 변경되지 않았다면 기존 메모리 데이터를 0.001초만에 즉시 반환
+    mtime = os.path.getmtime(file_path)
+    if GLOBAL_EXCEL_CACHE["mtime"] == mtime and GLOBAL_EXCEL_CACHE["df"] is not None:
+        return GLOBAL_EXCEL_CACHE["df"].copy()
+        
     try:
         xls = pd.ExcelFile(file_path)
         df_main = pd.read_excel(xls, sheet_name=0)
@@ -134,8 +143,12 @@ def load_excel_dataset():
             df_main = df_main.merge(pm25_df, on='date', how='left')
             df_main['pm25_val'] = df_main['pm25_merged']
             
-        return df_main
-    except Exception: return None
+        # 처음 한 번 읽은 결과를 영구 저장
+        GLOBAL_EXCEL_CACHE["df"] = df_main
+        GLOBAL_EXCEL_CACHE["mtime"] = mtime
+        return df_main.copy()
+    except Exception: 
+        return None
 
 def fetch_openmeteo_env(lat, lon, start_date, end_date):
     env_data = {}
@@ -214,7 +227,8 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
             except: time.sleep(0.2)
         return key, "--"
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    # 스레드 제한으로 서버 다운 방지 (기존 20 -> 10)
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for i in range(diff):
             curr = s_dt + timedelta(days=i)
@@ -335,7 +349,8 @@ def get_kepco_data_for_station(station: str, date_str: str):
         m_target = target_meter_no if c_no == '0526314773' else "전체"
         return process_kepco_day_data(day_list, m_target)
 
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    # 이너 스레드 풀 제한하여 CPU 병목 방지
+    with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(fetch_and_process, cust_nos))
         
     for int_u in results:
@@ -355,7 +370,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (기상청 API 3종 병렬 동시 호출 최적화)
+# 🚀 1. 통합 대시보드 (기상청 API 3종 병렬 호출 + 엑셀 메모리 캐시 적용)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -388,7 +403,6 @@ def get_dashboard_data(station: str, start: str, end: str):
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     aws_stn = STATION_AWS_MAP.get(station, '143')
     
-    # 🌟 핵심 최적화: 날씨 API 3가지를 스레드로 동시에 찌릅니다.
     with ThreadPoolExecutor(max_workers=3) as weather_exec:
         future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
         future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
@@ -450,7 +464,8 @@ def get_dashboard_data(station: str, start: str, end: str):
             "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
         }
 
-    with ThreadPoolExecutor(max_workers=30) as executor:
+    # 아우터 스레드 제한하여 서버 CPU 보호 (기존 30 -> 15)
+    with ThreadPoolExecutor(max_workers=15) as executor:
         records = list(executor.map(process_day, range(diff)))
 
     tot_usage = sum(r["usage_kwh"] for r in records)
