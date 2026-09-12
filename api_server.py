@@ -31,14 +31,11 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
-# 🌟 1. 초고속 연결 풀링 (매번 끊지 않고 재사용하여 통신 속도 극대화)
 http_session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200)
 http_session.mount('https://', adapter)
 http_session.verify = False
 
-# 🌟 2. 서버 메모리 자동 캐시 (수동 엑셀 업로드 불필요)
-# 한번 수집된 과거 데이터는 서버가 켜져있는 동안 메모리에 저장되어 즉시 반환됩니다.
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 
@@ -283,7 +280,6 @@ def fetch_asos_daily(start_date: str, end_date: str):
 
 def fetch_kepco_day_lp(cust_no: str, date_str: str):
     cache_key = f"{cust_no}_{date_str}"
-    # 서버 메모리에 저장된 데이터가 있으면 0.001초 만에 반환
     if cache_key in GLOBAL_KEPCO_CACHE: return GLOBAL_KEPCO_CACHE[cache_key]
 
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
@@ -295,7 +291,6 @@ def fetch_kepco_day_lp(cust_no: str, date_str: str):
                 data = res.json()
                 if "dayLpDataInfoList" in data: 
                     result = data["dayLpDataInfoList"]
-                    # 과거 데이터인 경우 서버 메모리에 영구 저장
                     if date_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_KEPCO_CACHE[cache_key] = result
                     return result
                 elif "header" in data: return []
@@ -320,7 +315,6 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
-# 🌟 3. 한전 API도 개소별로 한 번에 동시 찌르기 (다중 스레드 병렬화)
 def get_kepco_data_for_station(station: str, date_str: str):
     cust_nos = []
     target_meter_no = "전체"
@@ -341,7 +335,6 @@ def get_kepco_data_for_station(station: str, date_str: str):
         m_target = target_meter_no if c_no == '0526314773' else "전체"
         return process_kepco_day_data(day_list, m_target)
 
-    # 15개의 작업자가 24개 역사를 한방에 긁어옵니다. (속도 15배 향상)
     with ThreadPoolExecutor(max_workers=15) as executor:
         results = list(executor.map(fetch_and_process, cust_nos))
         
@@ -362,14 +355,13 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드
+# 🚀 1. 통합 대시보드 (기상청 API 3종 병렬 동시 호출 최적화)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
     start_dt, end_dt = datetime.strptime(start, "%Y-%m-%d"), datetime.strptime(end, "%Y-%m-%d")
     diff = (end_dt - start_dt).days + 1
     
-    # 엑셀 캐싱 (수동 엑셀이 있는 경우 엑셀을 우선 적용)
     df = load_excel_dataset()
     excel_cache = {}
     if df is not None:
@@ -394,11 +386,17 @@ def get_dashboard_data(station: str, start: str, end: str):
                     excel_cache[d_str] = {"usage_kwh": usage, "peak_kw": peak, "pm25": pm25_val}
 
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
-    openmeteo_data = fetch_openmeteo_env(lat, lon, start, end)
-    
     aws_stn = STATION_AWS_MAP.get(station, '143')
-    aws_data = fetch_aws_daily_for_dashboard(aws_stn, start, end)
-    asos_data = fetch_asos_daily(start, end)
+    
+    # 🌟 핵심 최적화: 날씨 API 3가지를 스레드로 동시에 찌릅니다.
+    with ThreadPoolExecutor(max_workers=3) as weather_exec:
+        future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+        future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+        future_asos = weather_exec.submit(fetch_asos_daily, start, end)
+        
+        openmeteo_data = future_om.result()
+        aws_data = future_aws.result()
+        asos_data = future_asos.result()
     
     today_str = get_kst_now().strftime("%Y-%m-%d")
 
@@ -406,7 +404,6 @@ def get_dashboard_data(station: str, start: str, end: str):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        # 엑셀에 데이터가 있으면 한전 API 스킵
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
@@ -867,7 +864,7 @@ def get_bill_data(station: str, year: str):
 
 
 # =========================================================================
-# 🚀 5. [단일 백업 아키텍처]
+# 🚀 5. [단일 백업 아키텍처] 진짜 데이터가 있는 마지막 날짜를 찾는 스마트 엔진
 # =========================================================================
 @app.get("/api/backup")
 def export_master_backup():
