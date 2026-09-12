@@ -800,15 +800,18 @@ def export_master_backup():
 
         date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
+        
+        # 🌟 [유령 행 제거] 엑셀에서 날짜를 지울 때 남은 보이지 않는 빈 행(NaT)을 완벽히 청소합니다.
+        df = df.dropna(subset=[date_col])
 
         # 어제 자정 기준
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # 🌟 [수정 완료] 결측치 따위는 무시하고, 엑셀에 적혀있는 '물리적인 마지막 날짜'를 무조건 기준점으로 잡습니다.
+        # 엑셀에 적혀있는 '물리적인 마지막 날짜'를 무조건 기준점으로 잡습니다.
         last_date = pd.to_datetime(df[date_col].max())
             
         if pd.isna(last_date):
-            return {"error": "엑셀 파일에서 날짜 데이터를 찾을 수 없습니다."}
+            return {"error": "엑셀 파일에서 유효한 날짜 데이터를 찾을 수 없습니다."}
             
         new_rows = []
         curr_date = last_date + timedelta(days=1)
@@ -853,11 +856,14 @@ def export_master_backup():
             df.sort_values(by=date_col, inplace=True)
             df.reset_index(drop=True, inplace=True)
 
-        # 🌟 [대한민국 공휴일 자동화 패치]
-        # 휴일 컬럼을 찾거나 없으면 생성해서, 주말(토,일)과 한국 공휴일에 무조건 1을 박아넣습니다.
+        # 🌟 [대한민국 공휴일 자동화 & NaT 방어 패치]
         holi_col = next((c for c in df.columns if '휴일' in str(c) or 'is_holiday' in str(c)), '휴일\n(is_holiday)')
         kr_holidays = holidays.KR()
-        df[holi_col] = df[date_col].apply(lambda x: 1 if x.dayofweek >= 5 or x.strftime('%Y-%m-%d') in kr_holidays else 0)
+        
+        # pd.notna(x) 조건을 추가하여 날짜가 확실히 있는 행에만 공휴일을 계산합니다.
+        df[holi_col] = df[date_col].apply(
+            lambda x: 1 if pd.notna(x) and (x.dayofweek >= 5 or x.strftime('%Y-%m-%d') in kr_holidays) else 0
+        )
 
         # 타임존 이슈 방지
         if df[date_col].dt.tz is not None:
@@ -868,11 +874,16 @@ def export_master_backup():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for sheet_name, sheet_df in xls_dict.items():
-                # 날짜 포맷 깔끔하게 정리
-                if date_col in sheet_df.columns and pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
-                    sheet_df[date_col] = sheet_df[date_col].dt.strftime('%Y-%m-%d')
-                if '일자' in sheet_df.columns and pd.api.types.is_datetime64_any_dtype(sheet_df['일자']):
-                    sheet_df['일자'] = sheet_df['일자'].dt.strftime('%Y-%m-%d')
+                # 엑셀 저장 시에도 빈 행 방지 및 날짜 포맷 정리
+                if date_col in sheet_df.columns:
+                    sheet_df = sheet_df.dropna(subset=[date_col])
+                    if pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
+                        sheet_df[date_col] = sheet_df[date_col].dt.strftime('%Y-%m-%d')
+                        
+                if '일자' in sheet_df.columns:
+                    sheet_df = sheet_df.dropna(subset=['일자'])
+                    if pd.api.types.is_datetime64_any_dtype(sheet_df['일자']):
+                        sheet_df['일자'] = sheet_df['일자'].dt.strftime('%Y-%m-%d')
                 
                 sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
