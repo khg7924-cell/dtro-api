@@ -603,7 +603,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (시뮬레이션 변수 확장 및 결측치 완벽 방어)
+# 🚀 3. AI 수요 예측 (변수 그룹핑 로직 반영)
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0):
@@ -627,7 +627,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         
         target_y = int(target_year)
         
-        # 🌟 핵심 픽스 1: 회원님이 엑셀 꼬리를 잘랐어도, 2026년 365일 날짜 뼈대를 강제로 생성합니다.
         start_dt = pd.to_datetime(f"{target_y}-01-01")
         end_dt = pd.to_datetime(f"{target_y}-12-31")
         full_year_dates = pd.date_range(start=start_dt, end=end_dt)
@@ -658,7 +657,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if 'pm25_val' in df.columns:
             df['pm25'] = df['pm25_val']
 
-        # 직전 연도 동기 데이터로 미래(타겟 연도) 빈칸 채우기
         idx_target = df['date'].dt.year == target_y
         for i in df[idx_target].index:
             past_date = df.loc[i, 'date'] - pd.DateOffset(years=1)
@@ -674,7 +672,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if df['temp_max'].isna().all():
             return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 백엔드 로그 확인 후 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
         
-        # 🌟 핵심 픽스 2: 미세먼지와 승객수 빈칸을 과거 데이터로 완벽하게 메워줍니다. (이게 빠져서 8월 이후가 다 삭제되었음)
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
         df['temp_avg'] = df['temp_avg'].bfill().ffill()
@@ -683,7 +680,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if 'pm25' in df.columns:
             df['pm25'] = df['pm25'].bfill().ffill()
 
-        # 🌟 [신규 로직] 4대 시뮬레이션 변수 정밀 적용 (결측치 보간 후 안전하게 적용)
         if temp_adj != 0:
             df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
             df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
@@ -697,12 +693,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if 'pm25' in df.columns and pm25_adj != 0:
             target_indices = df[idx_target].index
             if pm25_adj > 0:
-                # 나쁨 기준(35) 이하인 날들 중, 35에 가장 가까운 N일을 골라 나쁨 수준(45.0)으로 악화시킴
                 normal_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] <= 35]
                 adjust_idx = normal_days.sort_values('pm25', ascending=False).head(pm25_adj).index
                 df.loc[adjust_idx, 'pm25'] = 45.0
             elif pm25_adj < 0:
-                # 나쁨 기준(35) 초과인 날들 중, 35에 가장 가까운 N일을 골라 보통 수준(25.0)으로 완화시킴
                 bad_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] > 35]
                 adjust_idx = bad_days.sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
                 df.loc[adjust_idx, 'pm25'] = 25.0
@@ -741,13 +735,18 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         importances = [float(v) for v in (model.feature_importances_ * 100).round(1)]
         feat_df = pd.DataFrame({'name': features, 'value': importances})
         
+        # 🌟 기온(최고, 최저, 평균)을 하나로 통합하는 매핑 로직
         name_map = {
-            'month': '계절(월)', 'temp_max': '최고기온(냉방)', 'temp_min': '최저기온(난방)', 
-            'temp_avg': '평균기온(기저)', 'humidity': '평균습도', 'passengers': '승객수', 
+            'month': '계절(월)', 'temp_max': '기온', 'temp_min': '기온', 
+            'temp_avg': '기온', 'humidity': '습도', 'passengers': '승객수', 
             'pm25': '초미세먼지(PM2.5)', 'is_holiday': '공휴일', 'is_weekend': '주말'
         }
         feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
-        top_feats = feat_df[feat_df['name'].isin(name_map.values())].sort_values('value', ascending=False).to_dict(orient='records')
+        
+        # 이름이 같은 항목(기온 3종)의 수치를 하나로 합산합니다.
+        feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
+        
+        top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
         
         records = []
         for m in range(1, 13):
