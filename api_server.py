@@ -104,30 +104,28 @@ def load_excel_dataset():
         date_col = next((c for c in df_main.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df_main['date'] = pd.to_datetime(df_main[date_col]).dt.normalize()
         
-        if 'pm25_val' not in df_main.columns:
-            all_pm25 = []
-            for sheet in xls.sheet_names:
-                if '초미세먼지' in sheet or '미세먼지' in sheet:
-                    df_pm = pd.read_excel(xls, sheet_name=sheet)
-                    df_pm = df_pm.iloc[1:].copy() 
-                    pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
-                    
-                    if pm_date_col:
-                        df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
-                        num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
-                        for c in num_cols:
-                            df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
-                        df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
-                        all_pm25.append(df_pm[['date', 'pm25_merged']])
-            
-            if all_pm25:
-                pm25_df = pd.concat(all_pm25).dropna(subset=['date']).groupby('date')['pm25_merged'].mean().reset_index()
-                df_main = df_main.merge(pm25_df, on='date', how='left')
-                df_main['pm25_val'] = df_main['pm25_merged']
+        all_pm25 = []
+        for sheet in xls.sheet_names:
+            if '초미세먼지' in sheet or '미세먼지' in sheet:
+                df_pm = pd.read_excel(xls, sheet_name=sheet)
+                df_pm = df_pm.iloc[1:].copy() 
+                pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
                 
+                if pm_date_col:
+                    df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
+                    num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
+                    for c in num_cols:
+                        df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
+                    df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
+                    all_pm25.append(df_pm[['date', 'pm25_merged']])
+        
+        if all_pm25:
+            pm25_df = pd.concat(all_pm25).dropna(subset=['date']).groupby('date')['pm25_merged'].mean().reset_index()
+            df_main = df_main.merge(pm25_df, on='date', how='left')
+            df_main['pm25_val'] = df_main['pm25_merged']
+            
         return df_main
     except Exception as e: 
-        print(f"엑셀 로드 에러: {e}")
         return None
 
 def fetch_openmeteo_env(lat, lon, start_date, end_date):
@@ -786,7 +784,7 @@ def get_bill_data(station: str, year: str):
 
 
 # =========================================================================
-# 🚀 5. [단일 백업 아키텍처] 기존 엑셀 탭 100% 보존 + 한전 전력량만 누적 수집
+# 🚀 5. [단일 백업 아키텍처] 진짜 데이터가 있는 마지막 날짜를 찾는 스마트 엔진
 # =========================================================================
 @app.get("/api/backup")
 def export_master_backup():
@@ -795,10 +793,9 @@ def export_master_backup():
         return {"error": "기본이 될 과거 데이터베이스(Excel)가 업로드되어 있지 않습니다."}
 
     try:
-        # 1. 사용자가 업로드한 엑셀 파일의 '모든 시트'를 메모리로 그대로 퍼옵니다.
         xls_dict = pd.read_excel(file_path, sheet_name=None)
         sheet_names = list(xls_dict.keys())
-        main_sheet_name = sheet_names[0] # 첫 번째 시트 (전력량 및 승객수)
+        main_sheet_name = sheet_names[0] 
         df = xls_dict[main_sheet_name]
 
         date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
@@ -806,20 +803,22 @@ def export_master_backup():
 
         # 어제 자정 기준
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        last_date = pd.to_datetime(df[date_col].max())
         
+        # 🌟 [수정 완료] 결측치 따위는 무시하고, 엑셀에 적혀있는 '물리적인 마지막 날짜'를 무조건 기준점으로 잡습니다.
+        last_date = pd.to_datetime(df[date_col].max())
+            
         if pd.isna(last_date):
             return {"error": "엑셀 파일에서 날짜 데이터를 찾을 수 없습니다."}
             
         new_rows = []
         curr_date = last_date + timedelta(days=1)
         
-        # 2. 마지막 작성일 다음날부터 어제까지 한전 API로 비어있는 날짜만 수집합니다.
+        # 수집을 시작할 날짜(curr_date)부터 어제(yesterday)까지 일수 계산
         days_to_fetch = (yesterday - curr_date).days + 1
         
         if days_to_fetch > 0:
             if days_to_fetch > 30: 
-                days_to_fetch = 30 # 서버 과부하 방지 (최대 30일치씩만 백업 권장)
+                days_to_fetch = 30 # 서버 뻗음 방지
                 
             col_map = {}
             for c in df.columns:
@@ -833,8 +832,7 @@ def export_master_backup():
                 d_str = target_dt.strftime("%Y-%m-%d")
                 row = {date_col: target_dt}
                 
-                # 🌟 회원님 아이디어 적용: 기상은 ASOS로 대체되므로 날씨/미세먼지 수집 코드를 완전히 날렸습니다.
-                # 오직 '한전 전력량(kWh)'과 '최대수요(peak)'만 수집합니다.
+                # 날씨는 쏙 빼고 오직 한전 전력량만 가져옵니다
                 def fetch_st(st):
                     usage, peak, _ = get_kepco_data_for_station(st, d_str)
                     return st, usage, peak
@@ -849,28 +847,28 @@ def export_master_backup():
                 
                 new_rows.append(row)
                 
-        # 3. 수집된 데이터를 메인 시트 밑바닥에 이어 붙입니다.
         if new_rows:
             df_new = pd.DataFrame(new_rows)
             df = pd.concat([df, df_new], ignore_index=True)
-            
-            # 승객수와 미세먼지는 사용자가 수동으로 채우기 위해 빈칸으로 둡니다.
-            # (단, 휴일 여부는 자동으로 계산해서 넣어줍니다)
-            holi_col = next((c for c in df.columns if '휴일' in str(c)), None)
-            if holi_col:
-                kr_holidays = holidays.KR()
-                df[holi_col] = df[date_col].apply(lambda x: 1 if x.dayofweek >= 5 or x in kr_holidays else 0)
+            df.sort_values(by=date_col, inplace=True)
+            df.reset_index(drop=True, inplace=True)
 
+        # 🌟 [대한민국 공휴일 자동화 패치]
+        # 휴일 컬럼을 찾거나 없으면 생성해서, 주말(토,일)과 한국 공휴일에 무조건 1을 박아넣습니다.
+        holi_col = next((c for c in df.columns if '휴일' in str(c) or 'is_holiday' in str(c)), '휴일\n(is_holiday)')
+        kr_holidays = holidays.KR()
+        df[holi_col] = df[date_col].apply(lambda x: 1 if x.dayofweek >= 5 or x.strftime('%Y-%m-%d') in kr_holidays else 0)
+
+        # 타임존 이슈 방지
         if df[date_col].dt.tz is not None:
             df[date_col] = df[date_col].dt.tz_localize(None)
 
-        # 4. 업데이트된 메인 시트를 딕셔너리에 다시 덮어씁니다.
         xls_dict[main_sheet_name] = df
 
-        # 5. 기존 초미세먼지 탭들을 하나도 잃어버리지 않고, 엑셀 파일로 다시 통째로 굽습니다!
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for sheet_name, sheet_df in xls_dict.items():
+                # 날짜 포맷 깔끔하게 정리
                 if date_col in sheet_df.columns and pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
                     sheet_df[date_col] = sheet_df[date_col].dt.strftime('%Y-%m-%d')
                 if '일자' in sheet_df.columns and pd.api.types.is_datetime64_any_dtype(sheet_df['일자']):
@@ -886,4 +884,4 @@ def export_master_backup():
             headers={"Content-Disposition": f"attachment; filename=DTRO_Master_Backup_{yesterday.strftime('%Y%m%d')}.xlsx"}
         )
     except Exception as e:
-        return {"error": f"백업 파일 생성 중 서버 에러 발생: {str(e)}"}
+        return {"error": f"백업 파일 생성 중 서버 에러 발생: {str(e)}\n{traceback.format_exc()}"}
