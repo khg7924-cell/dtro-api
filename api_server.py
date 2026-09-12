@@ -603,10 +603,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 
+# 🚀 3. AI 수요 예측 (시뮬레이션 변수 확장 및 결측치 완벽 방어)
 # =========================================================================
 @app.get("/api/predict/{station}")
-def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0):
+def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0):
     try: 
         df = load_excel_dataset()
         if df is None: return {"error": "과거 다년간의 머신러닝 학습을 위해 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
@@ -627,8 +627,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         
         target_y = int(target_year)
         
-        # 🌟 핵심 픽스 1: 미래의 빈 날짜 자동 생성 
-        # (회원님이 엑셀 꼬리를 지우셨더라도, AI 예측이 연말까지 돌아가도록 365일치 날짜 뼈대를 강제로 만들어냅니다)
+        # 🌟 핵심 픽스 1: 회원님이 엑셀 꼬리를 잘랐어도, 2026년 365일 날짜 뼈대를 강제로 생성합니다.
         start_dt = pd.to_datetime(f"{target_y}-01-01")
         end_dt = pd.to_datetime(f"{target_y}-12-31")
         full_year_dates = pd.date_range(start=start_dt, end=end_dt)
@@ -659,6 +658,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if 'pm25_val' in df.columns:
             df['pm25'] = df['pm25_val']
 
+        # 직전 연도 동기 데이터로 미래(타겟 연도) 빈칸 채우기
         idx_target = df['date'].dt.year == target_y
         for i in df[idx_target].index:
             past_date = df.loc[i, 'date'] - pd.DateOffset(years=1)
@@ -671,15 +671,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                 if pd.isna(df.loc[i, 'passengers']): df.loc[i, 'passengers'] = past_val.iloc[0]['passengers'] * (1 + (pass_rate / 100.0))
                 if 'pm25' in df.columns and pd.isna(df.loc[i, 'pm25']): df.loc[i, 'pm25'] = past_val.iloc[0]['pm25']
                 
-        if temp_adj != 0:
-            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
-            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
-            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_min'] += float(temp_adj)
-            
         if df['temp_max'].isna().all():
             return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 백엔드 로그 확인 후 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
         
-        # 🌟 핵심 픽스 2: 미세먼지(pm25) 결측치 방어! (이 코드가 빠져서 8월 이후 행이 통째로 삭제되어 0으로 나왔습니다)
+        # 🌟 핵심 픽스 2: 미세먼지와 승객수 빈칸을 과거 데이터로 완벽하게 메워줍니다. (이게 빠져서 8월 이후가 다 삭제되었음)
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
         df['temp_avg'] = df['temp_avg'].bfill().ffill()
@@ -687,6 +682,30 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['passengers'] = df['passengers'].bfill().ffill()
         if 'pm25' in df.columns:
             df['pm25'] = df['pm25'].bfill().ffill()
+
+        # 🌟 [신규 로직] 4대 시뮬레이션 변수 정밀 적용 (결측치 보간 후 안전하게 적용)
+        if temp_adj != 0:
+            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
+            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
+            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_min'] += float(temp_adj)
+
+        if winter_temp_adj != 0:
+            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_max'] += float(winter_temp_adj)
+            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_avg'] += float(winter_temp_adj)
+            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_min'] += float(winter_temp_adj)
+            
+        if 'pm25' in df.columns and pm25_adj != 0:
+            target_indices = df[idx_target].index
+            if pm25_adj > 0:
+                # 나쁨 기준(35) 이하인 날들 중, 35에 가장 가까운 N일을 골라 나쁨 수준(45.0)으로 악화시킴
+                normal_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] <= 35]
+                adjust_idx = normal_days.sort_values('pm25', ascending=False).head(pm25_adj).index
+                df.loc[adjust_idx, 'pm25'] = 45.0
+            elif pm25_adj < 0:
+                # 나쁨 기준(35) 초과인 날들 중, 35에 가장 가까운 N일을 골라 보통 수준(25.0)으로 완화시킴
+                bad_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] > 35]
+                adjust_idx = bad_days.sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
+                df.loc[adjust_idx, 'pm25'] = 25.0
 
         features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
         if 'pm25' in df.columns: features.append('pm25')
@@ -697,7 +716,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
              
         test_df = df[df['date'].dt.year == target_y].copy()
         test_df = test_df.dropna(subset=features)
-        if test_df.empty: return {"error": f"{target_year}년도 예측을 위한 데이터 포맷(빈 날짜 행)이 엑셀에 마련되어 있지 않습니다."}
+        if test_df.empty: return {"error": f"{target_year}년도 예측을 위한 데이터 포맷이 처리 중 소실되었습니다."}
         
         X_train, y_train = train_df[features].copy(), train_df['target_power'].copy()
         X_test = test_df[features].copy()
