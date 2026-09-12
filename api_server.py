@@ -95,6 +95,16 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# 🌟 [신규] 서버에 엑셀 데이터가 존재하는지 확인하는 동기화 API
+@app.get("/api/check_dataset")
+def check_dataset_status():
+    file_path = "uploaded_dataset.xlsx"
+    if os.path.exists(file_path):
+        modified_time = os.path.getmtime(file_path)
+        dt_m = datetime.fromtimestamp(modified_time).strftime('%m월 %d일 %H:%M')
+        return {"exists": True, "updated_at": dt_m}
+    return {"exists": False}
+
 def load_excel_dataset():
     file_path = "uploaded_dataset.xlsx"
     if not os.path.exists(file_path): return None
@@ -603,7 +613,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (변수 그룹핑 로직 반영)
+# 🚀 3. AI 수요 예측 
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0):
@@ -735,7 +745,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         importances = [float(v) for v in (model.feature_importances_ * 100).round(1)]
         feat_df = pd.DataFrame({'name': features, 'value': importances})
         
-        # 🌟 기온(최고, 최저, 평균)을 하나로 통합하는 매핑 로직
         name_map = {
             'month': '계절(월)', 'temp_max': '기온', 'temp_min': '기온', 
             'temp_avg': '기온', 'humidity': '습도', 'passengers': '승객수', 
@@ -743,7 +752,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         }
         feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
         
-        # 이름이 같은 항목(기온 3종)의 수치를 하나로 합산합니다.
         feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
         
         top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
