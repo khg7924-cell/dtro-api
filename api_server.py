@@ -625,13 +625,29 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
             df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
         
+        target_y = int(target_year)
+        
+        # 🌟 핵심 픽스 1: 미래의 빈 날짜 자동 생성 
+        # (회원님이 엑셀 꼬리를 지우셨더라도, AI 예측이 연말까지 돌아가도록 365일치 날짜 뼈대를 강제로 만들어냅니다)
+        start_dt = pd.to_datetime(f"{target_y}-01-01")
+        end_dt = pd.to_datetime(f"{target_y}-12-31")
+        full_year_dates = pd.date_range(start=start_dt, end=end_dt)
+        
+        existing_dates = pd.to_datetime(df['date']).dt.normalize().tolist()
+        missing_dates = pd.Index(full_year_dates).difference(pd.Index(existing_dates))
+        
+        if len(missing_dates) > 0:
+            missing_df = pd.DataFrame({'date': missing_dates})
+            df = pd.concat([df, missing_df], ignore_index=True)
+            df.sort_values(by='date', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
         kr_holidays = holidays.KR()
         df['month'] = df['date'].dt.month
         df['dayofweek'] = df['date'].dt.dayofweek
         df['is_weekend'] = df['dayofweek'].isin([5,6]).astype(int)
         df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
-        target_y = int(target_year)
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
         df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
@@ -663,11 +679,14 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if df['temp_max'].isna().all():
             return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 백엔드 로그 확인 후 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
         
+        # 🌟 핵심 픽스 2: 미세먼지(pm25) 결측치 방어! (이 코드가 빠져서 8월 이후 행이 통째로 삭제되어 0으로 나왔습니다)
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
         df['temp_avg'] = df['temp_avg'].bfill().ffill()
         df['humidity'] = df['humidity'].bfill().ffill()
         df['passengers'] = df['passengers'].bfill().ffill()
+        if 'pm25' in df.columns:
+            df['pm25'] = df['pm25'].bfill().ffill()
 
         features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
         if 'pm25' in df.columns: features.append('pm25')
@@ -801,13 +820,10 @@ def export_master_backup():
         date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
         
-        # 🌟 [유령 행 제거] 엑셀에서 날짜를 지울 때 남은 보이지 않는 빈 행(NaT)을 완벽히 청소합니다.
         df = df.dropna(subset=[date_col])
 
-        # 어제 자정 기준
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # 엑셀에 적혀있는 '물리적인 마지막 날짜'를 무조건 기준점으로 잡습니다.
         last_date = pd.to_datetime(df[date_col].max())
             
         if pd.isna(last_date):
@@ -816,12 +832,11 @@ def export_master_backup():
         new_rows = []
         curr_date = last_date + timedelta(days=1)
         
-        # 수집을 시작할 날짜(curr_date)부터 어제(yesterday)까지 일수 계산
         days_to_fetch = (yesterday - curr_date).days + 1
         
         if days_to_fetch > 0:
             if days_to_fetch > 30: 
-                days_to_fetch = 30 # 서버 뻗음 방지
+                days_to_fetch = 30 
                 
             col_map = {}
             for c in df.columns:
@@ -835,7 +850,6 @@ def export_master_backup():
                 d_str = target_dt.strftime("%Y-%m-%d")
                 row = {date_col: target_dt}
                 
-                # 날씨는 쏙 빼고 오직 한전 전력량만 가져옵니다
                 def fetch_st(st):
                     usage, peak, _ = get_kepco_data_for_station(st, d_str)
                     return st, usage, peak
@@ -856,16 +870,13 @@ def export_master_backup():
             df.sort_values(by=date_col, inplace=True)
             df.reset_index(drop=True, inplace=True)
 
-        # 🌟 [대한민국 공휴일 자동화 & NaT 방어 패치]
         holi_col = next((c for c in df.columns if '휴일' in str(c) or 'is_holiday' in str(c)), '휴일\n(is_holiday)')
         kr_holidays = holidays.KR()
         
-        # pd.notna(x) 조건을 추가하여 날짜가 확실히 있는 행에만 공휴일을 계산합니다.
         df[holi_col] = df[date_col].apply(
             lambda x: 1 if pd.notna(x) and (x.dayofweek >= 5 or x.strftime('%Y-%m-%d') in kr_holidays) else 0
         )
 
-        # 타임존 이슈 방지
         if df[date_col].dt.tz is not None:
             df[date_col] = df[date_col].dt.tz_localize(None)
 
@@ -874,7 +885,6 @@ def export_master_backup():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for sheet_name, sheet_df in xls_dict.items():
-                # 엑셀 저장 시에도 빈 행 방지 및 날짜 포맷 정리
                 if date_col in sheet_df.columns:
                     sheet_df = sheet_df.dropna(subset=[date_col])
                     if pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
