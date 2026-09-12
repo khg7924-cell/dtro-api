@@ -8,3 +8,4 @@ scikit-learn
 holidays
 openpyxl
 python-multipart
+xlsxwriter
