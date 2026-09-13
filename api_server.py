@@ -657,7 +657,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 
+# 🚀 3. AI 수요 예측 (부하증감 신고 데이터 자동 합산/차감 연동)
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0):
@@ -724,7 +724,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                 if 'pm25' in df.columns and pd.isna(df.loc[i, 'pm25']): df.loc[i, 'pm25'] = past_val.iloc[0]['pm25']
                 
         if df['temp_max'].isna().all():
-            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 백엔드 로그 확인 후 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
+            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
         
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
@@ -776,6 +776,35 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         model.fit(X_train, y_train)
         test_df['pred_power'] = model.predict(X_test)
         
+        # 🌟 [핵심 연동] Firebase에서 확인 완료된 부하증감 데이터를 가져와 예측치에 가산/차감
+        try:
+            # 회원님의 Firebase Realtime DB URL (dtro 프로젝트)
+            fb_url = "https://dtro-project-default-rtdb.firebaseio.com/load_reports.json" 
+            fb_res = http_session.get(fb_url, timeout=3)
+            if fb_res.status_code == 200 and fb_res.json():
+                fb_data = fb_res.json()
+                for _, r_info in fb_data.items():
+                    if r_info.get('status') == '확인':
+                        r_sub = r_info.get('substation', '')
+                        # '전체' 개소이거나, 매핑된 변전소와 일치하거나, 호선 단위에 포함된 경우
+                        is_match = False
+                        if station == '전체': is_match = True
+                        elif station in LINE_STATIONS and r_sub in LINE_STATIONS[station]: is_match = True
+                        elif station == r_sub: is_match = True
+
+                        if is_match:
+                            app_date = pd.to_datetime(r_info.get('applyDate', f"{target_y}-01-01"))
+                            kw_val = float(r_info.get('kw', 0))
+                            hours_val = float(r_info.get('hours', 0))
+                            daily_kwh = kw_val * hours_val
+                            if '철거' in str(r_info.get('type', '')): daily_kwh = -daily_kwh
+
+                            # 적용예정일 이후의 날짜 행에만 일일 전력량 증감 반영
+                            mask_after = (test_df['date'] >= app_date)
+                            test_df.loc[mask_after, 'pred_power'] += daily_kwh
+        except Exception as fb_err:
+            print(f"Firebase 부하증감 데이터 연동 스킵 (비네트워크 또는 미설정): {fb_err}")
+
         train_pred = model.predict(X_train)
         r2_acc = float(round(r2_score(y_train, train_pred) * 100, 1))
         
@@ -795,7 +824,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             'pm25': '초미세먼지(PM2.5)', 'is_holiday': '공휴일', 'is_weekend': '주말'
         }
         feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
-        
         feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
         
         top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
@@ -812,7 +840,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         }
     except Exception as e:
         return {"error": f"서버 내부 오류로 예측에 실패했습니다: {str(e)}\n\n{traceback.format_exc()}"}
-
+    
 # =========================================================================
 # 🚀 4. 전기요금 청구정보 (지침 정보 추가 수집)
 # =========================================================================
