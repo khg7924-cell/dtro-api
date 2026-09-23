@@ -2,6 +2,8 @@ import os
 import time
 import io
 import json
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -17,6 +19,10 @@ import urllib3
 from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 🌟 로그 설정 (서버 구동 시 캐싱 과정을 모니터링하기 위함)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -37,10 +43,16 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200)
 http_session.mount('https://', adapter)
 http_session.verify = False
 
+# =========================================================================
+# 🚀 글로벌 캐시 메모리 
+# =========================================================================
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
-
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
+
+# 🌟 [신규] 스케줄러가 저장할 2가지 캐시 방
+GLOBAL_RECENT_CACHE = {}  # 엑셀 누락일(과거~어제) 데이터
+GLOBAL_REALTIME_CACHE = {"data": {}, "updated_at": None}  # 당일 15분 데이터
 
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
@@ -91,12 +103,106 @@ STATION_AWS_MAP = {
     '전체': '143', '1호선': '143', '2호선': '143', '3호선': '143'
 }
 
+# =========================================================================
+# 🔄 [신규] 백그라운드 스케줄러 자동 캐싱 로직
+# =========================================================================
+async def fetch_realtime_job():
+    """15분마다 오늘 실시간 데이터를 가져오는 스케줄러 (서버 켜지자마자 즉시 1회 실행)"""
+    while True:
+        try:
+            today_str = get_kst_now().strftime("%Y-%m-%d")
+            logger.info(f"⏰ [스케줄러] 당일({today_str}) 15분 전력 데이터 수집 시작...")
+            
+            get_kepco_data_for_station('전체', today_str) # 한전 API 과부하 방지 사전 적재
+            new_data = {}
+            target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
+            
+            for st in target_stations:
+                _, _, details = get_kepco_data_for_station(st, today_str)
+                new_data[st] = details
+                
+            GLOBAL_REALTIME_CACHE["data"] = new_data
+            GLOBAL_REALTIME_CACHE["updated_at"] = get_kst_now().strftime("%H:%M:%S")
+            logger.info(f"✅ [스케줄러] 당일 실시간 데이터 업데이트 완료 ({GLOBAL_REALTIME_CACHE['updated_at']})")
+        except Exception as e:
+            logger.error(f"❌ [스케줄러] 당일 실시간 수집 에러: {e}")
+        
+        await asyncio.sleep(900) # 15분 대기
+
+async def fetch_daily_gap_job():
+    """매일 01:00에 '엑셀 마지막 날짜 ~ 어제' 까지의 빈 공간을 자동 저장 (서버 켜지자마자 즉시 1회 실행)"""
+    while True:
+        try:
+            df = GLOBAL_EXCEL_CACHE.get("df")
+            if df is not None and not df.empty:
+                last_date = pd.to_datetime(df['date'].max())
+                yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                days_gap = (yesterday - last_date).days
+                
+                if days_gap > 0:
+                    logger.info(f"📅 [스케줄러] 엑셀 누락분({last_date.strftime('%Y-%m-%d')} ~ 어제) 일일 데이터 자동 저장 시작...")
+                    fetch_limit = min(days_gap, 30) # 안전을 위해 최대 30일치 보완
+                    target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
+                    
+                    for i in range(1, fetch_limit + 1):
+                        target_dt = last_date + timedelta(days=i)
+                        d_str = target_dt.strftime("%Y-%m-%d")
+                        
+                        if d_str not in GLOBAL_RECENT_CACHE:
+                            logger.info(f" - [{d_str}] 데이터 조회 및 캐싱 중...")
+                            get_kepco_data_for_station('전체', d_str)
+                            day_data = {}
+                            for st in target_stations:
+                                usage, peak, _ = get_kepco_data_for_station(st, d_str)
+                                day_data[st] = {"usage_kwh": usage, "peak_kw": peak}
+                            GLOBAL_RECENT_CACHE[d_str] = day_data
+                            
+                    logger.info("✅ [스케줄러] 과거 누락 데이터 저장 완료! (이제 대시보드 조회 시 0초만에 표출됩니다)")
+        except Exception as e:
+            logger.error(f"❌ [스케줄러] 누락 데이터 저장 에러: {e}")
+        
+        # 다음 01:00 타임 계산 후 대기
+        now = get_kst_now()
+        next_run = now.replace(hour=1, minute=0, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        sleep_seconds = (next_run - now).total_seconds()
+        logger.info(f"⏳ [스케줄러] 다음 일일 전체개소 데이터 조회의 자동 저장은 {next_run.strftime('%m-%d %H:%M')} 에 실행됩니다.")
+        await asyncio.sleep(sleep_seconds)
+
+async def fetch_weather_job():
+    """기상 데이터 자동 수집"""
+    while True:
+        try:
+            now = get_kst_now()
+            end_str = now.strftime("%Y-%m-%d")
+            start_str = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            fetch_asos_daily(start_str, end_str)
+            fetch_openmeteo_env(35.8714, 128.6014, start_str, end_str)
+            for aws_stn in set(STATION_AWS_MAP.values()):
+                fetch_aws_daily_for_dashboard(aws_stn, start_str, end_str)
+        except Exception as e:
+            logger.error(f"기상 캐싱 에러: {e}")
+        await asyncio.sleep(3600)
+
+@app.on_event("startup")
+async def startup_event():
+    """서버가 켜지면 엑셀을 로드하고 스케줄러를 가동"""
+    load_excel_dataset()
+    asyncio.create_task(fetch_realtime_job())
+    asyncio.create_task(fetch_daily_gap_job())
+    asyncio.create_task(fetch_weather_job())
+
+# =========================================================================
+# 기초 함수 영역 (유지)
+# =========================================================================
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
+        load_excel_dataset() # 업로드 시 엑셀 최신화
         return {"status": "success", "filename": file.filename}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -366,7 +472,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 
+# 🚀 1. 통합 대시보드 (라이브 호출 차단 및 100% 캐싱 사용 구조로 완벽 교체)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -398,22 +504,16 @@ def get_dashboard_data(station: str, start: str, end: str):
 
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     aws_stn = STATION_AWS_MAP.get(station, '143')
-    
-    with ThreadPoolExecutor(max_workers=3) as weather_exec:
-        future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
-        future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
-        future_asos = weather_exec.submit(fetch_asos_daily, start, end)
-        
-        openmeteo_data = future_om.result()
-        aws_data = future_aws.result()
-        asos_data = future_asos.result()
-    
     today_str = get_kst_now().strftime("%Y-%m-%d")
+
+    records = []
+    tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
 
     def process_day(i):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
+        # 🌟 병목 제거: 엑셀 -> 보완 캐시 -> 당일 캐시 순서로만 로드! 절대 KEPCO 라이브 호출을 하지 않음
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
@@ -423,38 +523,39 @@ def get_dashboard_data(station: str, start: str, end: str):
                 hh = m // 4; mm = (m % 4) * 15 + 15
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
-        else:
-            if date_str >= "2026-09-04": usage, peak, details = get_kepco_data_for_station(station, date_str)
-            else: usage, peak, details = 0.0, 0.0, []
+        elif date_str in GLOBAL_RECENT_CACHE and station in GLOBAL_RECENT_CACHE[date_str]:
+            usage = GLOBAL_RECENT_CACHE[date_str][station]["usage_kwh"]
+            peak = GLOBAL_RECENT_CACHE[date_str][station]["peak_kw"]
             cached_pm25 = "--"
-            
-        co2 = usage * 0.466 / 1000
-        
-        env_o = openmeteo_data.get(date_str, {})
-        env_a = aws_data.get(date_str, {})
-        
-        tmax = env_a.get("tmax", "--")
-        tmin = env_a.get("tmin", "--")
-        humi = env_a.get("humi", "--")
-        
-        if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
-        if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
-        if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
-        
-        if date_str >= today_str or (tmax == "--" and tmin == "--"):
-            if tmax == "--": tmax = env_o.get("tmax", "--")
-            if tmin == "--": tmin = env_o.get("tmin", "--")
-            if humi == "--": humi = env_o.get("humi", "--")
-        
-        pm25 = cached_pm25 if cached_pm25 != "--" else env_o.get("pm25", "--")
-
-        if not details or len(details) < 96:
             details = []
             for m in range(96):
                 hh = m // 4; mm = (m % 4) * 15 + 15
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
-
+        elif date_str == today_str:
+            r_details = GLOBAL_REALTIME_CACHE.get("data", {}).get(station, [])
+            valid_usages = [d.get("usage_kwh", 0) for d in r_details if d.get("usage_kwh") is not None]
+            valid_peaks = [d.get("peak_kw", 0) for d in r_details if d.get("peak_kw") is not None]
+            usage = sum(valid_usages) if valid_usages else 0.0
+            peak = max(valid_peaks) if valid_peaks else 0.0
+            details = r_details
+            cached_pm25 = "--"
+        else:
+            usage, peak, details = 0.0, 0.0, []
+            cached_pm25 = "--"
+            for m in range(96):
+                hh = m // 4; mm = (m % 4) * 15 + 15
+                if mm == 60: hh += 1; mm = 0
+                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
+            
+        co2 = usage * 0.466 / 1000
+        
+        # 날씨 데이터 역시 캐시나 글로벌 메모리에서만 맵핑
+        tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
+        tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
+        humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
+        pm25 = cached_pm25
+        
         return {
             "date": date_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
             "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
@@ -469,7 +570,7 @@ def get_dashboard_data(station: str, start: str, end: str):
 
     return {
         "station_name": station, 
-        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
+        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 캐싱 렌더링)",
         "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
         "daily_records": records
     }
@@ -479,8 +580,13 @@ def get_realtime_data(station: str):
     kst_now = get_kst_now()
     today_str = kst_now.strftime("%Y-%m-%d")
     
-    kepco_data = get_kepco_data_for_station(station, today_str)
-    day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
+    # 🌟 스케줄러가 저장한 실시간 캐시만 반환 (라이브 호출 차단)
+    if station in GLOBAL_REALTIME_CACHE.get("data", {}):
+        details = GLOBAL_REALTIME_CACHE["data"][station]
+    else:
+        # 혹시 스케줄러가 아직 안 돌았을 최악의 경우 대비 (안전장치)
+        kepco_data = get_kepco_data_for_station(station, today_str)
+        _, _, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
     if not details or len(details) < 96:
         details = []
@@ -490,14 +596,17 @@ def get_realtime_data(station: str):
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
     now_minutes = kst_now.hour * 60 + kst_now.minute
+    res_details = []
+    
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
         time_m = hh * 60 + mm if hh != 24 else 24 * 60
         if time_m > now_minutes:
-            d["usage_kwh"] = None
-            d["peak_kw"] = None
+            res_details.append({"time": d["time"], "usage_kwh": None, "peak_kw": None})
+        else:
+            res_details.append(d.copy())
             
-    return {"station_name": station, "date": today_str, "records": details}
+    return {"station_name": station, "date": today_str, "records": res_details}
 
 # =========================================================================
 # 🚀 2. 연도별 비교 분석
@@ -658,7 +767,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (로컬 부하증감 신고 데이터 자동 합산/차감 연동)
+# 🚀 3. AI 수요 예측
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
@@ -777,14 +886,12 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         model.fit(X_train, y_train)
         test_df['pred_power'] = model.predict(X_test)
         
-        # 🌟 [핵심 연동] 프론트엔드에서 넘어온 승인된 부하증감 데이터 파싱 및 예측치 가산/차감
         if reports_data:
             try:
                 local_reports = json.loads(reports_data)
                 for r_info in local_reports:
                     if r_info.get('status') == '확인':
                         r_sub = r_info.get('substation', '')
-                        # 선택된 개소(변전소)와 일치하는 경우 부하 반영
                         is_match = False
                         if station == '전체': is_match = True
                         elif station in LINE_STATIONS and r_sub in LINE_STATIONS[station]: is_match = True
@@ -796,8 +903,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                             hours_val = float(r_info.get('hours', 0))
                             daily_kwh = kw_val * hours_val
                             if '철거' in str(r_info.get('type', '')): daily_kwh = -daily_kwh
-
-                            # 적용예정일 이후의 날짜 행에만 일일 전력량 증감 반영
                             mask_after = (test_df['date'] >= app_date)
                             test_df.loc[mask_after, 'pred_power'] += daily_kwh
             except Exception as parse_err:
@@ -888,7 +993,6 @@ def get_bill_data(station: str, year: str):
                                 "lload_usekwh": parse_float(lower_item.get("lloadusekwh", lower_item.get("lload_usekwh"))),
                                 "mload_usekwh": parse_float(lower_item.get("mloadusekwh", lower_item.get("mload_usekwh"))),
                                 "maxload_usekwh": parse_float(lower_item.get("maxloadusekwh", lower_item.get("maxload_usekwh"))),
-                                # 🌟 [신규] 지침 정보 파싱 추가
                                 "lload_needle": parse_float(lower_item.get("lloadneedle", lower_item.get("lload_needle"))),
                                 "mload_needle": parse_float(lower_item.get("mloadneedle", lower_item.get("mload_needle"))),
                                 "maxload_needle": parse_float(lower_item.get("maxloadneedle", lower_item.get("maxload_needle"))),
@@ -1001,3 +1105,7 @@ def export_master_backup():
         )
     except Exception as e:
         return {"error": f"백업 파일 생성 중 서버 에러 발생: {str(e)}\n{traceback.format_exc()}"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
