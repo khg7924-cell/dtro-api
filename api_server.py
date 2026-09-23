@@ -472,7 +472,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (라이브 호출 차단 및 100% 캐싱 사용 구조로 완벽 교체)
+# 🚀 1. 통합 대시보드 (온디맨드 스마트 캐싱 패치 적용)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -502,9 +502,18 @@ def get_dashboard_data(station: str, start: str, end: str):
                 if usage > 0:
                     excel_cache[d_str] = {"usage_kwh": usage, "peak_kw": peak, "pm25": pm25_val}
 
-    lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     aws_stn = STATION_AWS_MAP.get(station, '143')
     today_str = get_kst_now().strftime("%Y-%m-%d")
+    
+    missing_weather = [ (start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(diff) 
+                        if f"AWS_{aws_stn}_{(start_dt + timedelta(days=i)).strftime('%Y-%m-%d')}_tmax" not in GLOBAL_WEATHER_CACHE ]
+    
+    if missing_weather:
+        lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
+        with ThreadPoolExecutor(max_workers=3) as weather_exec:
+            weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+            weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+            weather_exec.submit(fetch_asos_daily, start, end)
 
     records = []
     tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
@@ -513,7 +522,7 @@ def get_dashboard_data(station: str, start: str, end: str):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        # 🌟 병목 제거: 엑셀 -> 보완 캐시 -> 당일 캐시 순서로만 로드! 절대 KEPCO 라이브 호출을 하지 않음
+        # 1. 엑셀에 데이터가 있으면 가장 먼저 사용
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
@@ -523,15 +532,8 @@ def get_dashboard_data(station: str, start: str, end: str):
                 hh = m // 4; mm = (m % 4) * 15 + 15
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
-        elif date_str in GLOBAL_RECENT_CACHE and station in GLOBAL_RECENT_CACHE[date_str]:
-            usage = GLOBAL_RECENT_CACHE[date_str][station]["usage_kwh"]
-            peak = GLOBAL_RECENT_CACHE[date_str][station]["peak_kw"]
-            cached_pm25 = "--"
-            details = []
-            for m in range(96):
-                hh = m // 4; mm = (m % 4) * 15 + 15
-                if mm == 60: hh += 1; mm = 0
-                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
+                
+        # 2. 당일(오늘)이면 15분 실시간 캐시 사용
         elif date_str == today_str:
             r_details = GLOBAL_REALTIME_CACHE.get("data", {}).get(station, [])
             valid_usages = [d.get("usage_kwh", 0) for d in r_details if d.get("usage_kwh") is not None]
@@ -540,17 +542,24 @@ def get_dashboard_data(station: str, start: str, end: str):
             peak = max(valid_peaks) if valid_peaks else 0.0
             details = r_details
             cached_pm25 = "--"
+            
+        # 3. 🌟 [핵심 패치] 엑셀에도 없고 오늘 것도 아닌 빈 날짜(어제, 그제 등)인 경우
         else:
-            usage, peak, details = 0.0, 0.0, []
+            if date_str not in GLOBAL_RECENT_CACHE:
+                GLOBAL_RECENT_CACHE[date_str] = {}
+                
+            # 캐시가 비어있으면 0을 뱉는 대신 딱 한 번만 라이브로 가져와서 영구 저장!
+            if station not in GLOBAL_RECENT_CACHE[date_str]:
+                _u, _p, _d = get_kepco_data_for_station(station, date_str)
+                GLOBAL_RECENT_CACHE[date_str][station] = {"usage_kwh": _u, "peak_kw": _p, "details": _d}
+                
+            usage = GLOBAL_RECENT_CACHE[date_str][station]["usage_kwh"]
+            peak = GLOBAL_RECENT_CACHE[date_str][station]["peak_kw"]
+            details = GLOBAL_RECENT_CACHE[date_str][station]["details"]
             cached_pm25 = "--"
-            for m in range(96):
-                hh = m // 4; mm = (m % 4) * 15 + 15
-                if mm == 60: hh += 1; mm = 0
-                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
         co2 = usage * 0.466 / 1000
         
-        # 날씨 데이터 역시 캐시나 글로벌 메모리에서만 맵핑
         tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
         tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
         humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
@@ -570,7 +579,7 @@ def get_dashboard_data(station: str, start: str, end: str):
 
     return {
         "station_name": station, 
-        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 캐싱 렌더링)",
+        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 스마트 캐싱)",
         "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
         "daily_records": records
     }
