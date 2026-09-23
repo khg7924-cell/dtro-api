@@ -2,8 +2,6 @@ import os
 import time
 import io
 import json
-import logging
-import asyncio
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -19,9 +17,6 @@ import urllib3
 from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -44,46 +39,11 @@ http_session.verify = False
 
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
-GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
-GLOBAL_PAST_CACHE = {}
-GLOBAL_TODAY_CACHE = {
-    "date": None,
-    "last_update": 0,
-    "kepco": {},
-    "weather": {}
-}
+GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
-
-STATION_AWS_MAP = {
-    # 991 (달성군 옥포읍) - 화원읍과 가장 인접
-    '설화명곡': '991', '월배기지': '991',
-    
-    # 846 (대구서구 중리동) - AWS가 없는 달서구, 남구 지역의 최인접 보완
-    '서부정류장': '846', '성서산단': '846', '죽전': '846', '반고개': '846',
-    
-    # 143 (대구 ASOS 동구 효목동) - AWS가 없는 중구, 수성구 중심부 커버
-    '반월당': '143', '종합청사': '143', '남산': '143', '대구은행': '143', 
-    '만촌': '143', '수성알파시티': '143', '범물기지': '143', 
-    '전체': '143', '1호선': '143', '2호선': '143', '3호선': '143',
-    
-    # 860 (동구 신암동) 
-    '신천': '860', '방촌': '860',
-    
-    # 827 (경산시 중방동) - 신암동보다 시지/안심 지역에 더 인접함
-    '안심': '827', '숙천': '827', '사월': '827', '영남대': '827',
-    
-    # 840 (경산시 하양읍)
-    '금락': '840',
-    
-    # 992 (달성군 하빈면) - 다사읍과 바로 맞닿아 있음
-    '문양기지': '992', '대실': '992',
-    
-    # 845 (대구북구 침산동/연암공원)
-    '칠곡기지': '845', '팔달시장': '845'
-}
 
 STATION_CUST_MAP = {
     '설화명곡': '0526314773', '월배기지': '0526314773', '서부정류장': '0526314773', 
@@ -123,31 +83,18 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
-async def prefetch_gap_data():
-    df = GLOBAL_EXCEL_CACHE.get("df")
-    if df is not None and not df.empty:
-        last_date = pd.to_datetime(df['date'].max())
-        yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        diff = (yesterday - last_date).days
-        if diff > 0:
-            if diff > 14: diff = 14
-            missing_dates = [(last_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, diff + 1)]
-            logger.info(f"🚀 [사전 캐싱] 엑셀 누락분({len(missing_dates)}일치) 데이터 영구 저장 시작...")
-            def run_update():
-                update_past_cache(missing_dates)
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, run_update)
-            logger.info("✅ [사전 캐싱 완료] 데이터 표출 준비 완료!")
-            
-    def init_today():
-        update_today_cache()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, init_today)
-
-@app.on_event("startup")
-async def startup_event():
-    load_excel_dataset()
-    asyncio.create_task(prefetch_gap_data())
+STATION_AWS_MAP = {
+    '설화명곡': '991', '월배기지': '991',
+    '서부정류장': '846', '성서산단': '846', '죽전': '846', '반고개': '846',
+    '반월당': '143', '종합청사': '143', '남산': '143', '대구은행': '143', 
+    '만촌': '143', '수성알파시티': '143', '범물기지': '143', 
+    '전체': '143', '1호선': '143', '2호선': '143', '3호선': '143',
+    '신천': '860', '방촌': '860',
+    '안심': '827', '숙천': '827', '사월': '827', '영남대': '827',
+    '금락': '840',
+    '문양기지': '992', '대실': '992',
+    '칠곡기지': '845', '팔달시장': '845'
+}
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -155,8 +102,6 @@ async def upload_file(file: UploadFile = File(...)):
         contents = await file.read()
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
-        load_excel_dataset()
-        asyncio.create_task(prefetch_gap_data())
         return {"status": "success", "filename": file.filename}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -208,7 +153,33 @@ def load_excel_dataset():
     except Exception: 
         return None
 
+# 🌟 Open-Meteo 캐싱 추가
 def fetch_openmeteo_env(lat, lon, start_date, end_date):
+    s_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    e_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    diff = (e_dt - s_dt).days + 1
+    
+    cached_res = {}
+    is_fully_cached = True
+    for i in range(diff):
+        d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+        ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
+        ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
+        
+        if ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
+            cached_res[d_str] = {
+                "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
+                "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
+                "tmin": GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_tmin", "--"),
+                "humi": GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_humi", "--")
+            }
+        else:
+            is_fully_cached = False
+            break
+            
+    if is_fully_cached:
+        return cached_res
+
     env_data = {}
     url_a = "https://air-quality-api.open-meteo.com/v1/air-quality"
     params_a = {"latitude": lat, "longitude": lon, "start_date": start_date, "end_date": end_date, "hourly": "pm2_5", "timezone": "Asia/Seoul"}
@@ -249,6 +220,15 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
                 if tmins and i < len(tmins) and tmins[i] is not None: env_data[t]["tmin"] = round(tmins[i], 1)
                 if t in humi_dict: env_data[t]["humi"] = round(sum(humi_dict[t])/len(humi_dict[t]), 1)
     except: pass
+
+    # 캐시 저장
+    for d_str, v in env_data.items():
+        if d_str < get_kst_now().strftime("%Y-%m-%d"):
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = v.get("pm25", "--")
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = v.get("tmax", "--")
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = v.get("tmin", "--")
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_humi"] = v.get("humi", "--")
+            
     return env_data
 
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
@@ -274,10 +254,10 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
                 for line in lines:
                     if line.strip() and not line.startswith('#'):
                         parts = line.split()
-                        # 🌟 [완벽한 버그 해결] 관측소 번호는 parts[1], 데이터 값은 parts[5]
-                        if len(parts) >= 6 and parts[1] == stn_id:
+                        # 🌟 원본 로직 유지 (동네 매핑 정확)
+                        if len(parts) >= 2 and parts[0] == stn_id:
                             try:
-                                fv = float(parts[5])
+                                fv = float(parts[1])
                                 if fv > -50.0:  
                                     if d_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_WEATHER_CACHE[cache_key] = fv
                                     return key, fv
@@ -302,12 +282,33 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
             if val != "--": res[d_str][key] = val
     return res
 
+# 🌟 ASOS 캐싱 추가
 def fetch_asos_daily(start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     yesterday = get_kst_now() - timedelta(days=1)
     if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
     if s_dt > e_dt: return {} 
+
+    diff = (e_dt - s_dt).days + 1
+    cached_res = {}
+    is_fully_cached = True
+    for i in range(diff):
+        d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+        ck_tmax = f"ASOS_{d_str}_tmax"
+        if ck_tmax in GLOBAL_WEATHER_CACHE:
+            cached_res[d_str] = {
+                "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
+                "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
+                "tavg": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", "--"),
+                "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
+            }
+        else:
+            is_fully_cached = False
+            break
+            
+    if is_fully_cached:
+        return cached_res
 
     res = {}
     y_s = s_dt.strftime("%Y%m%d")
@@ -348,6 +349,14 @@ def fetch_asos_daily(start_date: str, end_date: str):
                             }
             if res: break 
         except: time.sleep(0.5)
+
+    # 캐시 저장
+    for d_str, v in res.items():
+        if d_str < get_kst_now().strftime("%Y-%m-%d"):
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v.get("tmax", "--")
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v.get("tmin", "--")
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v.get("tavg", "--")
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v.get("humi", "--")
     return res
 
 def fetch_kepco_day_lp(cust_no: str, date_str: str):
@@ -426,103 +435,6 @@ def get_kepco_data_for_station(station: str, date_str: str):
         
     return total_usage, max_peak, details
 
-def update_today_cache():
-    today_str = get_kst_now().strftime("%Y-%m-%d")
-    current_time = time.time()
-    target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
-
-    if GLOBAL_TODAY_CACHE.get("date") != today_str:
-        GLOBAL_TODAY_CACHE["date"] = today_str
-        GLOBAL_TODAY_CACHE["weather"] = {}
-        GLOBAL_TODAY_CACHE["kepco"] = {}
-        
-        with ThreadPoolExecutor(max_workers=10) as weather_exec:
-            f_as = weather_exec.submit(fetch_asos_daily, today_str, today_str)
-            aws_futures = {aws_stn: weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, today_str, today_str) for aws_stn in set(STATION_AWS_MAP.values())}
-            om_futures = {}
-            for st in target_stations:
-                lat, lon = STATION_COORD_MAP.get(st, (35.8714, 128.6014))
-                k = f"{lat}_{lon}"
-                if k not in om_futures:
-                    om_futures[k] = weather_exec.submit(fetch_openmeteo_env, lat, lon, today_str, today_str)
-        
-        as_data = f_as.result()
-        aws_results = {stn: f.result() for stn, f in aws_futures.items()} 
-        om_results = {k: f.result() for k, f in om_futures.items()}
-
-        for st in target_stations:
-            aws_stn = STATION_AWS_MAP.get(st, '143')
-            lat, lon = STATION_COORD_MAP.get(st, (35.8714, 128.6014))
-            om_data = om_results[f"{lat}_{lon}"]
-            
-            env_a = aws_results[aws_stn].get(today_str, {})
-            tmax = env_a.get("tmax", "--")
-            tmin = env_a.get("tmin", "--")
-            humi = env_a.get("humi", "--")
-            
-            if tmax == "--": tmax = as_data.get(today_str, {}).get("tmax", "--")
-            if tmax == "--": tmax = om_data.get(today_str, {}).get("tmax", "--")
-            if tmin == "--": tmin = as_data.get(today_str, {}).get("tmin", "--")
-            if tmin == "--": tmin = om_data.get(today_str, {}).get("tmin", "--")
-            if humi == "--": humi = as_data.get(today_str, {}).get("humi", "--")
-            if humi == "--": humi = om_data.get(today_str, {}).get("humi", "--")
-            
-            pm25 = om_data.get(today_str, {}).get("pm25", "--")
-            GLOBAL_TODAY_CACHE["weather"][st] = {"tmax": tmax, "tmin": tmin, "humi": humi, "pm25": pm25}
-
-    if current_time - GLOBAL_TODAY_CACHE.get("last_update", 0) >= 600:
-        get_kepco_data_for_station('전체', today_str) 
-        for st in target_stations:
-            u, p, d = get_kepco_data_for_station(st, today_str)
-            GLOBAL_TODAY_CACHE["kepco"][st] = {"usage_kwh": u, "peak_kw": p, "details": d}
-        GLOBAL_TODAY_CACHE["last_update"] = current_time
-
-def update_past_cache(missing_dates):
-    if not missing_dates: return
-    target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
-    start_str = min(missing_dates)
-    end_str = max(missing_dates)
-    
-    with ThreadPoolExecutor(max_workers=10) as weather_exec:
-        f_as = weather_exec.submit(fetch_asos_daily, start_str, end_str)
-        aws_futures = {aws_stn: weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_str, end_str) for aws_stn in set(STATION_AWS_MAP.values())}
-        om_futures = {}
-        for st in target_stations:
-            lat, lon = STATION_COORD_MAP.get(st, (35.8714, 128.6014))
-            k = f"{lat}_{lon}"
-            if k not in om_futures:
-                om_futures[k] = weather_exec.submit(fetch_openmeteo_env, lat, lon, start_str, end_str)
-            
-    as_data = f_as.result()
-    aws_results = {stn: f.result() for stn, f in aws_futures.items()}
-    om_results = {k: f.result() for k, f in om_futures.items()}
-
-    for d_str in missing_dates:
-        GLOBAL_PAST_CACHE[d_str] = {}
-        get_kepco_data_for_station('전체', d_str) 
-        
-        for st in target_stations:
-            u, p, d = get_kepco_data_for_station(st, d_str)
-            aws_stn = STATION_AWS_MAP.get(st, '143')
-            lat, lon = STATION_COORD_MAP.get(st, (35.8714, 128.6014))
-            om_data = om_results[f"{lat}_{lon}"]
-            
-            env_a = aws_results[aws_stn].get(d_str, {})
-            tmax = env_a.get("tmax", "--")
-            tmin = env_a.get("tmin", "--")
-            humi = env_a.get("humi", "--")
-            
-            if tmax == "--": tmax = as_data.get(d_str, {}).get("tmax", "--")
-            if tmin == "--": tmin = as_data.get(d_str, {}).get("tmin", "--")
-            if humi == "--": humi = as_data.get(d_str, {}).get("humi", "--")
-            
-            pm25 = om_data.get(d_str, {}).get("pm25", "--")
-
-            GLOBAL_PAST_CACHE[d_str][st] = {
-                "usage_kwh": u, "peak_kw": p, "details": d,
-                "tmax": tmax, "tmin": tmin, "humi": humi, "pm25": pm25
-            }
-
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
     start_dt, end_dt = datetime.strptime(start, "%Y-%m-%d"), datetime.strptime(end, "%Y-%m-%d")
@@ -531,9 +443,16 @@ def get_dashboard_data(station: str, start: str, end: str):
     df = load_excel_dataset()
     excel_cache = {}
     if df is not None:
-        if station == '전체': kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]; peak_cols = [c for c in df.columns if 'peak_kw' in c and '종합청사' not in c]
-        elif station in LINE_STATIONS: kwh_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'total_kwh' in c]; peak_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'peak_kw' in c]
-        else: kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]; peak_cols = [c for c in df.columns if station in c and 'peak_kw' in c]
+        if station == '전체':
+            kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
+            peak_cols = [c for c in df.columns if 'peak_kw' in c and '종합청사' not in c]
+        elif station in LINE_STATIONS:
+            line_stations = LINE_STATIONS[station]
+            kwh_cols = [c for c in df.columns if any(s in c for s in line_stations) and 'total_kwh' in c]
+            peak_cols = [c for c in df.columns if any(s in c for s in line_stations) and 'peak_kw' in c]
+        else:
+            kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
+            peak_cols = [c for c in df.columns if station in c and 'peak_kw' in c]
 
         for _, row in df.iterrows():
             if pd.notna(row['date']):
@@ -544,119 +463,77 @@ def get_dashboard_data(station: str, start: str, end: str):
                 if usage > 0:
                     excel_cache[d_str] = {"usage_kwh": usage, "peak_kw": peak, "pm25": pm25_val}
 
-    today_str = get_kst_now().strftime("%Y-%m-%d")
-    update_today_cache()
-
-    missing_past_dates = []
-    excel_missing_weather_dates = []
-    
-    for i in range(diff):
-        d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
-        if d_str == today_str: continue
-        
-        if d_str in excel_cache:
-            aws_stn = STATION_AWS_MAP.get(station, '143')
-            if f"AWS_{aws_stn}_{d_str}_tmax" not in GLOBAL_WEATHER_CACHE:
-                excel_missing_weather_dates.append(d_str)
-        else:
-            if d_str not in GLOBAL_PAST_CACHE:
-                missing_past_dates.append(d_str)
-                
-    if missing_past_dates:
-        update_past_cache(missing_past_dates)
-        
-    openmeteo_ex, as_ex, aws_ex = {}, {}, {}
-    if excel_missing_weather_dates:
-        aws_stn = STATION_AWS_MAP.get(station, '143')
-        min_d, max_d = min(excel_missing_weather_dates), max(excel_missing_weather_dates)
-        with ThreadPoolExecutor(max_workers=5) as weather_exec:
-            f_as = weather_exec.submit(fetch_asos_daily, min_d, max_d)
-            f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, min_d, max_d)
-            lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
-            f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, min_d, max_d)
-        
-        as_ex = f_as.result()
-        aws_ex = f_aw.result()
-        openmeteo_ex = f_om.result()
-        
-        for d in excel_missing_weather_dates:
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_pm25"] = openmeteo_ex.get(d, {}).get("pm25", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_tmax"] = openmeteo_ex.get(d, {}).get("tmax", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_tmin"] = openmeteo_ex.get(d, {}).get("tmin", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_humi"] = openmeteo_ex.get(d, {}).get("humi", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d}_tmax"] = as_ex.get(d, {}).get("tmax", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d}_tmin"] = as_ex.get(d, {}).get("tmin", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d}_humi"] = as_ex.get(d, {}).get("humi", "--")
-
-    records = []
-    tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
-    
-    safe_empty_details = []
-    for m in range(96):
-        hh = m // 4
-        mm = (m % 4) * 15 + 15
-        if mm == 60: hh += 1; mm = 0
-        safe_empty_details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
-    
-    for i in range(diff):
-        d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
-        
-        if d_str == today_str:
-            st_data = GLOBAL_TODAY_CACHE["kepco"].get(station, {})
-            usage = st_data.get("usage_kwh", 0.0)
-            peak = st_data.get("peak_kw", 0.0)
-            details = st_data.get("details", safe_empty_details)
-            if not details: details = safe_empty_details
-            
-            w_data = GLOBAL_TODAY_CACHE["weather"].get(station, {})
-            tmax = w_data.get("tmax", "--")
-            tmin = w_data.get("tmin", "--")
-            humi = w_data.get("humi", "--")
-            pm25 = w_data.get("pm25", "--")
-            
-        elif d_str in excel_cache:
-            usage = excel_cache[d_str]["usage_kwh"]
-            peak = excel_cache[d_str]["peak_kw"]
-            pm25 = excel_cache[d_str]["pm25"]
-            details = safe_empty_details
-            
-            aws_stn = STATION_AWS_MAP.get(station, '143')
-            tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{d_str}_tmax", "--")
-            tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{d_str}_tmin", "--")
-            humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{d_str}_humi", "--")
-            
-            if tmax == "--": tmax = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", "--")
-            if tmax == "--": tmax = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_tmax", "--")
-            if tmin == "--": tmin = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--")
-            if tmin == "--": tmin = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_tmin", "--")
-            if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
-            if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_humi", "--")
-            
-            if pm25 == "--":
-                pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_pm25", "--")
-                
-        else:
-            st_data = GLOBAL_PAST_CACHE.get(d_str, {}).get(station, {})
-            usage = st_data.get("usage_kwh", 0.0)
-            peak = st_data.get("peak_kw", 0.0)
-            details = st_data.get("details", safe_empty_details)
-            if not details: details = safe_empty_details
-            
-            tmax = st_data.get("tmax", "--")
-            tmin = st_data.get("tmin", "--")
-            humi = st_data.get("humi", "--")
-            pm25 = st_data.get("pm25", "--")
-                
-        co2 = usage * 0.466 / 1000
-        records.append({
-            "date": d_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
-            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
-        })
-        tot_usage += usage
-        if peak > max_peak: max_peak = peak
-        tot_co2 += co2
-
+    lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     aws_stn = STATION_AWS_MAP.get(station, '143')
+    
+    with ThreadPoolExecutor(max_workers=3) as weather_exec:
+        future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+        future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+        future_asos = weather_exec.submit(fetch_asos_daily, start, end)
+        
+        openmeteo_data = future_om.result()
+        aws_data = future_aws.result()
+        asos_data = future_asos.result()
+    
+    today_str = get_kst_now().strftime("%Y-%m-%d")
+
+    def process_day(i):
+        curr_date = start_dt + timedelta(days=i)
+        date_str = curr_date.strftime("%Y-%m-%d")
+        
+        if date_str in excel_cache:
+            usage = excel_cache[date_str]["usage_kwh"]
+            peak = excel_cache[date_str]["peak_kw"]
+            cached_pm25 = excel_cache[date_str]["pm25"]
+            details = []
+            for m in range(96):
+                hh = m // 4; mm = (m % 4) * 15 + 15
+                if mm == 60: hh += 1; mm = 0
+                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
+        else:
+            if date_str >= "2026-09-04": usage, peak, details = get_kepco_data_for_station(station, date_str)
+            else: usage, peak, details = 0.0, 0.0, []
+            cached_pm25 = "--"
+            
+        co2 = usage * 0.466 / 1000
+        
+        env_o = openmeteo_data.get(date_str, {})
+        env_a = aws_data.get(date_str, {})
+        
+        tmax = env_a.get("tmax", "--")
+        tmin = env_a.get("tmin", "--")
+        humi = env_a.get("humi", "--")
+        
+        if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
+        if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
+        if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
+        
+        if date_str >= today_str or (tmax == "--" and tmin == "--"):
+            if tmax == "--": tmax = env_o.get("tmax", "--")
+            if tmin == "--": tmin = env_o.get("tmin", "--")
+            if humi == "--": humi = env_o.get("humi", "--")
+        
+        pm25 = cached_pm25 if cached_pm25 != "--" else env_o.get("pm25", "--")
+
+        if not details or len(details) < 96:
+            details = []
+            for m in range(96):
+                hh = m // 4; mm = (m % 4) * 15 + 15
+                if mm == 60: hh += 1; mm = 0
+                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
+
+        return {
+            "date": date_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
+            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
+        }
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        records = list(executor.map(process_day, range(diff)))
+
+    tot_usage = sum(r["usage_kwh"] for r in records)
+    max_peak = max((r["peak_kw"] for r in records), default=0.0)
+    tot_co2 = sum(r["co2"] for r in records)
+
     return {
         "station_name": station, 
         "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
@@ -666,32 +543,28 @@ def get_dashboard_data(station: str, start: str, end: str):
 
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
-    update_today_cache()
-    today_str = get_kst_now().strftime("%Y-%m-%d")
+    kst_now = get_kst_now()
+    today_str = kst_now.strftime("%Y-%m-%d")
     
-    st_data = GLOBAL_TODAY_CACHE["kepco"].get(station, {})
-    details = st_data.get("details", [])
+    kepco_data = get_kepco_data_for_station(station, today_str)
+    day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
     if not details or len(details) < 96:
         details = []
         for m in range(96):
-            hh = m // 4
-            mm = (m % 4) * 15 + 15
+            hh = m // 4; mm = (m % 4) * 15 + 15
             if mm == 60: hh += 1; mm = 0
-            details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": None, "peak_kw": None})
+            details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
-    now_minutes = get_kst_now().hour * 60 + get_kst_now().minute
-    res_details = []
-    
+    now_minutes = kst_now.hour * 60 + kst_now.minute
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
         time_m = hh * 60 + mm if hh != 24 else 24 * 60
         if time_m > now_minutes:
-            res_details.append({"time": d["time"], "usage_kwh": None, "peak_kw": None})
-        else:
-            res_details.append(d.copy())
+            d["usage_kwh"] = None
+            d["peak_kw"] = None
             
-    return {"station_name": station, "date": today_str, "records": res_details}
+    return {"station_name": station, "date": today_str, "records": details}
 
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
