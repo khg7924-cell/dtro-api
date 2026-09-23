@@ -472,7 +472,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (온디맨드 스마트 캐싱 패치 적용)
+# 🚀 1. 통합 대시보드 (스마트 캐싱 + 3중 기상 데이터 백업/대기 완벽 복구)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -508,12 +508,19 @@ def get_dashboard_data(station: str, start: str, end: str):
     missing_weather = [ (start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(diff) 
                         if f"AWS_{aws_stn}_{(start_dt + timedelta(days=i)).strftime('%Y-%m-%d')}_tmax" not in GLOBAL_WEATHER_CACHE ]
     
+    openmeteo_data, aws_data, asos_data = {}, {}, {}
+    
+    # 🌟 [버그 수정 1] 백그라운드 호출 후 데이터가 올 때까지 기다림 (.result() 복구)
     if missing_weather:
         lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
         with ThreadPoolExecutor(max_workers=3) as weather_exec:
-            weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
-            weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
-            weather_exec.submit(fetch_asos_daily, start, end)
+            future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+            future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+            future_asos = weather_exec.submit(fetch_asos_daily, start, end)
+            
+            openmeteo_data = future_om.result()
+            aws_data = future_aws.result()
+            asos_data = future_asos.result()
 
     records = []
     tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
@@ -522,7 +529,7 @@ def get_dashboard_data(station: str, start: str, end: str):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        # 1. 엑셀에 데이터가 있으면 가장 먼저 사용
+        # [전력량 세팅 로직 - 온디맨드 스마트 캐싱 유지]
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
@@ -532,8 +539,6 @@ def get_dashboard_data(station: str, start: str, end: str):
                 hh = m // 4; mm = (m % 4) * 15 + 15
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
-                
-        # 2. 당일(오늘)이면 15분 실시간 캐시 사용
         elif date_str == today_str:
             r_details = GLOBAL_REALTIME_CACHE.get("data", {}).get(station, [])
             valid_usages = [d.get("usage_kwh", 0) for d in r_details if d.get("usage_kwh") is not None]
@@ -542,13 +547,9 @@ def get_dashboard_data(station: str, start: str, end: str):
             peak = max(valid_peaks) if valid_peaks else 0.0
             details = r_details
             cached_pm25 = "--"
-            
-        # 3. 🌟 [핵심 패치] 엑셀에도 없고 오늘 것도 아닌 빈 날짜(어제, 그제 등)인 경우
         else:
             if date_str not in GLOBAL_RECENT_CACHE:
                 GLOBAL_RECENT_CACHE[date_str] = {}
-                
-            # 캐시가 비어있으면 0을 뱉는 대신 딱 한 번만 라이브로 가져와서 영구 저장!
             if station not in GLOBAL_RECENT_CACHE[date_str]:
                 _u, _p, _d = get_kepco_data_for_station(station, date_str)
                 GLOBAL_RECENT_CACHE[date_str][station] = {"usage_kwh": _u, "peak_kw": _p, "details": _d}
@@ -560,10 +561,31 @@ def get_dashboard_data(station: str, start: str, end: str):
             
         co2 = usage * 0.466 / 1000
         
+        # 🌟 [버그 수정 2] 3중 기상 데이터 릴레이 보완(Fallback) 로직 완벽 복구
         tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
         tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
         humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
+        
+        # 1차 보완: 메모리에 없으면 방금 호출한 동네 AWS 결과 적용
+        if tmax == "--" or tmin == "--":
+            env_a = aws_data.get(date_str, {})
+            tmax = env_a.get("tmax", tmax)
+            tmin = env_a.get("tmin", tmin)
+            humi = env_a.get("humi", humi)
+            
+            # 2차 보완: 동네 AWS가 점검 중이면 대구 대표 ASOS 적용
+            if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
+            if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
+            if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
+            
+            # 3차 보완: ASOS마저 없으면 최후의 글로벌 Open-Meteo 적용
+            if tmax == "--": tmax = openmeteo_data.get(date_str, {}).get("tmax", "--")
+            if tmin == "--": tmin = openmeteo_data.get(date_str, {}).get("tmin", "--")
+            
+        # 미세먼지도 엑셀에 없으면 Open-Meteo에서 즉시 채움
         pm25 = cached_pm25
+        if pm25 == "--":
+            pm25 = openmeteo_data.get(date_str, {}).get("pm25", "--")
         
         return {
             "date": date_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
