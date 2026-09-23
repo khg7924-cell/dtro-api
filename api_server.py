@@ -824,7 +824,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (사전 학습 모델 / 기상청 ASOS 실측치 기반 시뮬레이션)
+# 🚀 3. AI 수요 예측 (기상청 ASOS 실측치 기반 시뮬레이션 복구 및 버그 픽스)
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
@@ -837,6 +837,34 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         
         target_y = int(target_year)
         
+        if station == '전체':
+            kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
+            df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
+        elif station in LINE_STATIONS:
+            line_stations = LINE_STATIONS[station]
+            kwh_cols = [c for c in df.columns if any(s in c for s in line_stations) and 'total_kwh' in c]
+            df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
+        else:
+            kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
+            df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
+            
+        # 🌟 [버그 픽스] 누락되었던 기상청 데이터(ASOS) 다운로드 및 병합 로직 복구
+        asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
+        
+        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
+        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if asos_data.get(x, {}).get('tmin') != "--" else np.nan)
+        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if asos_data.get(x, {}).get('tavg') != "--" else np.nan)
+        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if asos_data.get(x, {}).get('humi') != "--" else np.nan)
+        
+        if df['temp_max'].isna().all():
+            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 다시 시도해 주세요."}
+            
+        df['temp_max'] = df['temp_max'].bfill().ffill()
+        df['temp_min'] = df['temp_min'].bfill().ffill()
+        df['temp_avg'] = df['temp_avg'].bfill().ffill()
+        df['humidity'] = df['humidity'].bfill().ffill()
+
+        # 데이터 프레임 생성
         start_dt = pd.to_datetime(f"{target_y}-01-01")
         end_dt = pd.to_datetime(f"{target_y}-12-31")
         full_year_dates = pd.date_range(start=start_dt, end=end_dt)
@@ -848,7 +876,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         test_df['is_weekend'] = test_df['dayofweek'].isin([5,6]).astype(int)
         test_df['is_holiday'] = test_df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
-        # 🌟 1. 베이스라인: 직전 연도의 기상청(ASOS) 실측 날씨를 일자별(MM-DD)로 완벽히 복제
+        # 🌟 1. 베이스라인: 직전 연도의 기상청(ASOS) 실측 날씨 일자별 복제 (MM-DD 기준)
         last_year = target_y - 1
         last_year_df = df[df['date'].dt.year == last_year].copy()
         last_year_df['mm_dd'] = last_year_df['date'].dt.strftime('%m-%d')
@@ -856,7 +884,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
 
         test_df['mm_dd'] = test_df['date'].dt.strftime('%m-%d')
         
-        # 만약 윤년(2월 29일) 등으로 매핑 안 되는 날짜는 전체 평균으로 예외 처리
+        # 윤년(2월 29일) 등 매핑 안 되는 날짜는 해당 연도 전체 평균으로 예외 처리
         test_df['temp_max'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_max'] if x in last_year_weather.index else df['temp_max'].mean())
         test_df['temp_min'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_min'] if x in last_year_weather.index else df['temp_min'].mean())
         test_df['temp_avg'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_avg'] if x in last_year_weather.index else df['temp_avg'].mean())
@@ -866,7 +894,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if pd.isna(last_year_pass): last_year_pass = 10000
         test_df['passengers'] = last_year_pass * (1 + (pass_rate / 100.0))
 
-        # 🌟 2. 시뮬레이션: 복제된 실제 ASOS 날씨 위에 웹(UI)에서 설정한 가감(Delta) 변수 적용
+        # 🌟 2. 시뮬레이션: 복제된 ASOS 기반 데이터에 가감(Delta) 변수 덧씌우기
         if temp_adj != 0:
             test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
             test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
@@ -879,20 +907,17 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             
         features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
         
-        # 미세먼지도 실제 과거 데이터 기반으로 매핑 후 시뮬레이션 일수 조절
         if 'pm25_val' in df.columns:
             test_df['pm25'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'pm25_val'] if x in last_year_weather.index else df['pm25_val'].mean())
             if pm25_adj > 0:
-                # 미세먼지 좋은 날 중 랜덤하게 N일을 '나쁨(45.0)'으로 악화시킴
                 normal_idx = test_df[test_df['pm25'] <= 35].sort_values('pm25', ascending=False).head(pm25_adj).index
                 test_df.loc[normal_idx, 'pm25'] = 45.0
             elif pm25_adj < 0:
-                # 미세먼지 나쁜 날 중 랜덤하게 N일을 '좋음(25.0)'으로 개선시킴
                 bad_idx = test_df[test_df['pm25'] > 35].sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
                 test_df.loc[bad_idx, 'pm25'] = 25.0
             features.append('pm25')
 
-        # 🌟 글로벌 캐시에서 학습 완료된 AI 모델 꺼내기
+        # 학습 모델 호출 (또는 fallback 즉시 훈련)
         cache_obj = GLOBAL_EXCEL_CACHE.get("ai_models", {}).get(station)
         if cache_obj:
             model = cache_obj["model"]
@@ -912,10 +937,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
             model.fit(train_df[train_features], y_train)
 
-        # 1초 만에 미래 1년치 예측 완료
+        # 예측 실행
         test_df['pred_power'] = model.predict(test_df[train_features])
         
-        # 부하증감 신고 데이터 파싱 및 예측치 가산/차감
+        # 부하증감 데이터 파싱 및 예측치 연동
         if reports_data:
             try:
                 local_reports = json.loads(reports_data)
@@ -933,7 +958,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                             hours_val = float(r_info.get('hours', 0))
                             daily_kwh = kw_val * hours_val
                             if '철거' in str(r_info.get('type', '')): daily_kwh = -daily_kwh
-
                             mask_after = (test_df['date'] >= app_date)
                             test_df.loc[mask_after, 'pred_power'] += daily_kwh
             except Exception as parse_err:
@@ -962,7 +986,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         }
         feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
         feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
-        
         top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
         
         records = []
@@ -976,6 +999,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             "chart_data": records, "feat_data": top_feats
         }
     except Exception as e:
+        import traceback
         return {"error": f"서버 예측 연산 실패: {str(e)}\n\n{traceback.format_exc()}"}
     
 # =========================================================================
