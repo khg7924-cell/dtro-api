@@ -824,7 +824,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (사전 학습 모델 / 캐싱 활용)
+# 🚀 3. AI 수요 예측 (사전 학습 모델 / 기상청 ASOS 실측치 기반 시뮬레이션)
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
@@ -841,7 +841,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         end_dt = pd.to_datetime(f"{target_y}-12-31")
         full_year_dates = pd.date_range(start=start_dt, end=end_dt)
         
-        # 테스트를 위한 베이스라인 데이터(Test Data) 구성
         test_df = pd.DataFrame({'date': full_year_dates})
         kr_holidays = holidays.KR()
         test_df['month'] = test_df['date'].dt.month
@@ -849,16 +848,25 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         test_df['is_weekend'] = test_df['dayofweek'].isin([5,6]).astype(int)
         test_df['is_holiday'] = test_df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
-        # 전년도(과거) 평균값을 기반으로 미래 시나리오 변수 구성
-        test_df['temp_max'] = df['temp_max'].mean() if 'temp_max' in df else 20.0
-        test_df['temp_min'] = df['temp_min'].mean() if 'temp_min' in df else 10.0
-        test_df['temp_avg'] = df['temp_avg'].mean() if 'temp_avg' in df else 15.0
-        test_df['humidity'] = df['humidity'].mean() if 'humidity' in df else 60.0
+        # 🌟 1. 베이스라인: 직전 연도의 기상청(ASOS) 실측 날씨를 일자별(MM-DD)로 완벽히 복제
+        last_year = target_y - 1
+        last_year_df = df[df['date'].dt.year == last_year].copy()
+        last_year_df['mm_dd'] = last_year_df['date'].dt.strftime('%m-%d')
+        last_year_weather = last_year_df.drop_duplicates(subset=['mm_dd']).set_index('mm_dd')
+
+        test_df['mm_dd'] = test_df['date'].dt.strftime('%m-%d')
         
-        last_year_pass = df.loc[df['date'].dt.year == (target_y - 1), pass_col].mean()
+        # 만약 윤년(2월 29일) 등으로 매핑 안 되는 날짜는 전체 평균으로 예외 처리
+        test_df['temp_max'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_max'] if x in last_year_weather.index else df['temp_max'].mean())
+        test_df['temp_min'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_min'] if x in last_year_weather.index else df['temp_min'].mean())
+        test_df['temp_avg'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_avg'] if x in last_year_weather.index else df['temp_avg'].mean())
+        test_df['humidity'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'humidity'] if x in last_year_weather.index else df['humidity'].mean())
+        
+        last_year_pass = last_year_weather[pass_col].mean() if pass_col in last_year_weather.columns else 10000
         if pd.isna(last_year_pass): last_year_pass = 10000
         test_df['passengers'] = last_year_pass * (1 + (pass_rate / 100.0))
 
+        # 🌟 2. 시뮬레이션: 복제된 실제 ASOS 날씨 위에 웹(UI)에서 설정한 가감(Delta) 변수 적용
         if temp_adj != 0:
             test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
             test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
@@ -871,10 +879,17 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             
         features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
         
+        # 미세먼지도 실제 과거 데이터 기반으로 매핑 후 시뮬레이션 일수 조절
         if 'pm25_val' in df.columns:
-            test_df['pm25'] = df['pm25_val'].mean()
-            if pm25_adj > 0: test_df.loc[test_df.index[:pm25_adj], 'pm25'] = 45.0
-            elif pm25_adj < 0: test_df.loc[test_df.index[:abs(pm25_adj)], 'pm25'] = 25.0
+            test_df['pm25'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'pm25_val'] if x in last_year_weather.index else df['pm25_val'].mean())
+            if pm25_adj > 0:
+                # 미세먼지 좋은 날 중 랜덤하게 N일을 '나쁨(45.0)'으로 악화시킴
+                normal_idx = test_df[test_df['pm25'] <= 35].sort_values('pm25', ascending=False).head(pm25_adj).index
+                test_df.loc[normal_idx, 'pm25'] = 45.0
+            elif pm25_adj < 0:
+                # 미세먼지 나쁜 날 중 랜덤하게 N일을 '좋음(25.0)'으로 개선시킴
+                bad_idx = test_df[test_df['pm25'] > 35].sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
+                test_df.loc[bad_idx, 'pm25'] = 25.0
             features.append('pm25')
 
         # 🌟 글로벌 캐시에서 학습 완료된 AI 모델 꺼내기
@@ -883,7 +898,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             model = cache_obj["model"]
             train_features = cache_obj["features"]
         else:
-            # 혹시 캐시에 없다면, 즉시 학습 진행 (Fallback)
             if station == '전체': kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
             elif station in LINE_STATIONS: kwh_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'total_kwh' in c]
             else: kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
@@ -891,7 +905,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             y_train = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
             train_features = features
             
-            train_df = df[df['date'].dt.year <= (target_y - 1)].copy()
+            train_df = df[df['date'].dt.year <= last_year].copy()
             train_df = train_df.dropna(subset=train_features)
             y_train = y_train.loc[train_df.index]
             
@@ -925,7 +939,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             except Exception as parse_err:
                 logger.error(f"로컬 부하증감 파싱 중 오류: {parse_err}")
 
-        train_last_year_df = df[df['date'].dt.year == (target_y - 1)]
+        train_last_year_df = df[df['date'].dt.year == last_year]
         if station == '전체': kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
         elif station in LINE_STATIONS: kwh_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'total_kwh' in c]
         else: kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
