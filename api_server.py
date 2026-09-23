@@ -103,9 +103,6 @@ STATION_AWS_MAP = {
     '전체': '143', '1호선': '143', '2호선': '143', '3호선': '143'
 }
 
-# =========================================================================
-# 🚀 [추가] 서버 구동 시 즉각적인 캐싱
-# =========================================================================
 async def prefetch_gap_data():
     df = GLOBAL_EXCEL_CACHE.get("df")
     if df is not None and not df.empty:
@@ -260,10 +257,11 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
                 for line in lines:
                     if line.strip() and not line.startswith('#'):
                         parts = line.split()
-                        # 🌟 [버그 수정 1] 원래 구조로 복원 (parts[0]이 관측소ID, parts[1]이 값)
-                        if len(parts) >= 2 and parts[0] == stn_id:
+                        # 🌟 [진짜 최종 수정] 기상청 데이터의 정확한 6열 위치 파싱
+                        # parts[0]: 날짜, parts[1]: 지점번호, parts[2]: 경도, parts[3]: 위도, parts[4]: 고도, parts[5]: 실제 관측값
+                        if len(parts) >= 6 and parts[1] == stn_id:
                             try:
-                                fv = float(parts[1])
+                                fv = float(parts[5])
                                 if fv > -50.0:  
                                     if d_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_WEATHER_CACHE[cache_key] = fv
                                     return key, fv
@@ -426,7 +424,6 @@ def update_today_cache():
             f_as = weather_exec.submit(fetch_asos_daily, today_str, today_str)
             aws_futures = {aws_stn: weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, today_str, today_str) for aws_stn in set(STATION_AWS_MAP.values())}
             
-            # 🌟 [버그 수정 2] 개소별 위도경도를 분리하여 Open-Meteo 호출 (초미세먼지 개별 적용)
             om_futures = {}
             for st in target_stations:
                 lat, lon = STATION_COORD_MAP.get(st, (35.8714, 128.6014))
@@ -448,7 +445,6 @@ def update_today_cache():
             tmin = env_a.get("tmin", "--")
             humi = env_a.get("humi", "--")
             
-            # 🌟 [버그 수정 3] 기온/습도 fallback 독립적으로 분리 (습도 누락 방지)
             if tmax == "--": tmax = as_data.get(today_str, {}).get("tmax", "--")
             if tmax == "--": tmax = om_data.get(today_str, {}).get("tmax", "--")
             
@@ -629,7 +625,8 @@ def get_dashboard_data(station: str, start: str, end: str):
             if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
             if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_humi", "--")
             
-            if pm25 == "--": pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_pm25", "--")
+            if pm25 == "--":
+                pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_pm25", "--")
                 
         else:
             st_data = GLOBAL_PAST_CACHE.get(d_str, {}).get(station, {})
@@ -688,9 +685,6 @@ def get_realtime_data(station: str):
             
     return {"station_name": station, "date": today_str, "records": res_details}
 
-# =========================================================================
-# 🚀 2. 연도별 비교 분석 (유지)
-# =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
     try:
