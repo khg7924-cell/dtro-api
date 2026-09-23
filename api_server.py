@@ -2,8 +2,6 @@ import os
 import time
 import io
 import json
-import asyncio
-import logging
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -19,9 +17,6 @@ import urllib3
 from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -42,25 +37,10 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200)
 http_session.mount('https://', adapter)
 http_session.verify = False
 
-# =========================================================================
-# 🚀 3단 하이브리드 캐시 시스템
-# =========================================================================
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 
-GLOBAL_EXCEL_CACHE = {
-    "df": None, 
-    "mtime": 0,
-    "ai_models": {}
-}
-
-REALTIME_CACHE = {
-    "data": {},
-    "updated_at": None
-}
-
-# 🌟 [신규] 엑셀 업데이트가 밀렸을 때, 빈 날짜를 자동으로 채워주는 캐시
-RECENT_CACHE = {}
+GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
@@ -111,137 +91,12 @@ STATION_AWS_MAP = {
     '전체': '143', '1호선': '143', '2호선': '143', '3호선': '143'
 }
 
-# =========================================================================
-# 🔄 백그라운드 스케줄러 영역
-# =========================================================================
-async def fetch_realtime_job():
-    """당일 15분 실시간 데이터 수집 (15분 주기)"""
-    while True:
-        try:
-            today_str = get_kst_now().strftime("%Y-%m-%d")
-            get_kepco_data_for_station('전체', today_str)
-            new_realtime_data = {}
-            target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
-            for st in target_stations:
-                _, _, details = get_kepco_data_for_station(st, today_str)
-                new_realtime_data[st] = details
-
-            REALTIME_CACHE["data"] = new_realtime_data
-            REALTIME_CACHE["updated_at"] = get_kst_now().strftime("%H:%M:%S")
-        except Exception as e: logger.error(f"실시간 수집 에러: {e}")
-        await asyncio.sleep(900)
-
-async def fetch_weather_job():
-    """기상청/미세먼지 데이터 캐싱 (1시간 주기)"""
-    while True:
-        try:
-            end_dt = get_kst_now()
-            start_dt = end_dt - timedelta(days=30)
-            start_str = start_dt.strftime("%Y-%m-%d")
-            end_str = end_dt.strftime("%Y-%m-%d")
-            fetch_asos_daily(start_str, end_str)
-            fetch_openmeteo_env(35.8714, 128.6014, start_str, end_str)
-            for aws_stn in set(STATION_AWS_MAP.values()):
-                fetch_aws_daily_for_dashboard(aws_stn, start_str, end_str)
-        except Exception as e: logger.error(f"기상 수집 에러: {e}")
-        await asyncio.sleep(3600)
-
-async def fetch_recent_gap_job():
-    """🌟 [신규] 엑셀 데이터의 빈 날짜(과거~어제)를 스스로 메꾸는 보완 캐싱 (2시간 주기)"""
-    while True:
-        try:
-            df = GLOBAL_EXCEL_CACHE["df"]
-            if df is not None:
-                last_date = pd.to_datetime(df['date'].max())
-                yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                
-                if pd.notna(last_date):
-                    days_to_fetch = (yesterday - last_date).days
-                    if 0 < days_to_fetch <= 14: # 서버 무리 방지를 위해 최대 14일까지만 자동 갭필링
-                        for i in range(1, days_to_fetch + 1):
-                            target_dt = last_date + timedelta(days=i)
-                            d_str = target_dt.strftime("%Y-%m-%d")
-                            
-                            if d_str not in RECENT_CACHE:
-                                day_data = {}
-                                target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
-                                for st in target_stations:
-                                    usage, peak, details = get_kepco_data_for_station(st, d_str)
-                                    day_data[st] = {"usage_kwh": usage, "peak_kw": peak, "details": details}
-                                RECENT_CACHE[d_str] = day_data
-                                logger.info(f"✅ {d_str} 누락 데이터 자동 보완 완료")
-        except Exception as e: logger.error(f"최근 데이터 보완 에러: {e}")
-        await asyncio.sleep(7200)
-
-def pretrain_all_models(df):
-    """서버 구동 및 엑셀 업로드 시 AI 모델 1회 사전 훈련"""
-    if df is None or df.empty: return
-    try:
-        target_y = get_kst_now().year
-        pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
-        if not pass_col: return
-
-        df = df.copy()
-        df['month'] = df['date'].dt.month
-        df['dayofweek'] = df['date'].dt.dayofweek
-        df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
-        df['is_holiday'] = df['date'].map(lambda x: 1 if x in holidays.KR() else 0)
-        
-        asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
-        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
-        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if asos_data.get(x, {}).get('tmin') != "--" else np.nan)
-        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if asos_data.get(x, {}).get('tavg') != "--" else np.nan)
-        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if asos_data.get(x, {}).get('humi') != "--" else np.nan)
-        df['passengers'] = df[pass_col]
-
-        df['temp_max'] = df['temp_max'].bfill().ffill()
-        df['temp_min'] = df['temp_min'].bfill().ffill()
-        df['temp_avg'] = df['temp_avg'].bfill().ffill()
-        df['humidity'] = df['humidity'].bfill().ffill()
-        df['passengers'] = df['passengers'].bfill().ffill()
-
-        features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
-        if 'pm25_val' in df.columns:
-            df['pm25'] = df['pm25_val'].bfill().ffill()
-            features.append('pm25')
-
-        train_df = df[df['date'].dt.year <= (target_y - 1)].copy().dropna(subset=features)
-        target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
-        
-        GLOBAL_EXCEL_CACHE["ai_models"] = {}
-        for station in target_stations:
-            if station == '전체': kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
-            elif station in LINE_STATIONS: kwh_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'total_kwh' in c]
-            else: kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
-            
-            y_train = train_df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=train_df.index)
-            if y_train.sum() == 0: continue
-            
-            model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
-            model.fit(train_df[features], y_train)
-            GLOBAL_EXCEL_CACHE["ai_models"][station] = {"model": model, "features": features}
-    except Exception as e: logger.error(f"AI 사전 학습 에러: {e}")
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("🚀 DTRO SEMS 백엔드 서버 가동 시작...")
-    df = load_excel_dataset()
-    if df is not None: pretrain_all_models(df)
-    asyncio.create_task(fetch_realtime_job())
-    asyncio.create_task(fetch_weather_job())
-    asyncio.create_task(fetch_recent_gap_job())
-
-# =========================================================================
-# 기초 함수 영역 (기상청, 한전 API)
-# =========================================================================
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
-        df = load_excel_dataset()
-        if df is not None: pretrain_all_models(df)
         return {"status": "success", "filename": file.filename}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -290,7 +145,8 @@ def load_excel_dataset():
         GLOBAL_EXCEL_CACHE["df"] = df_main
         GLOBAL_EXCEL_CACHE["mtime"] = mtime
         return df_main.copy()
-    except Exception: return None
+    except Exception: 
+        return None
 
 def fetch_openmeteo_env(lat, lon, start_date, end_date):
     env_data = {}
@@ -321,10 +177,12 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
             tmins = data.get("daily", {}).get("temperature_2m_min", [])
             h_times = data.get("hourly", {}).get("time", [])
             humis = data.get("hourly", {}).get("relative_humidity_2m", [])
+            
             humi_dict = {}
             for i, ht in enumerate(h_times):
                 d_str = ht[:10]
                 if humis[i] is not None: humi_dict.setdefault(d_str, []).append(humis[i])
+                    
             for i, t in enumerate(d_times):
                 env_data.setdefault(t, {})
                 if tmaxs and i < len(tmaxs) and tmaxs[i] is not None: env_data[t]["tmax"] = round(tmaxs[i], 1)
@@ -508,7 +366,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (3중 기상 백업 + 하이브리드 캐시 복구 버전)
+# 🚀 1. 통합 대시보드 
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -538,81 +396,58 @@ def get_dashboard_data(station: str, start: str, end: str):
                 if usage > 0:
                     excel_cache[d_str] = {"usage_kwh": usage, "peak_kw": peak, "pm25": pm25_val}
 
+    lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     aws_stn = STATION_AWS_MAP.get(station, '143')
+    
+    with ThreadPoolExecutor(max_workers=3) as weather_exec:
+        future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+        future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+        future_asos = weather_exec.submit(fetch_asos_daily, start, end)
+        
+        openmeteo_data = future_om.result()
+        aws_data = future_aws.result()
+        asos_data = future_asos.result()
+    
     today_str = get_kst_now().strftime("%Y-%m-%d")
-    
-    missing_weather = [ (start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(diff) 
-                        if f"AWS_{aws_stn}_{(start_dt + timedelta(days=i)).strftime('%Y-%m-%d')}_tmax" not in GLOBAL_WEATHER_CACHE ]
-    
-    openmeteo_data, aws_data, asos_data = {}, {}, {}
-    
-    # 🌟 [복구됨] 기상청/Open-Meteo 3중 백업 데이터 수집 로직 복구
-    if missing_weather:
-        lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
-        with ThreadPoolExecutor(max_workers=3) as weather_exec:
-            future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
-            future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
-            future_asos = weather_exec.submit(fetch_asos_daily, start, end)
-            
-            openmeteo_data = future_om.result()
-            aws_data = future_aws.result()
-            asos_data = future_asos.result()
 
-    records = []
-    tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
-
-    for i in range(diff):
+    def process_day(i):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        # 1. 전력량 세팅 (엑셀 -> 최근 보완 -> 당일 실시간)
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
             cached_pm25 = excel_cache[date_str]["pm25"]
             details = []
-        elif date_str in RECENT_CACHE and station in RECENT_CACHE[date_str]:
-            usage = RECENT_CACHE[date_str][station]["usage_kwh"]
-            peak = RECENT_CACHE[date_str][station]["peak_kw"]
-            details = RECENT_CACHE[date_str][station]["details"]
-            cached_pm25 = "--"
-        elif date_str == today_str:
-            r_details = REALTIME_CACHE.get("data", {}).get(station, [])
-            valid_usages = [d.get("usage_kwh", 0) for d in r_details if d.get("usage_kwh") is not None]
-            valid_peaks = [d.get("peak_kw", 0) for d in r_details if d.get("peak_kw") is not None]
-            usage = sum(valid_usages) if valid_usages else 0.0
-            peak = max(valid_peaks) if valid_peaks else 0.0
-            details = r_details
-            cached_pm25 = "--"
+            for m in range(96):
+                hh = m // 4; mm = (m % 4) * 15 + 15
+                if mm == 60: hh += 1; mm = 0
+                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
         else:
-            usage, peak, details = 0.0, 0.0, []
+            if date_str >= "2026-09-04": usage, peak, details = get_kepco_data_for_station(station, date_str)
+            else: usage, peak, details = 0.0, 0.0, []
             cached_pm25 = "--"
             
         co2 = usage * 0.466 / 1000
         
-        # 🌟 2. 날씨 세팅 (캐시 우선 확인 후 3중 백업 적용)
-        tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
-        tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
-        humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
+        env_o = openmeteo_data.get(date_str, {})
+        env_a = aws_data.get(date_str, {})
         
-        if tmax == "--" or tmin == "--":
-            env_a = aws_data.get(date_str, {})
-            tmax = env_a.get("tmax", tmax)
-            tmin = env_a.get("tmin", tmin)
-            humi = env_a.get("humi", humi)
-            
-            # ASOS(대표관측소) 2차 백업
-            if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
-            if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
-            if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
-            
-            # Open-Meteo(글로벌 API) 3차 최후 백업
-            if tmax == "--": tmax = openmeteo_data.get(date_str, {}).get("tmax", "--")
-            if tmin == "--": tmin = openmeteo_data.get(date_str, {}).get("tmin", "--")
-            
-        if cached_pm25 == "--":
-            cached_pm25 = openmeteo_data.get(date_str, {}).get("pm25", "--")
+        tmax = env_a.get("tmax", "--")
+        tmin = env_a.get("tmin", "--")
+        humi = env_a.get("humi", "--")
         
+        if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
+        if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
+        if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
+        
+        if date_str >= today_str or (tmax == "--" and tmin == "--"):
+            if tmax == "--": tmax = env_o.get("tmax", "--")
+            if tmin == "--": tmin = env_o.get("tmin", "--")
+            if humi == "--": humi = env_o.get("humi", "--")
+        
+        pm25 = cached_pm25 if cached_pm25 != "--" else env_o.get("pm25", "--")
+
         if not details or len(details) < 96:
             details = []
             for m in range(96):
@@ -620,18 +455,21 @@ def get_dashboard_data(station: str, start: str, end: str):
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
 
-        records.append({
+        return {
             "date": date_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
-            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": cached_pm25, "details": details
-        })
-        
-        tot_usage += usage
-        if peak > max_peak: max_peak = peak
-        tot_co2 += co2
+            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
+        }
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        records = list(executor.map(process_day, range(diff)))
+
+    tot_usage = sum(r["usage_kwh"] for r in records)
+    max_peak = max((r["peak_kw"] for r in records), default=0.0)
+    tot_co2 = sum(r["co2"] for r in records)
 
     return {
         "station_name": station, 
-        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료)",
+        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
         "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
         "daily_records": records
     }
@@ -641,11 +479,8 @@ def get_realtime_data(station: str):
     kst_now = get_kst_now()
     today_str = kst_now.strftime("%Y-%m-%d")
     
-    if station in REALTIME_CACHE["data"]:
-        details = REALTIME_CACHE["data"][station]
-    else:
-        kepco_data = get_kepco_data_for_station(station, today_str)
-        _, _, details = kepco_data if kepco_data else (0.0, 0.0, [])
+    kepco_data = get_kepco_data_for_station(station, today_str)
+    day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
     if not details or len(details) < 96:
         details = []
@@ -655,16 +490,14 @@ def get_realtime_data(station: str):
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
     now_minutes = kst_now.hour * 60 + kst_now.minute
-    res_details = []
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
         time_m = hh * 60 + mm if hh != 24 else 24 * 60
         if time_m > now_minutes:
-            res_details.append({"time": d["time"], "usage_kwh": None, "peak_kw": None})
-        else:
-            res_details.append(d.copy())
+            d["usage_kwh"] = None
+            d["peak_kw"] = None
             
-    return {"station_name": station, "date": today_str, "records": res_details}
+    return {"station_name": station, "date": today_str, "records": details}
 
 # =========================================================================
 # 🚀 2. 연도별 비교 분석
@@ -825,7 +658,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (과거 ASOS 기반 정밀 시뮬레이션 적용)
+# 🚀 3. AI 수요 예측 (로컬 부하증감 신고 데이터 자동 합산/차감 연동)
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
@@ -835,8 +668,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             
         pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
         if pass_col is None: return {"error": "엑셀 첫번째 시트에 '승객수' 컬럼이 포함되어 있는지 확인해 주세요."}
-        
-        target_y = int(target_year)
         
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
@@ -848,98 +679,112 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         else:
             kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
             df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
-            
+        
+        target_y = int(target_year)
+        
+        start_dt = pd.to_datetime(f"{target_y}-01-01")
+        end_dt = pd.to_datetime(f"{target_y}-12-31")
+        full_year_dates = pd.date_range(start=start_dt, end=end_dt)
+        
+        existing_dates = pd.to_datetime(df['date']).dt.normalize().tolist()
+        missing_dates = pd.Index(full_year_dates).difference(pd.Index(existing_dates))
+        
+        if len(missing_dates) > 0:
+            missing_df = pd.DataFrame({'date': missing_dates})
+            df = pd.concat([df, missing_df], ignore_index=True)
+            df.sort_values(by='date', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+        kr_holidays = holidays.KR()
+        df['month'] = df['date'].dt.month
+        df['dayofweek'] = df['date'].dt.dayofweek
+        df['is_weekend'] = df['dayofweek'].isin([5,6]).astype(int)
+        df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
+        
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
         df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
         df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if asos_data.get(x, {}).get('tmin') != "--" else np.nan)
         df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if asos_data.get(x, {}).get('tavg') != "--" else np.nan)
         df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if asos_data.get(x, {}).get('humi') != "--" else np.nan)
-        
+        df['passengers'] = df[pass_col]
+
+        if 'pm25_val' in df.columns:
+            df['pm25'] = df['pm25_val']
+
+        idx_target = df['date'].dt.year == target_y
+        for i in df[idx_target].index:
+            past_date = df.loc[i, 'date'] - pd.DateOffset(years=1)
+            past_val = df[df['date'] == past_date]
+            if not past_val.empty:
+                if pd.isna(df.loc[i, 'temp_max']): df.loc[i, 'temp_max'] = past_val.iloc[0]['temp_max']
+                if pd.isna(df.loc[i, 'temp_min']): df.loc[i, 'temp_min'] = past_val.iloc[0]['temp_min']
+                if pd.isna(df.loc[i, 'temp_avg']): df.loc[i, 'temp_avg'] = past_val.iloc[0]['temp_avg']
+                if pd.isna(df.loc[i, 'humidity']): df.loc[i, 'humidity'] = past_val.iloc[0]['humidity']
+                if pd.isna(df.loc[i, 'passengers']): df.loc[i, 'passengers'] = past_val.iloc[0]['passengers'] * (1 + (pass_rate / 100.0))
+                if 'pm25' in df.columns and pd.isna(df.loc[i, 'pm25']): df.loc[i, 'pm25'] = past_val.iloc[0]['pm25']
+                
         if df['temp_max'].isna().all():
-            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 다시 시도해 주세요."}
-            
+            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
+        
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
         df['temp_avg'] = df['temp_avg'].bfill().ffill()
         df['humidity'] = df['humidity'].bfill().ffill()
-
-        start_dt = pd.to_datetime(f"{target_y}-01-01")
-        end_dt = pd.to_datetime(f"{target_y}-12-31")
-        full_year_dates = pd.date_range(start=start_dt, end=end_dt)
-        
-        test_df = pd.DataFrame({'date': full_year_dates})
-        kr_holidays = holidays.KR()
-        test_df['month'] = test_df['date'].dt.month
-        test_df['dayofweek'] = test_df['date'].dt.dayofweek
-        test_df['is_weekend'] = test_df['dayofweek'].isin([5,6]).astype(int)
-        test_df['is_holiday'] = test_df['date'].map(lambda x: 1 if x in kr_holidays else 0)
-        
-        last_year = target_y - 1
-        last_year_df = df[df['date'].dt.year == last_year].copy()
-        last_year_df['mm_dd'] = last_year_df['date'].dt.strftime('%m-%d')
-        last_year_weather = last_year_df.drop_duplicates(subset=['mm_dd']).set_index('mm_dd')
-
-        test_df['mm_dd'] = test_df['date'].dt.strftime('%m-%d')
-        
-        test_df['temp_max'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_max'] if x in last_year_weather.index else df['temp_max'].mean())
-        test_df['temp_min'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_min'] if x in last_year_weather.index else df['temp_min'].mean())
-        test_df['temp_avg'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_avg'] if x in last_year_weather.index else df['temp_avg'].mean())
-        test_df['humidity'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'humidity'] if x in last_year_weather.index else df['humidity'].mean())
-        
-        last_year_pass = last_year_weather[pass_col].mean() if pass_col in last_year_weather.columns else 10000
-        if pd.isna(last_year_pass): last_year_pass = 10000
-        test_df['passengers'] = last_year_pass * (1 + (pass_rate / 100.0))
+        df['passengers'] = df['passengers'].bfill().ffill()
+        if 'pm25' in df.columns:
+            df['pm25'] = df['pm25'].bfill().ffill()
 
         if temp_adj != 0:
-            test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
-            test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
-            test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_min'] += float(temp_adj)
+            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
+            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
+            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_min'] += float(temp_adj)
 
         if winter_temp_adj != 0:
-            test_df.loc[(test_df['month'].isin([12, 1, 2])), 'temp_max'] += float(winter_temp_adj)
-            test_df.loc[(test_df['month'].isin([12, 1, 2])), 'temp_avg'] += float(winter_temp_adj)
-            test_df.loc[(test_df['month'].isin([12, 1, 2])), 'temp_min'] += float(winter_temp_adj)
+            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_max'] += float(winter_temp_adj)
+            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_avg'] += float(winter_temp_adj)
+            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_min'] += float(winter_temp_adj)
             
-        features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
-        
-        if 'pm25_val' in df.columns:
-            test_df['pm25'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'pm25_val'] if x in last_year_weather.index else df['pm25_val'].mean())
+        if 'pm25' in df.columns and pm25_adj != 0:
+            target_indices = df[idx_target].index
             if pm25_adj > 0:
-                normal_idx = test_df[test_df['pm25'] <= 35].sort_values('pm25', ascending=False).head(pm25_adj).index
-                test_df.loc[normal_idx, 'pm25'] = 45.0
+                normal_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] <= 35]
+                adjust_idx = normal_days.sort_values('pm25', ascending=False).head(pm25_adj).index
+                df.loc[adjust_idx, 'pm25'] = 45.0
             elif pm25_adj < 0:
-                bad_idx = test_df[test_df['pm25'] > 35].sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
-                test_df.loc[bad_idx, 'pm25'] = 25.0
-            features.append('pm25')
+                bad_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] > 35]
+                adjust_idx = bad_days.sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
+                df.loc[adjust_idx, 'pm25'] = 25.0
 
-        cache_obj = GLOBAL_EXCEL_CACHE.get("ai_models", {}).get(station)
-        if cache_obj:
-            model = cache_obj["model"]
-            train_features = cache_obj["features"]
-        else:
-            if station == '전체': kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
-            elif station in LINE_STATIONS: kwh_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'total_kwh' in c]
-            else: kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
-            
-            y_train = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
-            train_features = features
-            
-            train_df = df[df['date'].dt.year <= last_year].copy()
-            train_df = train_df.dropna(subset=train_features)
-            y_train = y_train.loc[train_df.index]
-            
-            model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
-            model.fit(train_df[train_features], y_train)
-
-        test_df['pred_power'] = model.predict(test_df[train_features])
+        features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
+        if 'pm25' in df.columns: features.append('pm25')
         
+        train_df = df[df['date'].dt.year <= (target_y - 1)].copy()
+        train_df = train_df.dropna(subset=['target_power'] + features)
+        if train_df.empty: return {"error": "학습할 전력량 데이터(과거 실측치)가 존재하지 않습니다."}
+             
+        test_df = df[df['date'].dt.year == target_y].copy()
+        test_df = test_df.dropna(subset=features)
+        if test_df.empty: return {"error": f"{target_year}년도 예측을 위한 데이터 포맷이 처리 중 소실되었습니다."}
+        
+        X_train, y_train = train_df[features].copy(), train_df['target_power'].copy()
+        X_test = test_df[features].copy()
+        
+        X_train = X_train.bfill().ffill()
+        X_test = X_test.bfill().ffill()
+        
+        model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
+        model.fit(X_train, y_train)
+        test_df['pred_power'] = model.predict(X_test)
+        
+        # 🌟 [핵심 연동] 프론트엔드에서 넘어온 승인된 부하증감 데이터 파싱 및 예측치 가산/차감
         if reports_data:
             try:
                 local_reports = json.loads(reports_data)
                 for r_info in local_reports:
                     if r_info.get('status') == '확인':
                         r_sub = r_info.get('substation', '')
+                        # 선택된 개소(변전소)와 일치하는 경우 부하 반영
                         is_match = False
                         if station == '전체': is_match = True
                         elif station in LINE_STATIONS and r_sub in LINE_STATIONS[station]: is_match = True
@@ -951,26 +796,25 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                             hours_val = float(r_info.get('hours', 0))
                             daily_kwh = kw_val * hours_val
                             if '철거' in str(r_info.get('type', '')): daily_kwh = -daily_kwh
+
+                            # 적용예정일 이후의 날짜 행에만 일일 전력량 증감 반영
                             mask_after = (test_df['date'] >= app_date)
                             test_df.loc[mask_after, 'pred_power'] += daily_kwh
             except Exception as parse_err:
-                logger.error(f"로컬 부하증감 파싱 중 오류: {parse_err}")
+                print(f"로컬 부하증감 데이터 파싱 중 오류: {parse_err}")
 
-        train_last_year_df = df[df['date'].dt.year == last_year]
-        if station == '전체': kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
-        elif station in LINE_STATIONS: kwh_cols = [c for c in df.columns if any(s in c for s in LINE_STATIONS[station]) and 'total_kwh' in c]
-        else: kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
+        train_pred = model.predict(X_train)
+        r2_acc = float(round(r2_score(y_train, train_pred) * 100, 1))
         
-        last_y_power = train_last_year_df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0)
-
-        lt = float(last_y_power.sum()) if not last_y_power.empty else 0.0
+        train_last_year_df = train_df[train_df['date'].dt.year == (target_y - 1)]
+        lt = float(train_last_year_df['target_power'].sum()) if not train_last_year_df.empty else 0.0
         ft = float(test_df['pred_power'].sum())
         
-        last_peak_val = float(last_y_power.max()) if not last_y_power.empty else 0.0
+        last_peak_val = float(train_last_year_df['target_power'].max()) if not train_last_year_df.empty else 0.0
         peak_future_val = float(test_df['pred_power'].max())
         
         importances = [float(v) for v in (model.feature_importances_ * 100).round(1)]
-        feat_df = pd.DataFrame({'name': train_features, 'value': importances})
+        feat_df = pd.DataFrame({'name': features, 'value': importances})
         
         name_map = {
             'month': '계절(월)', 'temp_max': '기온', 'temp_min': '기온', 
@@ -979,23 +823,24 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         }
         feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
         feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
+        
         top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
         
         records = []
         for m in range(1, 13):
-            m_past = float(last_y_power[train_last_year_df['date'].dt.month == m].sum()) if not last_y_power.empty else 0.0
+            m_past = float(train_last_year_df[train_last_year_df['date'].dt.month == m]['target_power'].sum()) if not train_last_year_df.empty else 0.0
             m_pred = float(test_df[test_df['date'].dt.month == m]['pred_power'].sum())
             records.append({ "month": f"{m}월", "past_kwh": m_past, "pred_kwh": m_pred })
             
         return {
-            "summary": { "last_tot": lt, "tot_future": ft, "last_peak": last_peak_val, "peak_future": peak_future_val, "acc": 96.5 }, 
+            "summary": { "last_tot": lt, "tot_future": ft, "last_peak": last_peak_val, "peak_future": peak_future_val, "acc": r2_acc }, 
             "chart_data": records, "feat_data": top_feats
         }
     except Exception as e:
-        return {"error": f"서버 예측 연산 실패: {str(e)}\n\n{traceback.format_exc()}"}
+        return {"error": f"서버 내부 오류로 예측에 실패했습니다: {str(e)}\n\n{traceback.format_exc()}"}
     
 # =========================================================================
-# 🚀 4. 전기요금 청구정보
+# 🚀 4. 전기요금 청구정보 (지침 정보 추가 수집)
 # =========================================================================
 @app.get("/api/bill/{station}")
 def get_bill_data(station: str, year: str):
@@ -1043,6 +888,7 @@ def get_bill_data(station: str, year: str):
                                 "lload_usekwh": parse_float(lower_item.get("lloadusekwh", lower_item.get("lload_usekwh"))),
                                 "mload_usekwh": parse_float(lower_item.get("mloadusekwh", lower_item.get("mload_usekwh"))),
                                 "maxload_usekwh": parse_float(lower_item.get("maxloadusekwh", lower_item.get("maxload_usekwh"))),
+                                # 🌟 [신규] 지침 정보 파싱 추가
                                 "lload_needle": parse_float(lower_item.get("lloadneedle", lower_item.get("lload_needle"))),
                                 "mload_needle": parse_float(lower_item.get("mloadneedle", lower_item.get("mload_needle"))),
                                 "maxload_needle": parse_float(lower_item.get("maxloadneedle", lower_item.get("maxload_needle"))),
@@ -1057,7 +903,7 @@ def get_bill_data(station: str, year: str):
 
 
 # =========================================================================
-# 🚀 5. 단일 백업 아키텍처
+# 🚀 5. [단일 백업 아키텍처]
 # =========================================================================
 @app.get("/api/backup")
 def export_master_backup():
@@ -1155,7 +1001,3 @@ def export_master_backup():
         )
     except Exception as e:
         return {"error": f"백업 파일 생성 중 서버 에러 발생: {str(e)}\n{traceback.format_exc()}"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
