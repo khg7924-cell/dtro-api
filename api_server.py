@@ -508,7 +508,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (하이브리드 캐시 최적화 버전)
+# 🚀 1. 통합 대시보드 (3중 기상 백업 + 하이브리드 캐시 복구 버전)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -541,25 +541,31 @@ def get_dashboard_data(station: str, start: str, end: str):
     aws_stn = STATION_AWS_MAP.get(station, '143')
     today_str = get_kst_now().strftime("%Y-%m-%d")
     
-    # 누락된 날씨 정보만 짧게 보완 호출
     missing_weather = [ (start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(diff) 
                         if f"AWS_{aws_stn}_{(start_dt + timedelta(days=i)).strftime('%Y-%m-%d')}_tmax" not in GLOBAL_WEATHER_CACHE ]
     
+    openmeteo_data, aws_data, asos_data = {}, {}, {}
+    
+    # 🌟 [복구됨] 기상청/Open-Meteo 3중 백업 데이터 수집 로직 복구
     if missing_weather:
         lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
         with ThreadPoolExecutor(max_workers=3) as weather_exec:
-            weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
-            weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
-            weather_exec.submit(fetch_asos_daily, start, end)
+            future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+            future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+            future_asos = weather_exec.submit(fetch_asos_daily, start, end)
+            
+            openmeteo_data = future_om.result()
+            aws_data = future_aws.result()
+            asos_data = future_asos.result()
 
     records = []
     tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
 
-    # 🌟 3단 분기 처리: 엑셀 -> 최근 보완 캐시 -> 당일 실시간 캐시
     for i in range(diff):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
+        # 1. 전력량 세팅 (엑셀 -> 최근 보완 -> 당일 실시간)
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
@@ -584,9 +590,28 @@ def get_dashboard_data(station: str, start: str, end: str):
             
         co2 = usage * 0.466 / 1000
         
+        # 🌟 2. 날씨 세팅 (캐시 우선 확인 후 3중 백업 적용)
         tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
         tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
         humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
+        
+        if tmax == "--" or tmin == "--":
+            env_a = aws_data.get(date_str, {})
+            tmax = env_a.get("tmax", tmax)
+            tmin = env_a.get("tmin", tmin)
+            humi = env_a.get("humi", humi)
+            
+            # ASOS(대표관측소) 2차 백업
+            if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
+            if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
+            if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
+            
+            # Open-Meteo(글로벌 API) 3차 최후 백업
+            if tmax == "--": tmax = openmeteo_data.get(date_str, {}).get("tmax", "--")
+            if tmin == "--": tmin = openmeteo_data.get(date_str, {}).get("tmin", "--")
+            
+        if cached_pm25 == "--":
+            cached_pm25 = openmeteo_data.get(date_str, {}).get("pm25", "--")
         
         if not details or len(details) < 96:
             details = []
