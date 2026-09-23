@@ -20,7 +20,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -44,23 +43,24 @@ http_session.mount('https://', adapter)
 http_session.verify = False
 
 # =========================================================================
-# 🚀 글로벌 캐시 메모리 시스템
+# 🚀 3단 하이브리드 캐시 시스템
 # =========================================================================
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 
-# 엑셀 및 AI 사전 학습 모델 캐시
 GLOBAL_EXCEL_CACHE = {
     "df": None, 
     "mtime": 0,
-    "ai_models": {}  # 역별 사전 학습된 XGBoost 모델 저장소
+    "ai_models": {}
 }
 
-# 15분 주기 실시간 전력 데이터 전용 캐시
 REALTIME_CACHE = {
     "data": {},
     "updated_at": None
 }
+
+# 🌟 [신규] 엑셀 업데이트가 밀렸을 때, 빈 날짜를 자동으로 채워주는 캐시
+RECENT_CACHE = {}
 
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
@@ -112,65 +112,70 @@ STATION_AWS_MAP = {
 }
 
 # =========================================================================
-# 🔄 백그라운드 스케줄러: 실시간 전력 및 기상 데이터 자동 캐싱
+# 🔄 백그라운드 스케줄러 영역
 # =========================================================================
 async def fetch_realtime_job():
-    """15분 주기로 한전 API를 조회하여 메모리에 최신 데이터를 갱신합니다."""
+    """당일 15분 실시간 데이터 수집 (15분 주기)"""
     while True:
         try:
             today_str = get_kst_now().strftime("%Y-%m-%d")
-            logger.info(f"⏰ [스케줄러] {today_str} 실시간 15분 전력 데이터 수집 중...")
-            
-            # 한 번 '전체'로 조회하면 내부적으로 GLOBAL_KEPCO_CACHE에 각 고객번호별 데이터가 캐싱됨
             get_kepco_data_for_station('전체', today_str)
-
             new_realtime_data = {}
             target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
-            
             for st in target_stations:
                 _, _, details = get_kepco_data_for_station(st, today_str)
                 new_realtime_data[st] = details
 
             REALTIME_CACHE["data"] = new_realtime_data
             REALTIME_CACHE["updated_at"] = get_kst_now().strftime("%H:%M:%S")
-            logger.info(f"✅ [스케줄러] 전력 데이터 캐싱 완료 (기준: {REALTIME_CACHE['updated_at']})")
-        except Exception as e:
-            logger.error(f"❌ [스케줄러] 전력 수집 실패: {e}")
-            
-        await asyncio.sleep(900)  # 15분 대기
+        except Exception as e: logger.error(f"실시간 수집 에러: {e}")
+        await asyncio.sleep(900)
 
 async def fetch_weather_job():
-    """1시간 주기로 최근 30일치 기상 데이터를 사전 수집하여 캐싱합니다."""
+    """기상청/미세먼지 데이터 캐싱 (1시간 주기)"""
     while True:
         try:
-            logger.info("🌤️ [스케줄러] 최신 기상 데이터 사전 적재 시작...")
             end_dt = get_kst_now()
             start_dt = end_dt - timedelta(days=30)
             start_str = start_dt.strftime("%Y-%m-%d")
             end_str = end_dt.strftime("%Y-%m-%d")
-            
             fetch_asos_daily(start_str, end_str)
             fetch_openmeteo_env(35.8714, 128.6014, start_str, end_str)
-            
-            unique_aws = set(STATION_AWS_MAP.values())
-            for aws_stn in unique_aws:
+            for aws_stn in set(STATION_AWS_MAP.values()):
                 fetch_aws_daily_for_dashboard(aws_stn, start_str, end_str)
+        except Exception as e: logger.error(f"기상 수집 에러: {e}")
+        await asyncio.sleep(3600)
+
+async def fetch_recent_gap_job():
+    """🌟 [신규] 엑셀 데이터의 빈 날짜(과거~어제)를 스스로 메꾸는 보완 캐싱 (2시간 주기)"""
+    while True:
+        try:
+            df = GLOBAL_EXCEL_CACHE["df"]
+            if df is not None:
+                last_date = pd.to_datetime(df['date'].max())
+                yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                 
-            logger.info("✅ [스케줄러] 기상 데이터 캐싱 완료!")
-        except Exception as e:
-            logger.error(f"❌ [스케줄러] 기상 데이터 수집 실패: {e}")
-            
-        await asyncio.sleep(3600)  # 1시간 대기
+                if pd.notna(last_date):
+                    days_to_fetch = (yesterday - last_date).days
+                    if 0 < days_to_fetch <= 14: # 서버 무리 방지를 위해 최대 14일까지만 자동 갭필링
+                        for i in range(1, days_to_fetch + 1):
+                            target_dt = last_date + timedelta(days=i)
+                            d_str = target_dt.strftime("%Y-%m-%d")
+                            
+                            if d_str not in RECENT_CACHE:
+                                day_data = {}
+                                target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
+                                for st in target_stations:
+                                    usage, peak, details = get_kepco_data_for_station(st, d_str)
+                                    day_data[st] = {"usage_kwh": usage, "peak_kw": peak, "details": details}
+                                RECENT_CACHE[d_str] = day_data
+                                logger.info(f"✅ {d_str} 누락 데이터 자동 보완 완료")
+        except Exception as e: logger.error(f"최근 데이터 보완 에러: {e}")
+        await asyncio.sleep(7200)
 
-
-# =========================================================================
-# 🤖 AI 사전 학습 (Pre-training)
-# =========================================================================
 def pretrain_all_models(df):
-    """서버 구동 시 또는 엑셀 업로드 시 AI 모델을 1회 사전 학습하여 메모리에 등재합니다."""
+    """서버 구동 및 엑셀 업로드 시 AI 모델 1회 사전 훈련"""
     if df is None or df.empty: return
-    
-    logger.info("🤖 AI 수요예측 모델 사전 학습을 시작합니다...")
     try:
         target_y = get_kst_now().year
         pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
@@ -180,11 +185,9 @@ def pretrain_all_models(df):
         df['month'] = df['date'].dt.month
         df['dayofweek'] = df['date'].dt.dayofweek
         df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
-        kr_holidays = holidays.KR()
-        df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
+        df['is_holiday'] = df['date'].map(lambda x: 1 if x in holidays.KR() else 0)
         
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
-        
         df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
         df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if asos_data.get(x, {}).get('tmin') != "--" else np.nan)
         df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if asos_data.get(x, {}).get('tavg') != "--" else np.nan)
@@ -202,9 +205,7 @@ def pretrain_all_models(df):
             df['pm25'] = df['pm25_val'].bfill().ffill()
             features.append('pm25')
 
-        train_df = df[df['date'].dt.year <= (target_y - 1)].copy()
-        train_df = train_df.dropna(subset=features)
-        
+        train_df = df[df['date'].dt.year <= (target_y - 1)].copy().dropna(subset=features)
         target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
         
         GLOBAL_EXCEL_CACHE["ai_models"] = {}
@@ -219,26 +220,19 @@ def pretrain_all_models(df):
             model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
             model.fit(train_df[features], y_train)
             GLOBAL_EXCEL_CACHE["ai_models"][station] = {"model": model, "features": features}
-            
-        logger.info("✅ AI 모델 전 역사 사전 학습 및 캐싱 완료!")
-    except Exception as e:
-        logger.error(f"AI 사전 학습 중 에러 발생: {e}")
+    except Exception as e: logger.error(f"AI 사전 학습 에러: {e}")
 
-# =========================================================================
-# 시작 이벤트 등록 (데이터 및 스케줄러 로드)
-# =========================================================================
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 DTRO SEMS 백엔드 서버 가동 시작...")
     df = load_excel_dataset()
-    if df is not None:
-        pretrain_all_models(df)
-        
+    if df is not None: pretrain_all_models(df)
     asyncio.create_task(fetch_realtime_job())
     asyncio.create_task(fetch_weather_job())
+    asyncio.create_task(fetch_recent_gap_job())
 
 # =========================================================================
-# 기존 API 로직 (수집 함수)
+# 기초 함수 영역 (기상청, 한전 API)
 # =========================================================================
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -246,11 +240,8 @@ async def upload_file(file: UploadFile = File(...)):
         contents = await file.read()
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
-        
         df = load_excel_dataset()
-        if df is not None:
-            pretrain_all_models(df)
-            
+        if df is not None: pretrain_all_models(df)
         return {"status": "success", "filename": file.filename}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -299,8 +290,7 @@ def load_excel_dataset():
         GLOBAL_EXCEL_CACHE["df"] = df_main
         GLOBAL_EXCEL_CACHE["mtime"] = mtime
         return df_main.copy()
-    except Exception: 
-        return None
+    except Exception: return None
 
 def fetch_openmeteo_env(lat, lon, start_date, end_date):
     env_data = {}
@@ -331,12 +321,10 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
             tmins = data.get("daily", {}).get("temperature_2m_min", [])
             h_times = data.get("hourly", {}).get("time", [])
             humis = data.get("hourly", {}).get("relative_humidity_2m", [])
-            
             humi_dict = {}
             for i, ht in enumerate(h_times):
                 d_str = ht[:10]
                 if humis[i] is not None: humi_dict.setdefault(d_str, []).append(humis[i])
-                    
             for i, t in enumerate(d_times):
                 env_data.setdefault(t, {})
                 if tmaxs and i < len(tmaxs) and tmaxs[i] is not None: env_data[t]["tmax"] = round(tmaxs[i], 1)
@@ -520,7 +508,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드 (실시간 API 병목 완벽 제거 / 100% 캐싱 렌더링)
+# 🚀 1. 통합 대시보드 (하이브리드 캐시 최적화 버전)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -553,7 +541,7 @@ def get_dashboard_data(station: str, start: str, end: str):
     aws_stn = STATION_AWS_MAP.get(station, '143')
     today_str = get_kst_now().strftime("%Y-%m-%d")
     
-    # 🌟 기상청 API 병목 제거: 메모리에 없는 날짜(최초 조회)일 경우에만 백그라운드에서 짧게 수집
+    # 누락된 날씨 정보만 짧게 보완 호출
     missing_weather = [ (start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(diff) 
                         if f"AWS_{aws_stn}_{(start_dt + timedelta(days=i)).strftime('%Y-%m-%d')}_tmax" not in GLOBAL_WEATHER_CACHE ]
     
@@ -567,21 +555,25 @@ def get_dashboard_data(station: str, start: str, end: str):
     records = []
     tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
 
+    # 🌟 3단 분기 처리: 엑셀 -> 최근 보완 캐시 -> 당일 실시간 캐시
     for i in range(diff):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
-        # 🌟 한전 API 병목 제거: 조회 당일은 '실시간 캐시', 과거는 '엑셀 캐시'만 즉시 반환
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
             cached_pm25 = excel_cache[date_str]["pm25"]
             details = []
+        elif date_str in RECENT_CACHE and station in RECENT_CACHE[date_str]:
+            usage = RECENT_CACHE[date_str][station]["usage_kwh"]
+            peak = RECENT_CACHE[date_str][station]["peak_kw"]
+            details = RECENT_CACHE[date_str][station]["details"]
+            cached_pm25 = "--"
         elif date_str == today_str:
             r_details = REALTIME_CACHE.get("data", {}).get(station, [])
             valid_usages = [d.get("usage_kwh", 0) for d in r_details if d.get("usage_kwh") is not None]
             valid_peaks = [d.get("peak_kw", 0) for d in r_details if d.get("peak_kw") is not None]
-            
             usage = sum(valid_usages) if valid_usages else 0.0
             peak = max(valid_peaks) if valid_peaks else 0.0
             details = r_details
@@ -592,7 +584,6 @@ def get_dashboard_data(station: str, start: str, end: str):
             
         co2 = usage * 0.466 / 1000
         
-        # 날씨 데이터 역시 캐시 메모리 딕셔너리에서 즉시 맵핑
         tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
         tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
         humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
@@ -620,19 +611,14 @@ def get_dashboard_data(station: str, start: str, end: str):
         "daily_records": records
     }
 
-# =========================================================================
-# 🔄 1-1. 실시간 데이터 전용 엔드포인트 (스케줄러 캐시 리턴)
-# =========================================================================
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
     kst_now = get_kst_now()
     today_str = kst_now.strftime("%Y-%m-%d")
     
-    # 🌟 스케줄러가 백그라운드에서 수집한 캐시 데이터 활용
     if station in REALTIME_CACHE["data"]:
         details = REALTIME_CACHE["data"][station]
     else:
-        # 혹시 스케줄러가 아직 안 돌았다면 즉시 수집
         kepco_data = get_kepco_data_for_station(station, today_str)
         _, _, details = kepco_data if kepco_data else (0.0, 0.0, [])
     
@@ -644,8 +630,6 @@ def get_realtime_data(station: str):
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
     now_minutes = kst_now.hour * 60 + kst_now.minute
-    
-    # 캐시된 원본 훼손을 막기 위해 새 리스트 생성 (미래 시간 블라인드 처리)
     res_details = []
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
@@ -658,7 +642,7 @@ def get_realtime_data(station: str):
     return {"station_name": station, "date": today_str, "records": res_details}
 
 # =========================================================================
-# 🚀 2. 연도별 비교 분석 (그대로 유지)
+# 🚀 2. 연도별 비교 분석
 # =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
@@ -816,7 +800,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
 # =========================================================================
-# 🚀 3. AI 수요 예측 (기상청 ASOS 실측치 기반 시뮬레이션 복구 및 버그 픽스)
+# 🚀 3. AI 수요 예측 (과거 ASOS 기반 정밀 시뮬레이션 적용)
 # =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
@@ -840,7 +824,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
             df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
             
-        # 🌟 [버그 픽스] 누락되었던 기상청 데이터(ASOS) 다운로드 및 병합 로직 복구
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
         df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
@@ -856,7 +839,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['temp_avg'] = df['temp_avg'].bfill().ffill()
         df['humidity'] = df['humidity'].bfill().ffill()
 
-        # 데이터 프레임 생성
         start_dt = pd.to_datetime(f"{target_y}-01-01")
         end_dt = pd.to_datetime(f"{target_y}-12-31")
         full_year_dates = pd.date_range(start=start_dt, end=end_dt)
@@ -868,7 +850,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         test_df['is_weekend'] = test_df['dayofweek'].isin([5,6]).astype(int)
         test_df['is_holiday'] = test_df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
-        # 🌟 1. 베이스라인: 직전 연도의 기상청(ASOS) 실측 날씨 일자별 복제 (MM-DD 기준)
         last_year = target_y - 1
         last_year_df = df[df['date'].dt.year == last_year].copy()
         last_year_df['mm_dd'] = last_year_df['date'].dt.strftime('%m-%d')
@@ -876,7 +857,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
 
         test_df['mm_dd'] = test_df['date'].dt.strftime('%m-%d')
         
-        # 윤년(2월 29일) 등 매핑 안 되는 날짜는 해당 연도 전체 평균으로 예외 처리
         test_df['temp_max'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_max'] if x in last_year_weather.index else df['temp_max'].mean())
         test_df['temp_min'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_min'] if x in last_year_weather.index else df['temp_min'].mean())
         test_df['temp_avg'] = test_df['mm_dd'].map(lambda x: last_year_weather.loc[x, 'temp_avg'] if x in last_year_weather.index else df['temp_avg'].mean())
@@ -886,7 +866,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if pd.isna(last_year_pass): last_year_pass = 10000
         test_df['passengers'] = last_year_pass * (1 + (pass_rate / 100.0))
 
-        # 🌟 2. 시뮬레이션: 복제된 ASOS 기반 데이터에 가감(Delta) 변수 덧씌우기
         if temp_adj != 0:
             test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
             test_df.loc[(test_df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
@@ -909,7 +888,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                 test_df.loc[bad_idx, 'pm25'] = 25.0
             features.append('pm25')
 
-        # 학습 모델 호출 (또는 fallback 즉시 훈련)
         cache_obj = GLOBAL_EXCEL_CACHE.get("ai_models", {}).get(station)
         if cache_obj:
             model = cache_obj["model"]
@@ -929,10 +907,8 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
             model.fit(train_df[train_features], y_train)
 
-        # 예측 실행
         test_df['pred_power'] = model.predict(test_df[train_features])
         
-        # 부하증감 데이터 파싱 및 예측치 연동
         if reports_data:
             try:
                 local_reports = json.loads(reports_data)
@@ -991,11 +967,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             "chart_data": records, "feat_data": top_feats
         }
     except Exception as e:
-        import traceback
         return {"error": f"서버 예측 연산 실패: {str(e)}\n\n{traceback.format_exc()}"}
     
 # =========================================================================
-# 🚀 4. 전기요금 청구정보 (그대로 유지)
+# 🚀 4. 전기요금 청구정보
 # =========================================================================
 @app.get("/api/bill/{station}")
 def get_bill_data(station: str, year: str):
@@ -1057,7 +1032,7 @@ def get_bill_data(station: str, year: str):
 
 
 # =========================================================================
-# 🚀 5. [단일 백업 아키텍처] (그대로 유지)
+# 🚀 5. 단일 백업 아키텍처
 # =========================================================================
 @app.get("/api/backup")
 def export_master_backup():
