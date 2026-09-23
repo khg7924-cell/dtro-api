@@ -520,7 +520,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
     return total_usage, max_peak, details
 
 # =========================================================================
-# 🚀 1. 통합 대시보드
+# 🚀 1. 통합 대시보드 (실시간 API 병목 완벽 제거 / 100% 캐싱 렌더링)
 # =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -550,58 +550,53 @@ def get_dashboard_data(station: str, start: str, end: str):
                 if usage > 0:
                     excel_cache[d_str] = {"usage_kwh": usage, "peak_kw": peak, "pm25": pm25_val}
 
-    lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
     aws_stn = STATION_AWS_MAP.get(station, '143')
-    
-    with ThreadPoolExecutor(max_workers=3) as weather_exec:
-        future_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
-        future_aws = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
-        future_asos = weather_exec.submit(fetch_asos_daily, start, end)
-        
-        openmeteo_data = future_om.result()
-        aws_data = future_aws.result()
-        asos_data = future_asos.result()
-    
     today_str = get_kst_now().strftime("%Y-%m-%d")
+    
+    # 🌟 기상청 API 병목 제거: 메모리에 없는 날짜(최초 조회)일 경우에만 백그라운드에서 짧게 수집
+    missing_weather = [ (start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(diff) 
+                        if f"AWS_{aws_stn}_{(start_dt + timedelta(days=i)).strftime('%Y-%m-%d')}_tmax" not in GLOBAL_WEATHER_CACHE ]
+    
+    if missing_weather:
+        lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
+        with ThreadPoolExecutor(max_workers=3) as weather_exec:
+            weather_exec.submit(fetch_openmeteo_env, lat, lon, start, end)
+            weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start, end)
+            weather_exec.submit(fetch_asos_daily, start, end)
 
-    def process_day(i):
+    records = []
+    tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
+
+    for i in range(diff):
         curr_date = start_dt + timedelta(days=i)
         date_str = curr_date.strftime("%Y-%m-%d")
         
+        # 🌟 한전 API 병목 제거: 조회 당일은 '실시간 캐시', 과거는 '엑셀 캐시'만 즉시 반환
         if date_str in excel_cache:
             usage = excel_cache[date_str]["usage_kwh"]
             peak = excel_cache[date_str]["peak_kw"]
             cached_pm25 = excel_cache[date_str]["pm25"]
             details = []
-            for m in range(96):
-                hh = m // 4; mm = (m % 4) * 15 + 15
-                if mm == 60: hh += 1; mm = 0
-                details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
+        elif date_str == today_str:
+            r_details = REALTIME_CACHE.get("data", {}).get(station, [])
+            valid_usages = [d.get("usage_kwh", 0) for d in r_details if d.get("usage_kwh") is not None]
+            valid_peaks = [d.get("peak_kw", 0) for d in r_details if d.get("peak_kw") is not None]
+            
+            usage = sum(valid_usages) if valid_usages else 0.0
+            peak = max(valid_peaks) if valid_peaks else 0.0
+            details = r_details
+            cached_pm25 = "--"
         else:
-            if date_str >= "2026-09-04": usage, peak, details = get_kepco_data_for_station(station, date_str)
-            else: usage, peak, details = 0.0, 0.0, []
+            usage, peak, details = 0.0, 0.0, []
             cached_pm25 = "--"
             
         co2 = usage * 0.466 / 1000
         
-        env_o = openmeteo_data.get(date_str, {})
-        env_a = aws_data.get(date_str, {})
+        # 날씨 데이터 역시 캐시 메모리 딕셔너리에서 즉시 맵핑
+        tmax = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmax", "--")
+        tmin = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_tmin", "--")
+        humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{date_str}_humi", "--")
         
-        tmax = env_a.get("tmax", "--")
-        tmin = env_a.get("tmin", "--")
-        humi = env_a.get("humi", "--")
-        
-        if tmax == "--": tmax = asos_data.get(date_str, {}).get("tmax", "--")
-        if tmin == "--": tmin = asos_data.get(date_str, {}).get("tmin", "--")
-        if humi == "--": humi = asos_data.get(date_str, {}).get("humi", "--")
-        
-        if date_str >= today_str or (tmax == "--" and tmin == "--"):
-            if tmax == "--": tmax = env_o.get("tmax", "--")
-            if tmin == "--": tmin = env_o.get("tmin", "--")
-            if humi == "--": humi = env_o.get("humi", "--")
-        
-        pm25 = cached_pm25 if cached_pm25 != "--" else env_o.get("pm25", "--")
-
         if not details or len(details) < 96:
             details = []
             for m in range(96):
@@ -609,21 +604,18 @@ def get_dashboard_data(station: str, start: str, end: str):
                 if mm == 60: hh += 1; mm = 0
                 details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
 
-        return {
+        records.append({
             "date": date_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
-            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
-        }
-
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        records = list(executor.map(process_day, range(diff)))
-
-    tot_usage = sum(r["usage_kwh"] for r in records)
-    max_peak = max((r["peak_kw"] for r in records), default=0.0)
-    tot_co2 = sum(r["co2"] for r in records)
+            "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": cached_pm25, "details": details
+        })
+        
+        tot_usage += usage
+        if peak > max_peak: max_peak = peak
+        tot_co2 += co2
 
     return {
         "station_name": station, 
-        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
+        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료)",
         "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
         "daily_records": records
     }
