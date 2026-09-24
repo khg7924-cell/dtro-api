@@ -490,14 +490,20 @@ def get_kepco_data_for_station(station: str, date_str: str):
         
     return total_usage, max_peak, details
 
+# =========================================================================
+# 🚀 1. 통합 대시보드 (2026-09-05 이후 API 전용, 관리자 bypass 캐시 우회 추가)
+# =========================================================================
 @app.get("/api/dashboard/{station}")
-def get_dashboard_data(station: str, start: str, end: str):
+def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"):
+    is_bypass = bypass.lower() == "true"
     cache_key = f"{station}_{start}_{end}"
     today_str = get_kst_now().strftime("%Y-%m-%d")
     
-    if cache_key in GLOBAL_API_CACHE["dashboard"]:
+    # bypass가 아닐 때만 캐시를 반환
+    if not is_bypass and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
         if end < today_str or (time.time() - c_time < 600):
+            c_res["is_cached"] = True
             return c_res
 
     start_dt = datetime.strptime(start, "%Y-%m-%d")
@@ -511,7 +517,9 @@ def get_dashboard_data(station: str, start: str, end: str):
             "station_name": station, 
             "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
             "summary": { "total_usage": 0, "max_peak": 0, "total_co2": 0 },
-            "daily_records": []
+            "daily_records": [],
+            "cached_at": get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "is_cached": False
         }
         GLOBAL_API_CACHE["dashboard"][cache_key] = (time.time(), res)
         return res
@@ -574,7 +582,9 @@ def get_dashboard_data(station: str, start: str, end: str):
         "station_name": station, 
         "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
         "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
-        "daily_records": records
+        "daily_records": records,
+        "cached_at": get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "is_cached": False
     }
     
     GLOBAL_API_CACHE["dashboard"][cache_key] = (time.time(), res)
