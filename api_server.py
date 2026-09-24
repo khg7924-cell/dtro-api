@@ -3,6 +3,8 @@ import time
 import io
 import json
 import logging
+import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -107,25 +109,15 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
-# =========================================================================
-# 🌟 상시 자동 캐싱 (Cache Pre-warming) - 9월 5일 ~ 현재 전체 구간 완벽 준비
-# =========================================================================
 async def auto_cache_warmer():
-    """서버가 구동되는 동안 백그라운드에서 9월 5일 이후의 모든 데이터를 미리 준비합니다."""
-    await asyncio.sleep(3)  # 서버 구동 후 3초 대기 (안정화)
-    
+    await asyncio.sleep(3)
     while True:
         try:
             logger.info("🔥 [상시 캐싱] 백그라운드에서 9월 5일 이후 전체 데이터를 미리 준비합니다...")
-            
             def warm_up():
                 today_str = get_kst_now().strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
                 
-                # 1. 당일(실시간) 한전 및 기상 데이터 최신화
-                update_today_cache()
-                
-                # 2. 기상청(ASOS/AWS) 및 Open-Meteo 전체 구간 1회 일괄 선제 수집 (중복 통신 방지)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
@@ -133,28 +125,23 @@ async def auto_cache_warmer():
                     for lat, lon in set(STATION_COORD_MAP.values()):
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
                 
-                # 3. 28개 전체 역사의 "9월 5일~오늘" 대시보드 강제 1회 조회 (최종 JSON 결과물 캐시 적재)
                 target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
                 
                 for st in target_stations:
-                    # 한전 API 과부하 방지를 위해 순차적으로 내부 함수 호출 (백그라운드이므로 지연 무관)
                     get_dashboard_data(st, api_start, today_str)
                     
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
             logger.info("✅ [상시 캐싱 완료] 28개 전 개소의 9/5 이후 데이터가 메모리에 100% 적재되었습니다!")
-            
         except Exception as e:
             logger.error(f"상시 캐싱 중 오류 발생: {e}")
             
-        # 10분(600초) 대기 후 당일 최신 전력량 반영을 위해 무한 반복
         await asyncio.sleep(600)
 
 @app.on_event("startup")
 async def startup_event():
     load_excel_dataset()
-    # 서버가 켜지면 무거운 과거 데이터 긁어오기를 스케줄러에게 완전히 위임함
     asyncio.create_task(auto_cache_warmer())
     logger.info("✅ 서버 정상 구동 완료. (9월 5일~현재 상시 자동 캐싱 엔진 가동 중)")
 
@@ -218,7 +205,6 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 과거~미래 모든 구간을 빠짐없이 긁어오는 대구 대표 ASOS(143번) 수집 엔진
 def fetch_asos_daily(start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -504,9 +490,6 @@ def get_kepco_data_for_station(station: str, date_str: str):
         
     return total_usage, max_peak, details
 
-# =========================================================================
-# 🚀 1. 통합 대시보드 (2026-09-05 이후 API 전용, 초경량)
-# =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
     cache_key = f"{station}_{start}_{end}"
@@ -630,9 +613,6 @@ def get_realtime_data(station: str):
     GLOBAL_API_CACHE["realtime"][cache_key] = (time.time(), res)
     return res
 
-# =========================================================================
-# 🚀 2. 연도별 비교 분석 (ASOS 143번 수년 치 데이터 정상 수집 및 캐싱)
-# =========================================================================
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
     cache_key = f"{station}_{base_year}_{comp_year}_{price}"
@@ -689,7 +669,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         c_total_off = df_comp['is_offday'].sum()
         off_diff = c_total_off - b_total_off
 
-        # 🌟 기상청 대구 대표 ASOS(143번) 데이터 정밀 수집
         asos_data = fetch_asos_daily(f"{base_year}-01-01", f"{comp_year}-12-31")
             
         def get_stats(year_str):
@@ -795,12 +774,8 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
     except Exception as e:
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
 
-# =========================================================================
-# 🚀 3. AI 수요 예측 (ASOS 143번 기온/습도 피처 학습 완벽 연동)
-# =========================================================================
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
-    import hashlib
     rep_hash = hashlib.md5(reports_data.encode()).hexdigest() if reports_data else "none"
     cache_key = f"{station}_{target_year}_{pass_rate}_{temp_adj}_{winter_temp_adj}_{pm25_adj}_{rep_hash}"
     if cache_key in GLOBAL_API_CACHE["predict"]:
@@ -845,7 +820,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['is_weekend'] = df['dayofweek'].isin([5,6]).astype(int)
         df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
         
-        # 🌟 기상청 공식 ASOS 143번에서 2023년부터 예측 대상연도까지 기상 데이터 전량 수집
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
         df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
@@ -982,9 +956,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
     except Exception as e:
         return {"error": f"서버 내부 오류로 예측에 실패했습니다: {str(e)}\n\n{traceback.format_exc()}"}
     
-# =========================================================================
-# 🚀 4. 전기요금 청구정보 (12개월 병렬 수집)
-# =========================================================================
 @app.get("/api/bill/{station}")
 def get_bill_data(station: str, year: str):
     cache_key = f"{station}_{year}"
@@ -1048,9 +1019,6 @@ def get_bill_data(station: str, year: str):
     GLOBAL_API_CACHE["bill"][cache_key] = res
     return res
 
-# =========================================================================
-# 🚀 5. 백업 내보내기
-# =========================================================================
 @app.get("/api/backup")
 def export_master_backup():
     file_path = "uploaded_dataset.xlsx"
