@@ -41,11 +41,10 @@ KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 # =========================================================================
 # 🚨 카카오워크 알림 및 임계치 설정 시스템
 # =========================================================================
-# 🌟 발급받으신 Webhook URL을 아래에 반드시 붙여넣으세요!
 KAKAO_WEBHOOK_URL = "https://kakaowork.com/bots/hook/1b7bce124e5b4ce28d9b1374a81073ad"
 
-ALERT_FLAGS = {}   # 오늘 알림을 이미 보낸 역사 기록 (스팸 폭탄 방지용)
-THRESHOLDS = {}    # 역사별 최대수요 경고 임계치 저장소
+ALERT_FLAGS = {}   
+THRESHOLDS = {}    
 
 def load_thresholds():
     global THRESHOLDS
@@ -69,12 +68,11 @@ def check_and_send_alert(station: str, current_peak: float):
         today_str = get_kst_now().strftime("%Y-%m-%d")
         flag_key = f"{station}_{today_str}"
         
-        # 오늘 해당 역에 대해 알림을 보낸 적이 없다면 발송
         if flag_key not in ALERT_FLAGS:
             msg = f"🚨 [{station}] 최대수요전력 경고!\n- 현재 피크: {current_peak} kW\n- 설정 기준: {limit} kW"
             try:
                 requests.post(KAKAO_WEBHOOK_URL, json={"text": msg}, timeout=3)
-                ALERT_FLAGS[flag_key] = True  # 발송 완료 마킹
+                ALERT_FLAGS[flag_key] = True  
                 logger.info(f"✅ 카카오워크 알림 발송 완료: {station}")
             except Exception as e:
                 logger.error(f"❌ 카카오워크 발송 실패: {e}")
@@ -185,11 +183,10 @@ async def auto_cache_warmer():
 @app.on_event("startup")
 async def startup_event():
     load_excel_dataset()
-    load_thresholds()  # 🌟 서버 시작 시 임계치 불러오기
+    load_thresholds()
     asyncio.create_task(auto_cache_warmer())
     logger.info("✅ 서버 정상 구동 완료. (상시 자동 캐싱 및 카카오워크 감시 엔진 가동 중)")
 
-# 🌟 임계치 설정 API (프론트엔드 연동용)
 @app.post("/api/threshold/{station}")
 def set_threshold(station: str, limit: float):
     THRESHOLDS[station] = limit
@@ -492,7 +489,8 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
-def get_kepco_data_for_station(station: str, date_str: str):
+# 🌟 is_bypass 파라미터 추가
+def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = False):
     cust_nos = []
     target_meter_no = "전체"
     
@@ -508,8 +506,10 @@ def get_kepco_data_for_station(station: str, date_str: str):
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
         cache_key = f"{c_no}_{date_str}"
+        
+        # 🌟 is_bypass가 참이면 기존 메모리에 0으로 박힌 쓰레기 캐시 무시
         if not is_bypass and cache_key in GLOBAL_KEPCO_CACHE:
-                day_list = GLOBAL_KEPCO_CACHE[cache_key]
+            day_list = GLOBAL_KEPCO_CACHE[cache_key]
         else:
             url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
             params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
@@ -520,6 +520,7 @@ def get_kepco_data_for_station(station: str, date_str: str):
                     data = res.json()
                     if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
             except: pass
+            
             if date_str < get_kst_now().strftime("%Y-%m-%d"):
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
         
@@ -536,7 +537,6 @@ def get_kepco_data_for_station(station: str, date_str: str):
     total_usage = sum(total_interval_usage)
     max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
     
-    # 🌟 데이터 가져올 때마다 오늘 날짜면 카카오워크 알림 검사 실행
     if date_str == get_kst_now().strftime("%Y-%m-%d"):
         check_and_send_alert(station, max_peak)
     
@@ -606,7 +606,9 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         
+        # 🌟 이제 프론트엔드의 bypass 신호가 KEPCO API 통신부까지 뚫고 들어갑니다.
         usage, peak, details = get_kepco_data_for_station(station, d_str, is_bypass)
+        
         if not details: details = safe_empty_details
         
         tmax = aws_data.get(d_str, {}).get("tmax", "--")
