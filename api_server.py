@@ -2,6 +2,8 @@ import os
 import time
 import io
 import json
+import logging
+import asyncio
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -17,6 +19,9 @@ import urllib3
 from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -102,25 +107,6 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        with open("uploaded_dataset.xlsx", "wb") as f:
-            f.write(contents)
-        return {"status": "success", "filename": file.filename}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/check_dataset")
-def check_dataset_status():
-    file_path = "uploaded_dataset.xlsx"
-    if os.path.exists(file_path):
-        modified_time = os.path.getmtime(file_path)
-        dt_m = datetime.fromtimestamp(modified_time).strftime('%m월 %d일 %H:%M')
-        return {"exists": True, "updated_at": dt_m}
-    return {"exists": False}
-
 def load_excel_dataset():
     file_path = "uploaded_dataset.xlsx"
     if not os.path.exists(file_path): return None
@@ -164,13 +150,12 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     diff = (e_dt - s_dt).days + 1
     
+    missing_dates = []
     cached_res = {}
-    is_fully_cached = True
     for i in range(diff):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
         ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
-        
         if ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
@@ -179,17 +164,19 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
                 "humi": GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_humi", "--")
             }
         else:
-            is_fully_cached = False
-            break
+            missing_dates.append(d_str)
             
-    if is_fully_cached:
+    if not missing_dates:
         return cached_res
 
+    req_start = min(missing_dates)
+    req_end = max(missing_dates)
+    
     env_data = {}
     url_a = "https://air-quality-api.open-meteo.com/v1/air-quality"
-    params_a = {"latitude": lat, "longitude": lon, "start_date": start_date, "end_date": end_date, "hourly": "pm2_5", "timezone": "Asia/Seoul"}
+    params_a = {"latitude": lat, "longitude": lon, "start_date": req_start, "end_date": req_end, "hourly": "pm2_5", "timezone": "Asia/Seoul"}
     try:
-        r_a = http_session.get(url_a, params=params_a, timeout=5)
+        r_a = http_session.get(url_a, params=params_a, timeout=4)
         if r_a.status_code == 200:
             data = r_a.json()
             h_times = data.get("hourly", {}).get("time", [])
@@ -203,9 +190,9 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
     except: pass
 
     url_w = "https://api.open-meteo.com/v1/forecast"
-    params_w = {"latitude": lat, "longitude": lon, "start_date": start_date, "end_date": end_date, "daily": "temperature_2m_max,temperature_2m_min", "hourly": "relative_humidity_2m", "timezone": "Asia/Seoul"}
+    params_w = {"latitude": lat, "longitude": lon, "start_date": req_start, "end_date": req_end, "daily": "temperature_2m_max,temperature_2m_min", "hourly": "relative_humidity_2m", "timezone": "Asia/Seoul"}
     try:
-        r_w = http_session.get(url_w, params=params_w, timeout=5)
+        r_w = http_session.get(url_w, params=params_w, timeout=4)
         if r_w.status_code == 200:
             data = r_w.json()
             d_times = data.get("daily", {}).get("time", [])
@@ -226,14 +213,22 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
                 if t in humi_dict: env_data[t]["humi"] = round(sum(humi_dict[t])/len(humi_dict[t]), 1)
     except: pass
 
-    for d_str, v in env_data.items():
-        if d_str < get_kst_now().strftime("%Y-%m-%d"):
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = v.get("pm25", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = v.get("tmax", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = v.get("tmin", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_humi"] = v.get("humi", "--")
+    today_str = get_kst_now().strftime("%Y-%m-%d")
+    for d_str in missing_dates:
+        v = env_data.get(d_str, {})
+        cached_res[d_str] = {
+            "pm25": v.get("pm25", "--"),
+            "tmax": v.get("tmax", "--"),
+            "tmin": v.get("tmin", "--"),
+            "humi": v.get("humi", "--")
+        }
+        if d_str < today_str:
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
+            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_humi"] = cached_res[d_str]["humi"]
             
-    return env_data
+    return cached_res
 
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -245,46 +240,48 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
     res = {}
     diff = (e_dt - s_dt).days + 1
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    today_str = get_kst_now().strftime("%Y-%m-%d")
     
-    def fetch_single_element(d_str, tm2, obs, key):
-        cache_key = f"AWS_{stn_id}_{d_str}_{key}"
-        if cache_key in GLOBAL_WEATHER_CACHE: return key, GLOBAL_WEATHER_CACHE[cache_key]
-
-        url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
-        for _ in range(2):
-            try:
-                r = http_session.get(url, headers=headers, timeout=3)
-                lines = r.text.split('\n')
-                for line in lines:
-                    if line.strip() and not line.startswith('#'):
-                        parts = line.split()
-                        if len(parts) >= 6 and parts[1] == stn_id:
-                            try:
-                                fv = float(parts[5])
-                                if fv > -50.0:  
-                                    if d_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_WEATHER_CACHE[cache_key] = fv
-                                    return key, fv
-                            except: pass
-                break
-            except: time.sleep(0.2)
+    missing_tasks = []
+    for i in range(diff):
+        curr = s_dt + timedelta(days=i)
+        d_str = curr.strftime("%Y-%m-%d")
+        tm2 = curr.strftime("%Y%m%d")
+        res[d_str] = {"tmax": "--", "tmin": "--", "humi": "--"}
         
-        if d_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_WEATHER_CACHE[cache_key] = "--"
-        return key, "--"
+        for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
+            cache_key = f"AWS_{stn_id}_{d_str}_{key}"
+            if cache_key in GLOBAL_WEATHER_CACHE:
+                res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
+            else:
+                missing_tasks.append((d_str, tm2, obs, key, cache_key))
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = []
-        for i in range(diff):
-            curr = s_dt + timedelta(days=i)
-            d_str = curr.strftime("%Y-%m-%d")
-            tm2 = curr.strftime("%Y%m%d")
-            res[d_str] = {"tmax": "--", "tmin": "--", "humi": "--"}
-            futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_max", "tmax")))
-            futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "ta_min", "tmin")))
-            futures.append((d_str, executor.submit(fetch_single_element, d_str, tm2, "hm_avg", "humi")))
+    if not missing_tasks:
+        return res
+
+    def fetch_single_element(d_str, tm2, obs, key, cache_key):
+        url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
+        try:
+            r = http_session.get(url, headers=headers, timeout=2.5)
+            lines = r.text.split('\n')
+            for line in lines:
+                if line.strip() and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 6 and parts[1] == stn_id:
+                        fv = float(parts[5])
+                        if fv > -50.0:
+                            if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = fv
+                            return d_str, key, fv
+        except: pass
+        if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = "--"
+        return d_str, key, "--"
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_single_element, *t) for t in missing_tasks]
+        for f in futures:
+            d_str, k, val = f.result()
+            res[d_str][k] = val
             
-        for d_str, future in futures:
-            key, val = future.result()
-            if val != "--": res[d_str][key] = val
     return res
 
 def fetch_asos_daily(start_date: str, end_date: str):
@@ -295,9 +292,10 @@ def fetch_asos_daily(start_date: str, end_date: str):
     if s_dt > e_dt: return {} 
 
     diff = (e_dt - s_dt).days + 1
+    today_str = get_kst_now().strftime("%Y-%m-%d")
     
+    missing_dates = []
     cached_res = {}
-    is_fully_cached = True
     for i in range(diff):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
@@ -309,60 +307,60 @@ def fetch_asos_daily(start_date: str, end_date: str):
                 "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
             }
         else:
-            is_fully_cached = False
-            break
+            missing_dates.append(d_str)
             
-    if is_fully_cached:
+    if not missing_dates:
         return cached_res
 
-    res = {}
-    y_s = s_dt.strftime("%Y%m%d")
-    y_e = e_dt.strftime("%Y%m%d")
-    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={y_s}&tm2={y_e}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
+    req_start = min(missing_dates).replace("-", "")
+    req_end = max(missing_dates).replace("-", "")
+    
+    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
-    for attempt in range(2):
-        try:
-            r = http_session.get(url, headers=headers, timeout=5)
-            r.encoding = 'EUC-KR'
-            lines = r.text.split('\n')
-            headers_list = []
-            for line in lines:
-                if line.startswith('#') and ':' in line and '.' in line:
-                    left_side = line.split(':')[0].strip()
-                    if left_side.replace('#', '').strip()[0].isdigit():
-                        col_name = left_side.split('.')[1].strip().split()[0]
-                        if col_name not in headers_list: headers_list.append(col_name)
-                elif line.strip() and not line.startswith('#') and headers_list:
-                    parts = line.split()
-                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
-                        row_dict = dict(zip(headers_list, parts))
-                        date_key = row_dict.get('TM')
-                        if date_key and len(date_key) >= 8:
-                            d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                            def parse_val(v):
-                                if not v: return "--"
-                                try:
-                                    fv = float(v)
-                                    return fv if fv > -50.0 else "--"
-                                except: return "--"
-                            res[d_str] = {
-                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
-                            }
-            if res: break 
-        except: time.sleep(0.5)
+    res = {}
+    try:
+        r = http_session.get(url, headers=headers, timeout=4)
+        r.encoding = 'EUC-KR'
+        lines = r.text.split('\n')
+        headers_list = []
+        for line in lines:
+            if line.startswith('#') and ':' in line and '.' in line:
+                left_side = line.split(':')[0].strip()
+                if left_side.replace('#', '').strip()[0].isdigit():
+                    col_name = left_side.split('.')[1].strip().split()[0]
+                    if col_name not in headers_list: headers_list.append(col_name)
+            elif line.strip() and not line.startswith('#') and headers_list:
+                parts = line.split()
+                if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
+                    row_dict = dict(zip(headers_list, parts))
+                    date_key = row_dict.get('TM')
+                    if date_key and len(date_key) >= 8:
+                        d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                        def parse_val(v):
+                            if not v: return "--"
+                            try:
+                                fv = float(v)
+                                return fv if fv > -50.0 else "--"
+                            except: return "--"
+                        res[d_str] = {
+                            "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                            "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                            "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                            "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                        }
+    except: pass
 
-    for d_str, v in res.items():
-        if d_str < get_kst_now().strftime("%Y-%m-%d"):
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v.get("tmax", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v.get("tmin", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v.get("tavg", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v.get("humi", "--")
+    for d_str in missing_dates:
+        v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
+        cached_res[d_str] = v
+        if d_str < today_str:
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
+            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v["humi"]
             
-    return res
+    return cached_res
 
 def process_kepco_day_data(day_list, target_meter_no):
     interval_usage = [0.0] * 96
@@ -382,7 +380,6 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
-# 🌟 [해결 2] 당일 KEPCO 데이터 병렬 일괄 수집 로직 (19초 -> 2초 단축)
 def update_today_cache():
     today_str = get_kst_now().strftime("%Y-%m-%d")
     current_time = time.time()
@@ -393,7 +390,7 @@ def update_today_cache():
         GLOBAL_TODAY_CACHE["weather"] = {}
         GLOBAL_TODAY_CACHE["kepco"] = {}
         
-        with ThreadPoolExecutor(max_workers=10) as weather_exec:
+        with ThreadPoolExecutor(max_workers=8) as weather_exec:
             f_as = weather_exec.submit(fetch_asos_daily, today_str, today_str)
             aws_futures = {aws_stn: weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, today_str, today_str) for aws_stn in set(STATION_AWS_MAP.values())}
             om_futures = {}
@@ -434,16 +431,15 @@ def update_today_cache():
         def fetch_today_cust(c_no):
             url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
             params = {"custNo": c_no, "date": today_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
-            for _ in range(2):
-                try:
-                    res = http_session.get(url, params=params, timeout=5)
-                    if res.status_code == 200:
-                        data = res.json()
-                        if "dayLpDataInfoList" in data: return c_no, data["dayLpDataInfoList"]
-                except: time.sleep(0.2)
+            try:
+                res = http_session.get(url, params=params, timeout=3)
+                if res.status_code == 200:
+                    data = res.json()
+                    if "dayLpDataInfoList" in data: return c_no, data["dayLpDataInfoList"]
+            except: pass
             return c_no, []
 
-        with ThreadPoolExecutor(max_workers=10) as exec:
+        with ThreadPoolExecutor(max_workers=8) as exec:
             results = list(exec.map(fetch_today_cust, unique_custs))
             
         for c, r in results: today_raw[c] = r
@@ -480,7 +476,6 @@ def update_today_cache():
             
         GLOBAL_TODAY_CACHE["last_update"] = current_time
 
-# 과거 데이터 요청 보조 함수
 def get_kepco_data_for_station(station: str, date_str: str):
     cust_nos = []
     target_meter_no = "전체"
@@ -496,19 +491,21 @@ def get_kepco_data_for_station(station: str, date_str: str):
     
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
-        # 직접 API 호출
-        url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
-        params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
-        day_list = []
-        for _ in range(2):
+        cache_key = f"{c_no}_{date_str}"
+        if cache_key in GLOBAL_KEPCO_CACHE:
+            day_list = GLOBAL_KEPCO_CACHE[cache_key]
+        else:
+            url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
+            params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
+            day_list = []
             try:
-                res = http_session.get(url, params=params, timeout=5)
+                res = http_session.get(url, params=params, timeout=3)
                 if res.status_code == 200:
                     data = res.json()
-                    if "dayLpDataInfoList" in data:
-                        day_list = data["dayLpDataInfoList"]
-                        break
-            except: time.sleep(0.2)
+                    if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
+            except: pass
+            if date_str < get_kst_now().strftime("%Y-%m-%d"):
+                GLOBAL_KEPCO_CACHE[cache_key] = day_list
         
         m_target = target_meter_no if c_no == '0526314773' else "전체"
         return process_kepco_day_data(day_list, m_target)
@@ -538,7 +535,7 @@ def update_past_cache(missing_dates):
     start_str = min(missing_dates)
     end_str = max(missing_dates)
     
-    with ThreadPoolExecutor(max_workers=10) as weather_exec:
+    with ThreadPoolExecutor(max_workers=8) as weather_exec:
         f_as = weather_exec.submit(fetch_asos_daily, start_str, end_str)
         aws_futures = {aws_stn: weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_str, end_str) for aws_stn in set(STATION_AWS_MAP.values())}
         om_futures = {}
@@ -554,8 +551,6 @@ def update_past_cache(missing_dates):
 
     for d_str in missing_dates:
         GLOBAL_PAST_CACHE[d_str] = {}
-        get_kepco_data_for_station('전체', d_str) 
-        
         for st in target_stations:
             u, p, d = get_kepco_data_for_station(st, d_str)
             aws_stn = STATION_AWS_MAP.get(st, '143')
@@ -568,8 +563,11 @@ def update_past_cache(missing_dates):
             humi = env_a.get("humi", "--")
             
             if tmax == "--": tmax = as_data.get(d_str, {}).get("tmax", "--")
+            if tmax == "--": tmax = om_data.get(d_str, {}).get("tmax", "--")
             if tmin == "--": tmin = as_data.get(d_str, {}).get("tmin", "--")
+            if tmin == "--": tmin = om_data.get(d_str, {}).get("tmin", "--")
             if humi == "--": humi = as_data.get(d_str, {}).get("humi", "--")
+            if humi == "--": humi = om_data.get(d_str, {}).get("humi", "--")
             
             pm25 = om_data.get(d_str, {}).get("pm25", "--")
 
@@ -577,6 +575,37 @@ def update_past_cache(missing_dates):
                 "usage_kwh": u, "peak_kw": p, "details": d,
                 "tmax": tmax, "tmin": tmin, "humi": humi, "pm25": pm25
             }
+
+async def prefetch_gap_data():
+    def init_today():
+        update_today_cache()
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, init_today)
+
+@app.on_event("startup")
+async def startup_event():
+    load_excel_dataset()
+    asyncio.create_task(prefetch_gap_data())
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        with open("uploaded_dataset.xlsx", "wb") as f:
+            f.write(contents)
+        load_excel_dataset()
+        return {"status": "success", "filename": file.filename}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/check_dataset")
+def check_dataset_status():
+    file_path = "uploaded_dataset.xlsx"
+    if os.path.exists(file_path):
+        modified_time = os.path.getmtime(file_path)
+        dt_m = datetime.fromtimestamp(modified_time).strftime('%m월 %d일 %H:%M')
+        return {"exists": True, "updated_at": dt_m}
+    return {"exists": False}
 
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str):
@@ -613,28 +642,42 @@ def get_dashboard_data(station: str, start: str, end: str):
     update_today_cache()
 
     missing_past_dates = []
+    excel_missing_weather_dates = []
+    
     for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         if d_str == today_str: continue
         
-        if d_str not in excel_cache and d_str not in GLOBAL_PAST_CACHE:
-            missing_past_dates.append(d_str)
+        if d_str in excel_cache:
+            if f"AWS_{aws_stn}_{d_str}_tmax" not in GLOBAL_WEATHER_CACHE or f"ASOS_{d_str}_tmax" not in GLOBAL_WEATHER_CACHE:
+                excel_missing_weather_dates.append(d_str)
+        else:
+            if d_str not in GLOBAL_PAST_CACHE:
+                missing_past_dates.append(d_str)
                 
     if missing_past_dates:
         update_past_cache(missing_past_dates)
+        
+    if excel_missing_weather_dates:
+        min_d, max_d = min(excel_missing_weather_dates), max(excel_missing_weather_dates)
+        with ThreadPoolExecutor(max_workers=3) as weather_exec:
+            f_as = weather_exec.submit(fetch_asos_daily, min_d, max_d)
+            f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, min_d, max_d)
+            f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, min_d, max_d)
+        f_as.result()
+        f_aw.result()
+        f_om.result()
 
     records = []
     tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
     
     safe_empty_details = []
     for m in range(96):
-        hh = m // 4
-        mm = (m % 4) * 15 + 15
-        if mm == 60:
-            hh += 1; mm = 0
+        hh = m // 4; mm = (m % 4) * 15 + 15
+        if mm == 60: hh += 1; mm = 0
         safe_empty_details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
 
-    def process_day(i):
+    for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         
         if d_str == today_str:
@@ -666,9 +709,7 @@ def get_dashboard_data(station: str, start: str, end: str):
             if tmin == "--": tmin = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_tmin", "--")
             if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
             if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_humi", "--")
-            
-            if pm25 == "--":
-                pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_pm25", "--")
+            if pm25 == "--": pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_pm25", "--")
                 
         else:
             st_data = GLOBAL_PAST_CACHE.get(d_str, {}).get(station, {})
@@ -683,17 +724,13 @@ def get_dashboard_data(station: str, start: str, end: str):
             pm25 = st_data.get("pm25", "--")
                 
         co2 = usage * 0.466 / 1000
-        return {
+        records.append({
             "date": d_str, "usage_kwh": round(usage, 1), "peak_kw": round(peak, 1), "co2": round(co2, 2),
             "temp_max": tmax, "temp_min": tmin, "humidity": humi, "pm25": pm25, "details": details
-        }
-
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        records = list(executor.map(process_day, range(diff)))
-
-    tot_usage = sum(r["usage_kwh"] for r in records)
-    max_peak = max((r["peak_kw"] for r in records), default=0.0)
-    tot_co2 = sum(r["co2"] for r in records)
+        })
+        tot_usage += usage
+        if peak > max_peak: max_peak = peak
+        tot_co2 += co2
 
     return {
         "station_name": station, 
@@ -702,10 +739,8 @@ def get_dashboard_data(station: str, start: str, end: str):
         "daily_records": records
     }
 
-# 🌟 [해결 1] 실시간 API 캐시 우회 버그 완벽 차단 로직 적용
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
-    update_today_cache()
     today_str = get_kst_now().strftime("%Y-%m-%d")
     
     st_data = GLOBAL_TODAY_CACHE["kepco"].get(station, {})
@@ -1219,8 +1254,3 @@ def export_master_backup():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-    
