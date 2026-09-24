@@ -107,10 +107,56 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
+# =========================================================================
+# 🌟 상시 자동 캐싱 (Cache Pre-warming) - 9월 5일 ~ 현재 전체 구간 완벽 준비
+# =========================================================================
+async def auto_cache_warmer():
+    """서버가 구동되는 동안 백그라운드에서 9월 5일 이후의 모든 데이터를 미리 준비합니다."""
+    await asyncio.sleep(3)  # 서버 구동 후 3초 대기 (안정화)
+    
+    while True:
+        try:
+            logger.info("🔥 [상시 캐싱] 백그라운드에서 9월 5일 이후 전체 데이터를 미리 준비합니다...")
+            
+            def warm_up():
+                today_str = get_kst_now().strftime("%Y-%m-%d")
+                api_start = "2026-09-05"
+                
+                # 1. 당일(실시간) 한전 및 기상 데이터 최신화
+                update_today_cache()
+                
+                # 2. 기상청(ASOS/AWS) 및 Open-Meteo 전체 구간 1회 일괄 선제 수집 (중복 통신 방지)
+                with ThreadPoolExecutor(max_workers=5) as weather_exec:
+                    weather_exec.submit(fetch_asos_daily, api_start, today_str)
+                    for aws_stn in set(STATION_AWS_MAP.values()):
+                        weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
+                    for lat, lon in set(STATION_COORD_MAP.values()):
+                        weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
+                
+                # 3. 28개 전체 역사의 "9월 5일~오늘" 대시보드 강제 1회 조회 (최종 JSON 결과물 캐시 적재)
+                target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
+                                  LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
+                
+                for st in target_stations:
+                    # 한전 API 과부하 방지를 위해 순차적으로 내부 함수 호출 (백그라운드이므로 지연 무관)
+                    get_dashboard_data(st, api_start, today_str)
+                    
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, warm_up)
+            logger.info("✅ [상시 캐싱 완료] 28개 전 개소의 9/5 이후 데이터가 메모리에 100% 적재되었습니다!")
+            
+        except Exception as e:
+            logger.error(f"상시 캐싱 중 오류 발생: {e}")
+            
+        # 10분(600초) 대기 후 당일 최신 전력량 반영을 위해 무한 반복
+        await asyncio.sleep(600)
+
 @app.on_event("startup")
 async def startup_event():
     load_excel_dataset()
-    logger.info("✅ 서버 정상 구동 완료. (대시보드는 9/5 이후 API 전용, 타 탭은 ASOS/Excel 분석 모드)")
+    # 서버가 켜지면 무거운 과거 데이터 긁어오기를 스케줄러에게 완전히 위임함
+    asyncio.create_task(auto_cache_warmer())
+    logger.info("✅ 서버 정상 구동 완료. (9월 5일~현재 상시 자동 캐싱 엔진 가동 중)")
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
