@@ -508,8 +508,8 @@ def get_kepco_data_for_station(station: str, date_str: str):
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
         cache_key = f"{c_no}_{date_str}"
-        if cache_key in GLOBAL_KEPCO_CACHE:
-            day_list = GLOBAL_KEPCO_CACHE[cache_key]
+        if not is_bypass and cache_key in GLOBAL_KEPCO_CACHE:
+                day_list = GLOBAL_KEPCO_CACHE[cache_key]
         else:
             url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
             params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
@@ -606,7 +606,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         
-        usage, peak, details = get_kepco_data_for_station(station, d_str)
+        usage, peak, details = get_kepco_data_for_station(station, d_str, is_bypass)
         if not details: details = safe_empty_details
         
         tmax = aws_data.get(d_str, {}).get("tmax", "--")
