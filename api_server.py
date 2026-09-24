@@ -38,6 +38,49 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
+# =========================================================================
+# 🚨 카카오워크 알림 및 임계치 설정 시스템
+# =========================================================================
+# 🌟 발급받으신 Webhook URL을 아래에 반드시 붙여넣으세요!
+KAKAO_WEBHOOK_URL = "https://kakaowork.com/bots/hook/1b7bce124e5b4ce28d9b1374a81073ad"
+
+ALERT_FLAGS = {}   # 오늘 알림을 이미 보낸 역사 기록 (스팸 폭탄 방지용)
+THRESHOLDS = {}    # 역사별 최대수요 경고 임계치 저장소
+
+def load_thresholds():
+    global THRESHOLDS
+    if os.path.exists("thresholds.json"):
+        try:
+            with open("thresholds.json", "r", encoding="utf-8") as f:
+                THRESHOLDS = json.load(f)
+        except Exception:
+            THRESHOLDS = {}
+
+def save_thresholds():
+    with open("thresholds.json", "w", encoding="utf-8") as f:
+        json.dump(THRESHOLDS, f, ensure_ascii=False)
+
+def check_and_send_alert(station: str, current_peak: float):
+    if not KAKAO_WEBHOOK_URL or KAKAO_WEBHOOK_URL == "여기에_발급받은_URL을_붙여넣으세요": return
+    if station not in THRESHOLDS: return
+    
+    limit = THRESHOLDS[station]
+    if current_peak >= limit and limit > 0:
+        today_str = get_kst_now().strftime("%Y-%m-%d")
+        flag_key = f"{station}_{today_str}"
+        
+        # 오늘 해당 역에 대해 알림을 보낸 적이 없다면 발송
+        if flag_key not in ALERT_FLAGS:
+            msg = f"🚨 [{station}] 최대수요전력 경고!\n- 현재 피크: {current_peak} kW\n- 설정 기준: {limit} kW"
+            try:
+                requests.post(KAKAO_WEBHOOK_URL, json={"text": msg}, timeout=3)
+                ALERT_FLAGS[flag_key] = True  # 발송 완료 마킹
+                logger.info(f"✅ 카카오워크 알림 발송 완료: {station}")
+            except Exception as e:
+                logger.error(f"❌ 카카오워크 발송 실패: {e}")
+
+# =========================================================================
+
 http_session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200)
 http_session.mount('https://', adapter)
@@ -133,7 +176,7 @@ async def auto_cache_warmer():
                     
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
-            logger.info("✅ [상시 캐싱 완료] 28개 전 개소의 9/5 이후 데이터가 메모리에 100% 적재되었습니다!")
+            logger.info("✅ [상시 캐싱 완료] 데이터 100% 적재 완료. 임계치 감시 대기중.")
         except Exception as e:
             logger.error(f"상시 캐싱 중 오류 발생: {e}")
             
@@ -142,8 +185,20 @@ async def auto_cache_warmer():
 @app.on_event("startup")
 async def startup_event():
     load_excel_dataset()
+    load_thresholds()  # 🌟 서버 시작 시 임계치 불러오기
     asyncio.create_task(auto_cache_warmer())
-    logger.info("✅ 서버 정상 구동 완료. (9월 5일~현재 상시 자동 캐싱 엔진 가동 중)")
+    logger.info("✅ 서버 정상 구동 완료. (상시 자동 캐싱 및 카카오워크 감시 엔진 가동 중)")
+
+# 🌟 임계치 설정 API (프론트엔드 연동용)
+@app.post("/api/threshold/{station}")
+def set_threshold(station: str, limit: float):
+    THRESHOLDS[station] = limit
+    save_thresholds()
+    return {"status": "success", "station": station, "limit": limit}
+
+@app.get("/api/threshold/{station}")
+def get_threshold(station: str):
+    return {"station": station, "limit": THRESHOLDS.get(station, 0.0)}
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -481,6 +536,10 @@ def get_kepco_data_for_station(station: str, date_str: str):
     total_usage = sum(total_interval_usage)
     max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
     
+    # 🌟 데이터 가져올 때마다 오늘 날짜면 카카오워크 알림 검사 실행
+    if date_str == get_kst_now().strftime("%Y-%m-%d"):
+        check_and_send_alert(station, max_peak)
+    
     details = []
     for m in range(96):
         hh = m // 4
@@ -490,16 +549,12 @@ def get_kepco_data_for_station(station: str, date_str: str):
         
     return total_usage, max_peak, details
 
-# =========================================================================
-# 🚀 1. 통합 대시보드 (2026-09-05 이후 API 전용, 관리자 bypass 캐시 우회 추가)
-# =========================================================================
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"):
     is_bypass = bypass.lower() == "true"
     cache_key = f"{station}_{start}_{end}"
     today_str = get_kst_now().strftime("%Y-%m-%d")
     
-    # bypass가 아닐 때만 캐시를 반환
     if not is_bypass and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
         if end < today_str or (time.time() - c_time < 600):
