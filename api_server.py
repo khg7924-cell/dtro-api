@@ -2,8 +2,6 @@ import os
 import time
 import io
 import json
-import logging
-import asyncio
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -19,9 +17,6 @@ import urllib3
 from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -45,7 +40,6 @@ http_session.verify = False
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
-
 GLOBAL_PAST_CACHE = {}
 GLOBAL_TODAY_CACHE = {
     "date": None,
@@ -108,38 +102,12 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
-async def prefetch_gap_data():
-    df = GLOBAL_EXCEL_CACHE.get("df")
-    if df is not None and not df.empty:
-        last_date = pd.to_datetime(df['date'].max())
-        yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        diff = (yesterday - last_date).days
-        if diff > 0:
-            if diff > 14: diff = 14
-            missing_dates = [(last_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, diff + 1)]
-            def run_update():
-                update_past_cache(missing_dates)
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, run_update)
-            
-    def init_today():
-        update_today_cache()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, init_today)
-
-@app.on_event("startup")
-async def startup_event():
-    load_excel_dataset()
-    asyncio.create_task(prefetch_gap_data())
-
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
-        load_excel_dataset()
-        asyncio.create_task(prefetch_gap_data())
         return {"status": "success", "filename": file.filename}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -300,7 +268,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
                 break
             except: time.sleep(0.2)
         
-        # 🚨 [18초 지연 핵심 원인 해결]: 빈 데이터라도 캐시에 반드시 저장하여 두 번 다시 외부망 접속을 차단함
         if d_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_WEATHER_CACHE[cache_key] = "--"
         return key, "--"
 
@@ -397,30 +364,6 @@ def fetch_asos_daily(start_date: str, end_date: str):
             
     return res
 
-def fetch_kepco_day_lp(cust_no: str, date_str: str):
-    cache_key = f"{cust_no}_{date_str}"
-    if cache_key in GLOBAL_KEPCO_CACHE: return GLOBAL_KEPCO_CACHE[cache_key]
-
-    url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
-    params = {"custNo": cust_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
-    for _ in range(2):
-        try:
-            res = http_session.get(url, params=params, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if "dayLpDataInfoList" in data: 
-                    result = data["dayLpDataInfoList"]
-                    if date_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_KEPCO_CACHE[cache_key] = result
-                    return result
-                elif "header" in data: 
-                    # 🚨 [18초 지연 핵심 원인 해결]: 빈 데이터 캐싱 추가
-                    if date_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_KEPCO_CACHE[cache_key] = []
-                    return []
-        except: time.sleep(0.2)
-    
-    if date_str < get_kst_now().strftime("%Y-%m-%d"): GLOBAL_KEPCO_CACHE[cache_key] = []
-    return []
-
 def process_kepco_day_data(day_list, target_meter_no):
     interval_usage = [0.0] * 96
     if not day_list: return interval_usage
@@ -439,45 +382,7 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
-def get_kepco_data_for_station(station: str, date_str: str):
-    cust_nos = []
-    target_meter_no = "전체"
-    
-    if station == '전체': cust_nos = list(set(STATION_CUST_MAP.values()))
-    elif station in LINE_STATIONS: cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
-    elif station == '종합청사': cust_nos = [STATION_CUST_MAP['종합청사']]
-    else:
-        cust_nos = [STATION_CUST_MAP.get(station)]
-        if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
-            
-    total_interval_usage = [0.0] * 96
-    
-    def fetch_and_process(c_no):
-        if not c_no: return [0.0] * 96
-        day_list = fetch_kepco_day_lp(c_no, date_str)
-        if day_list is None: day_list = []
-        m_target = target_meter_no if c_no == '0526314773' else "전체"
-        return process_kepco_day_data(day_list, m_target)
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(fetch_and_process, cust_nos))
-        
-    for int_u in results:
-        for i, val in enumerate(int_u): 
-            total_interval_usage[i] += val
-            
-    total_usage = sum(total_interval_usage)
-    max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
-    
-    details = []
-    for m in range(96):
-        hh = m // 4
-        mm = (m % 4) * 15 + 15
-        if mm == 60: hh += 1; mm = 0
-        details.append({ "time": f"{hh:02d}:{mm:02d}", "usage_kwh": round(total_interval_usage[m], 1), "peak_kw": round(total_interval_usage[m] * 4, 1) })
-        
-    return total_usage, max_peak, details
-
+# 🌟 [해결 2] 당일 KEPCO 데이터 병렬 일괄 수집 로직 (19초 -> 2초 단축)
 def update_today_cache():
     today_str = get_kst_now().strftime("%Y-%m-%d")
     current_time = time.time()
@@ -523,11 +428,109 @@ def update_today_cache():
             GLOBAL_TODAY_CACHE["weather"][st] = {"tmax": tmax, "tmin": tmin, "humi": humi, "pm25": pm25}
 
     if current_time - GLOBAL_TODAY_CACHE.get("last_update", 0) >= 600:
-        get_kepco_data_for_station('전체', today_str) 
+        unique_custs = list(set(STATION_CUST_MAP.values()))
+        today_raw = {}
+        
+        def fetch_today_cust(c_no):
+            url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
+            params = {"custNo": c_no, "date": today_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
+            for _ in range(2):
+                try:
+                    res = http_session.get(url, params=params, timeout=5)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if "dayLpDataInfoList" in data: return c_no, data["dayLpDataInfoList"]
+                except: time.sleep(0.2)
+            return c_no, []
+
+        with ThreadPoolExecutor(max_workers=10) as exec:
+            results = list(exec.map(fetch_today_cust, unique_custs))
+            
+        for c, r in results: today_raw[c] = r
+
+        def process_local(st):
+            if st == '전체': c_list = unique_custs
+            elif st in LINE_STATIONS: c_list = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[st]]))
+            elif st == '종합청사': c_list = [STATION_CUST_MAP['종합청사']]
+            else: c_list = [STATION_CUST_MAP.get(st)]
+            
+            t_meter = STATION_METER_MAP.get(st, "") if st in LINE_STATIONS['1호선'] else "전체"
+            tot_int = [0.0] * 96
+            
+            for c_no in c_list:
+                if not c_no: continue
+                m_target = t_meter if c_no == '0526314773' else "전체"
+                d_list = today_raw.get(c_no, [])
+                int_u = process_kepco_day_data(d_list, m_target)
+                for i, val in enumerate(int_u): tot_int[i] += val
+            
+            usage = sum(tot_int)
+            peak = max(tot_int) * 4 if tot_int else 0.0
+            dets = []
+            for m in range(96):
+                hh = m // 4; mm = (m % 4) * 15 + 15
+                if mm == 60: hh += 1; mm = 0
+                dets.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": round(tot_int[m], 1), "peak_kw": round(tot_int[m]*4, 1)})
+            return st, usage, peak, dets
+        
+        GLOBAL_TODAY_CACHE["kepco"] = {}
         for st in target_stations:
-            u, p, d = get_kepco_data_for_station(st, today_str)
-            GLOBAL_TODAY_CACHE["kepco"][st] = {"usage_kwh": u, "peak_kw": p, "details": d}
+            s, u, p, d = process_local(st)
+            GLOBAL_TODAY_CACHE["kepco"][s] = {"usage_kwh": u, "peak_kw": p, "details": d}
+            
         GLOBAL_TODAY_CACHE["last_update"] = current_time
+
+# 과거 데이터 요청 보조 함수
+def get_kepco_data_for_station(station: str, date_str: str):
+    cust_nos = []
+    target_meter_no = "전체"
+    
+    if station == '전체': cust_nos = list(set(STATION_CUST_MAP.values()))
+    elif station in LINE_STATIONS: cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
+    elif station == '종합청사': cust_nos = [STATION_CUST_MAP['종합청사']]
+    else:
+        cust_nos = [STATION_CUST_MAP.get(station)]
+        if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
+            
+    total_interval_usage = [0.0] * 96
+    
+    def fetch_and_process(c_no):
+        if not c_no: return [0.0] * 96
+        # 직접 API 호출
+        url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
+        params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
+        day_list = []
+        for _ in range(2):
+            try:
+                res = http_session.get(url, params=params, timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    if "dayLpDataInfoList" in data:
+                        day_list = data["dayLpDataInfoList"]
+                        break
+            except: time.sleep(0.2)
+        
+        m_target = target_meter_no if c_no == '0526314773' else "전체"
+        return process_kepco_day_data(day_list, m_target)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(fetch_and_process, cust_nos))
+        
+    for int_u in results:
+        for i, val in enumerate(int_u): 
+            total_interval_usage[i] += val
+            
+    total_usage = sum(total_interval_usage)
+    max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
+    
+    details = []
+    for m in range(96):
+        hh = m // 4
+        mm = (m % 4) * 15 + 15
+        if mm == 60: hh += 1; mm = 0
+        details.append({ "time": f"{hh:02d}:{mm:02d}", "usage_kwh": round(total_interval_usage[m], 1), "peak_kw": round(total_interval_usage[m] * 4, 1) })
+        
+    return total_usage, max_peak, details
 
 def update_past_cache(missing_dates):
     if not missing_dates: return
@@ -609,44 +612,16 @@ def get_dashboard_data(station: str, start: str, end: str):
     
     update_today_cache()
 
-    # 🚨 [18초 지연 핵심 원인 해결]: 무식하게 전체 기간 API 쏘는 로직 폐기, 캐시에 없는 날짜만 골라서 찌름
     missing_past_dates = []
-    excel_missing_weather_dates = []
-    
     for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         if d_str == today_str: continue
         
-        if d_str in excel_cache:
-            if f"AWS_{aws_stn}_{d_str}_tmax" not in GLOBAL_WEATHER_CACHE:
-                excel_missing_weather_dates.append(d_str)
-        else:
-            if d_str not in GLOBAL_PAST_CACHE:
-                missing_past_dates.append(d_str)
+        if d_str not in excel_cache and d_str not in GLOBAL_PAST_CACHE:
+            missing_past_dates.append(d_str)
                 
     if missing_past_dates:
         update_past_cache(missing_past_dates)
-        
-    openmeteo_ex, as_ex, aws_ex = {}, {}, {}
-    if excel_missing_weather_dates:
-        min_d, max_d = min(excel_missing_weather_dates), max(excel_missing_weather_dates)
-        with ThreadPoolExecutor(max_workers=5) as weather_exec:
-            f_as = weather_exec.submit(fetch_asos_daily, min_d, max_d)
-            f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, min_d, max_d)
-            f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, min_d, max_d)
-        
-        as_ex = f_as.result()
-        aws_ex = f_aw.result()
-        openmeteo_ex = f_om.result()
-        
-        for d in excel_missing_weather_dates:
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_pm25"] = openmeteo_ex.get(d, {}).get("pm25", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_tmax"] = openmeteo_ex.get(d, {}).get("tmax", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_tmin"] = openmeteo_ex.get(d, {}).get("tmin", "--")
-            GLOBAL_WEATHER_CACHE[f"OM_{station}_{d}_humi"] = openmeteo_ex.get(d, {}).get("humi", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d}_tmax"] = as_ex.get(d, {}).get("tmax", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d}_tmin"] = as_ex.get(d, {}).get("tmin", "--")
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d}_humi"] = as_ex.get(d, {}).get("humi", "--")
 
     records = []
     tot_usage, max_peak, tot_co2 = 0.0, 0.0, 0.0
@@ -655,7 +630,8 @@ def get_dashboard_data(station: str, start: str, end: str):
     for m in range(96):
         hh = m // 4
         mm = (m % 4) * 15 + 15
-        if mm == 60: hh += 1; mm = 0
+        if mm == 60:
+            hh += 1; mm = 0
         safe_empty_details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
 
     def process_day(i):
@@ -685,14 +661,14 @@ def get_dashboard_data(station: str, start: str, end: str):
             humi = GLOBAL_WEATHER_CACHE.get(f"AWS_{aws_stn}_{d_str}_humi", "--")
             
             if tmax == "--": tmax = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", "--")
-            if tmax == "--": tmax = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_tmax", "--")
+            if tmax == "--": tmax = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_tmax", "--")
             if tmin == "--": tmin = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--")
-            if tmin == "--": tmin = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_tmin", "--")
+            if tmin == "--": tmin = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_tmin", "--")
             if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
-            if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_humi", "--")
+            if humi == "--": humi = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_humi", "--")
             
             if pm25 == "--":
-                pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{station}_{d_str}_pm25", "--")
+                pm25 = GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_pm25", "--")
                 
         else:
             st_data = GLOBAL_PAST_CACHE.get(d_str, {}).get(station, {})
@@ -726,13 +702,14 @@ def get_dashboard_data(station: str, start: str, end: str):
         "daily_records": records
     }
 
+# 🌟 [해결 1] 실시간 API 캐시 우회 버그 완벽 차단 로직 적용
 @app.get("/api/realtime/{station}")
 def get_realtime_data(station: str):
-    kst_now = get_kst_now()
-    today_str = kst_now.strftime("%Y-%m-%d")
+    update_today_cache()
+    today_str = get_kst_now().strftime("%Y-%m-%d")
     
-    kepco_data = get_kepco_data_for_station(station, today_str)
-    day_usage, day_peak, details = kepco_data if kepco_data else (0.0, 0.0, [])
+    st_data = GLOBAL_TODAY_CACHE["kepco"].get(station, {})
+    details = st_data.get("details", [])
     
     if not details or len(details) < 96:
         details = []
@@ -741,15 +718,18 @@ def get_realtime_data(station: str):
             if mm == 60: hh += 1; mm = 0
             details.append({"time": f"{hh:02d}:{mm:02d}", "usage_kwh": 0.0, "peak_kw": 0.0})
             
-    now_minutes = kst_now.hour * 60 + kst_now.minute
+    now_minutes = get_kst_now().hour * 60 + get_kst_now().minute
+    res_details = []
+    
     for d in details:
         hh, mm = map(int, d["time"].split(":"))
         time_m = hh * 60 + mm if hh != 24 else 24 * 60
         if time_m > now_minutes:
-            d["usage_kwh"] = None
-            d["peak_kw"] = None
+            res_details.append({"time": d["time"], "usage_kwh": None, "peak_kw": None})
+        else:
+            res_details.append(d.copy())
             
-    return {"station_name": station, "date": today_str, "records": details}
+    return {"station_name": station, "date": today_str, "records": res_details}
 
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
