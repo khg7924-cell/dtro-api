@@ -5,6 +5,7 @@ import json
 import logging
 import asyncio
 import hashlib
+import base64
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -39,7 +40,50 @@ KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
 # =========================================================================
-# 🚨 카카오워크 알림 및 임계치 설정 시스템
+# 🚨 영구 저장소 (Firebase Realtime Database) 연동 설정
+# =========================================================================
+# 프론트엔드에서 연결해둔 Firebase DB 주소를 아래에 반드시 입력하세요.
+# 예: "https://dtro-energy-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_DB_URL = "https://datacenter-app-7a69a-default-rtdb.firebaseio.com"
+
+def backup_dataset_to_firebase(file_bytes):
+    if "여기에_파이어베이스" in FIREBASE_DB_URL:
+        logger.warning("⚠️ Firebase DB URL이 설정되지 않아 엑셀 데이터가 영구 저장되지 않습니다.")
+        return
+    try:
+        b64_data = base64.b64encode(file_bytes).decode('utf-8')
+        requests.put(f"{FIREBASE_DB_URL}/master_dataset.json", json={"file_data": b64_data}, timeout=15)
+        logger.info("✅ 엑셀 데이터셋 Firebase 영구 백업 완료")
+    except Exception as e:
+        logger.error(f"❌ Firebase 백업 실패: {e}")
+
+def restore_dataset_from_firebase():
+    if "여기에_파이어베이스" in FIREBASE_DB_URL: return
+    try:
+        res = requests.get(f"{FIREBASE_DB_URL}/master_dataset.json", timeout=15)
+        if res.status_code == 200 and res.json():
+            data = res.json().get("file_data")
+            if data:
+                with open("uploaded_dataset.xlsx", "wb") as f:
+                    f.write(base64.b64decode(data))
+                logger.info("✅ 서버 시작됨 - Firebase에서 엑셀 데이터셋 복구 완료")
+    except Exception as e:
+        logger.error(f"❌ Firebase 엑셀 복구 실패: {e}")
+
+def restore_thresholds_from_firebase():
+    if "여기에_파이어베이스" in FIREBASE_DB_URL: return
+    try:
+        res = requests.get(f"{FIREBASE_DB_URL}/peak_thresholds.json", timeout=5)
+        if res.status_code == 200 and res.json():
+            global THRESHOLDS
+            THRESHOLDS = res.json()
+            save_thresholds()
+            logger.info("✅ 서버 시작됨 - Firebase에서 경고 임계치 복구 완료")
+    except Exception:
+        pass
+
+# =========================================================================
+# 🚨 카카오워크 알림 시스템
 # =========================================================================
 KAKAO_WEBHOOK_URL = "https://kakaowork.com/bots/hook/1b7bce124e5b4ce28d9b1374a81073ad"
 
@@ -63,7 +107,7 @@ def check_and_send_alert(station: str, current_peak: float):
     if not KAKAO_WEBHOOK_URL or KAKAO_WEBHOOK_URL == "여기에_발급받은_URL을_붙여넣으세요": return
     if station not in THRESHOLDS: return
     
-    limit = THRESHOLDS[station]
+    limit = float(THRESHOLDS[station])
     if current_peak >= limit and limit > 0:
         today_str = get_kst_now().strftime("%Y-%m-%d")
         flag_key = f"{station}_{today_str}"
@@ -182,6 +226,9 @@ async def auto_cache_warmer():
 
 @app.on_event("startup")
 async def startup_event():
+    restore_dataset_from_firebase()     # 🌟 추가됨: 서버 시작 시 엑셀 원격 복원
+    restore_thresholds_from_firebase()  # 🌟 추가됨: 서버 시작 시 설정값 원격 복원
+    
     load_excel_dataset()
     load_thresholds()
     asyncio.create_task(auto_cache_warmer())
@@ -203,6 +250,10 @@ async def upload_file(file: UploadFile = File(...)):
         contents = await file.read()
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
+            
+        # 🌟 추가됨: 로컬 저장 직후 파이어베이스에도 동시 백업
+        backup_dataset_to_firebase(contents)
+
         for key in GLOBAL_API_CACHE:
             GLOBAL_API_CACHE[key].clear()
         load_excel_dataset()
@@ -489,7 +540,6 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
-# 🌟 is_bypass 파라미터 추가
 def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = False):
     cust_nos = []
     target_meter_no = "전체"
@@ -507,7 +557,6 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         if not c_no: return [0.0] * 96
         cache_key = f"{c_no}_{date_str}"
         
-        # 🌟 is_bypass가 참이면 기존 메모리에 0으로 박힌 쓰레기 캐시 무시
         if not is_bypass and cache_key in GLOBAL_KEPCO_CACHE:
             day_list = GLOBAL_KEPCO_CACHE[cache_key]
         else:
@@ -606,7 +655,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         
-        # 🌟 이제 프론트엔드의 bypass 신호가 KEPCO API 통신부까지 뚫고 들어갑니다.
         usage, peak, details = get_kepco_data_for_station(station, d_str, is_bypass)
         
         if not details: details = safe_empty_details
@@ -821,7 +869,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             ai_report_text += "① 캘린더 및 열차 운행(다이아) 요인: \n"
             if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
             elif off_diff < 0: ai_report_text += f"휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
-            else: ai_report_text += "휴일 일수가 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
+            else: ai_report_text += "휴일 일수는 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
 
             ai_report_text += "\n\n② 계절별 기상 및 공조 설비 부하 요인: \n"
             ai_report_text += f"[하절기 냉방] 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다. "
@@ -1036,7 +1084,7 @@ def get_bill_data(station: str, year: str):
     else: target_cust = STATION_CUST_MAP.get(station)
         
     if not target_cust:
-        return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 없습니다."}
+        return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 준 없습니다."}
         
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getCustBillData.do"
     
