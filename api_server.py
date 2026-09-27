@@ -42,8 +42,6 @@ KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 # =========================================================================
 # 🚨 영구 저장소 (Firebase Realtime Database) 연동 설정
 # =========================================================================
-# 프론트엔드에서 연결해둔 Firebase DB 주소를 아래에 반드시 입력하세요.
-# 예: "https://dtro-energy-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_DB_URL = "https://datacenter-app-7a69a-default-rtdb.firebaseio.com"
 
 def backup_dataset_to_firebase(file_bytes):
@@ -226,8 +224,8 @@ async def auto_cache_warmer():
 
 @app.on_event("startup")
 async def startup_event():
-    restore_dataset_from_firebase()     # 🌟 추가됨: 서버 시작 시 엑셀 원격 복원
-    restore_thresholds_from_firebase()  # 🌟 추가됨: 서버 시작 시 설정값 원격 복원
+    restore_dataset_from_firebase()     
+    restore_thresholds_from_firebase()  
     
     load_excel_dataset()
     load_thresholds()
@@ -251,7 +249,6 @@ async def upload_file(file: UploadFile = File(...)):
         with open("uploaded_dataset.xlsx", "wb") as f:
             f.write(contents)
             
-        # 🌟 추가됨: 로컬 저장 직후 파이어베이스에도 동시 백업
         backup_dataset_to_firebase(contents)
 
         for key in GLOBAL_API_CACHE:
@@ -308,7 +305,8 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-def fetch_asos_daily(start_date: str, end_date: str):
+# 🌟 기상청 대표 관측소 (ASOS)
+def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     yesterday = get_kst_now() - timedelta(days=1)
@@ -323,7 +321,9 @@ def fetch_asos_daily(start_date: str, end_date: str):
     for i in range(diff):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
-        if ck_tmax in GLOBAL_WEATHER_CACHE:
+        
+        # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
+        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
                 "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
@@ -387,7 +387,8 @@ def fetch_asos_daily(start_date: str, end_date: str):
             
     return cached_res
 
-def fetch_openmeteo_env(lat, lon, start_date, end_date):
+# 🌟 Open-Meteo 환경 데이터 (기온 보완 및 미세먼지)
+def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     diff = (e_dt - s_dt).days + 1
@@ -398,7 +399,9 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
         ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
-        if ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
+        
+        # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
+        if not is_bypass and ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
@@ -469,7 +472,8 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date):
             
     return cached_res
 
-def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
+# 🌟 기상청 방재 기상 관측장비 (AWS)
+def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     yesterday = get_kst_now() - timedelta(days=1)
@@ -490,7 +494,9 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str):
         
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
-            if cache_key in GLOBAL_WEATHER_CACHE:
+            
+            # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
+            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
                 missing_tasks.append((d_str, tm2, obs, key, cache_key))
@@ -634,10 +640,11 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     diff = (end_dt - start_dt).days + 1
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
 
+    # 🌟 스레드풀에 weather 함수 호출 시 is_bypass 인자 전달
     with ThreadPoolExecutor(max_workers=3) as weather_exec:
-        f_as = weather_exec.submit(fetch_asos_daily, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
-        f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
-        f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+        f_as = weather_exec.submit(fetch_asos_daily, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
+        f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
+        f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
         
     asos_data = f_as.result()
     aws_data = f_aw.result()
@@ -1084,7 +1091,7 @@ def get_bill_data(station: str, year: str):
     else: target_cust = STATION_CUST_MAP.get(station)
         
     if not target_cust:
-        return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 준 없습니다."}
+        return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 없습니다."}
         
     url = "https://opm.kepco.co.kr:11080/OpenAPI/getCustBillData.do"
     
