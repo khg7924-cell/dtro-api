@@ -201,10 +201,8 @@ async def auto_cache_warmer():
                 today_str = get_kst_now().strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
                 
-                # 2023년~현재 기상청 ASOS 전체 데이터를 시작 시 한 번에 캐싱해 둠
-                fetch_asos_daily("2023-01-01", today_str)
-                
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
+                    weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
@@ -307,7 +305,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS) - 타임아웃 30초 확대 및 "--" 캐시 오염 방지
+# 🌟 기상청 대표 관측소 (ASOS)
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -324,8 +322,8 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
         
-        # 🌟 버그 수정: 캐시에 "--"가 들어있는 경우 유효한 캐시로 인정하지 않고 재호출
-        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_tmax] != "--":
+        # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
+        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
                 "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
@@ -344,60 +342,44 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
     res = {}
-    for _ in range(3):
+    for _ in range(2):
         try:
-            # 🌟 버그 수정: 장기간(2023~2026) 대용량 응답 수신을 위해 timeout을 8초 -> 30초로 확대
-            r = http_session.get(url, headers=headers, timeout=30)
+            r = http_session.get(url, headers=headers, timeout=8)
             r.encoding = 'EUC-KR'
             lines = r.text.split('\n')
             headers_list = []
             for line in lines:
                 if line.startswith('#') and ':' in line and '.' in line:
                     left_side = line.split(':')[0].strip()
-                    if left_side.replace('#', '').strip() and left_side.replace('#', '').strip()[0].isdigit():
+                    if left_side.replace('#', '').strip()[0].isdigit():
                         col_name = left_side.split('.')[1].strip().split()[0]
                         if col_name not in headers_list: headers_list.append(col_name)
-                elif line.strip() and not line.startswith('#'):
+                elif line.strip() and not line.startswith('#') and headers_list:
                     parts = line.split()
-                    if len(parts) >= 15:
-                        def parse_val(v):
-                            if not v: return "--"
-                            try:
-                                fv = float(v)
-                                return fv if fv > -50.0 else "--"
-                            except: return "--"
-                        
-                        # 헤더 파싱 성공 시 헤더 매핑, 만약 help=0 형태이거나 헤더 누락 시 기상청 표준 인덱스(TM:0, TA_AVG:10, TA_MAX:11, TA_MIN:13, HM_AVG:18)로 이중 파싱
-                        if headers_list and len(parts) >= len(headers_list) - 5:
-                            row_dict = dict(zip(headers_list, parts))
-                            date_key = row_dict.get('TM')
-                            if date_key and len(date_key) >= 8:
-                                d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                                res[d_str] = {
-                                    "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                    "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                    "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                    "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
-                                }
-                        elif len(parts[0]) == 8 and parts[0].isdigit():
-                            date_key = parts[0]
+                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
+                        row_dict = dict(zip(headers_list, parts))
+                        date_key = row_dict.get('TM')
+                        if date_key and len(date_key) >= 8:
                             d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                            def parse_val(v):
+                                if not v: return "--"
+                                try:
+                                    fv = float(v)
+                                    return fv if fv > -50.0 else "--"
+                                except: return "--"
                             res[d_str] = {
-                                "tavg": parse_val(parts[10]),
-                                "tmax": parse_val(parts[11]),
-                                "tmin": parse_val(parts[13]),
-                                "humi": parse_val(parts[18]) if len(parts) > 18 else "--"
+                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
                             }
             if res: break
-        except Exception as e:
-            logger.error(f"ASOS 호출 에러: {e}")
-            time.sleep(0.5)
+        except: time.sleep(0.5)
 
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
         cached_res[d_str] = v
-        # 🌟 버그 수정: 통신 실패로 "--"가 반환된 경우에는 절대 캐시에 저장하지 않음
-        if d_str < today_str and v["tmax"] != "--":
+        if d_str < today_str:
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
@@ -418,7 +400,8 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
         ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
         ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
         
-        if not is_bypass and ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_pm25] != "--":
+        # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
+        if not is_bypass and ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
@@ -481,7 +464,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
             "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
         }
-        if d_str < today_str and cached_res[d_str]["pm25"] != "--":
+        if d_str < today_str:
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
@@ -512,7 +495,8 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
             
-            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[cache_key] != "--":
+            # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
+            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
                 missing_tasks.append((d_str, tm2, obs, key, cache_key))
@@ -522,7 +506,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     def fetch_single_element(d_str, tm2, obs, key, cache_key):
         url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
         try:
-            r = http_session.get(url, headers=headers, timeout=4.0)
+            r = http_session.get(url, headers=headers, timeout=2.5)
             lines = r.text.split('\n')
             for line in lines:
                 if line.strip() and not line.startswith('#'):
@@ -533,6 +517,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                             if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = fv
                             return d_str, key, fv
         except: pass
+        if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = "--"
         return d_str, key, "--"
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -565,12 +550,9 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     cust_nos = []
     target_meter_no = "전체"
     
-    if station == '전체': 
-        cust_nos = list(set([v for k, v in STATION_CUST_MAP.items() if k != '종합청사']))
-    elif station in LINE_STATIONS: 
-        cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
-    elif station == '종합청사': 
-        cust_nos = [STATION_CUST_MAP['종합청사']]
+    if station == '전체': cust_nos = list(set(STATION_CUST_MAP.values()))
+    elif station in LINE_STATIONS: cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
+    elif station == '종합청사': cust_nos = [STATION_CUST_MAP['종합청사']]
     else:
         cust_nos = [STATION_CUST_MAP.get(station)]
         if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
@@ -594,8 +576,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                     if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
             except: pass
             
-            # 빈 리스트([])가 아닐 때만 캐싱하여 한전 통신 실패 시 재시도 보장, 금일 데이터도 캐싱하여 개별 개소 즉시 전환 지원
-            if day_list:
+            if date_str < get_kst_now().strftime("%Y-%m-%d"):
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
         
         m_target = target_meter_no if c_no == '0526314773' else "전체"
@@ -659,13 +640,11 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     diff = (end_dt - start_dt).days + 1
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
 
-    s_str = start_dt.strftime("%Y-%m-%d")
-    e_str = end_dt.strftime("%Y-%m-%d")
-
+    # 🌟 스레드풀에 weather 함수 호출 시 is_bypass 인자 전달
     with ThreadPoolExecutor(max_workers=3) as weather_exec:
-        f_as = weather_exec.submit(fetch_asos_daily, s_str, e_str, is_bypass)
-        f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, s_str, e_str, is_bypass)
-        f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, s_str, e_str, is_bypass)
+        f_as = weather_exec.submit(fetch_asos_daily, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
+        f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
+        f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
         
     asos_data = f_as.result()
     aws_data = f_aw.result()
@@ -757,12 +736,8 @@ def get_realtime_data(station: str):
     return res
 
 @app.get("/api/compare/{station}")
-def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150, start_month: int = 1, end_month: int = 12):
-    if start_month < 1: start_month = 1
-    if end_month > 12: end_month = 12
-    if start_month > end_month: start_month, end_month = end_month, start_month
-
-    cache_key = f"{station}_{base_year}_{comp_year}_{price}_{start_month}_{end_month}"
+def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
+    cache_key = f"{station}_{base_year}_{comp_year}_{price}"
     if cache_key in GLOBAL_API_CACHE["compare"]:
         return GLOBAL_API_CACHE["compare"][cache_key]
 
@@ -792,16 +767,15 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         df['target_power'] = df['target_power'].fillna(0)
         kr_holidays = holidays.KR()
         df['dayofweek'] = df['date'].dt.dayofweek
-        df['month'] = df['date'].dt.month
         df['is_offday'] = df.apply(lambda x: 1 if x['date'].dayofweek >= 5 or x['date'] in kr_holidays else 0, axis=1)
 
-        df_base = df[(df['date'].dt.year == int(base_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
-        df_comp = df[(df['date'].dt.year == int(comp_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
+        df_base = df[df['date'].dt.year == int(base_year)]
+        df_comp = df[df['date'].dt.year == int(comp_year)]
         monthly_base = df_base.groupby(df_base['date'].dt.month)['target_power'].sum()
         monthly_comp = df_comp.groupby(df_comp['date'].dt.month)['target_power'].sum()
 
         records, tb, tc = [], 0.0, 0.0
-        for m in range(start_month, end_month + 1):
+        for m in range(1, 13):
             bv = float(monthly_base.get(m, 0.0)); cv = float(monthly_comp.get(m, 0.0))
             if pd.isna(bv): bv = 0.0
             if pd.isna(cv): cv = 0.0
@@ -817,26 +791,20 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         c_total_off = df_comp['is_offday'].sum()
         off_diff = c_total_off - b_total_off
 
-        s_yr = min(int(base_year), int(comp_year))
-        e_yr = max(int(base_year), int(comp_year))
-        asos_data = fetch_asos_daily(f"{s_yr}-01-01", f"{e_yr}-12-31")
+        asos_data = fetch_asos_daily(f"{base_year}-01-01", f"{comp_year}-12-31")
             
         def get_stats(year_str):
             hw, cw = 0, 0
             summer_tmax_sum, summer_tmax_cnt = 0.0, 0
             winter_tmin_sum, winter_tmin_cnt = 0.0, 0
-            valid_days = 0
             for date_str, v in asos_data.items():
                 if date_str.startswith(year_str):
                     m = int(date_str[5:7])
-                    if not (start_month <= m <= end_month):
-                        continue
                     tmax = v.get("tmax", "--")
                     tmin = v.get("tmin", "--")
                     if tmax != "--":
                         try:
                             tmax_f = float(tmax)
-                            valid_days += 1
                             if tmax_f >= 33.0: hw += 1
                             if m in [6, 7, 8]:
                                 summer_tmax_sum += tmax_f; summer_tmax_cnt += 1
@@ -850,10 +818,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                         except: pass
             s_avg_tmax = (summer_tmax_sum / summer_tmax_cnt) if summer_tmax_cnt > 0 else 0.0
             w_avg_tmin = (winter_tmin_sum / winter_tmin_cnt) if winter_tmin_cnt > 0 else 0.0
-            return hw, cw, s_avg_tmax, w_avg_tmin, valid_days
+            return hw, cw, s_avg_tmax, w_avg_tmin
 
-        base_hw, base_cw, b_s_tmax, b_w_tmin, b_valid = get_stats(base_year)
-        comp_hw, comp_cw, c_s_tmax, c_w_tmin, c_valid = get_stats(comp_year)
+        base_hw, base_cw, b_s_tmax, b_w_tmin = get_stats(base_year)
+        comp_hw, comp_cw, c_s_tmax, c_w_tmin = get_stats(comp_year)
         
         hw_diff, cw_diff = comp_hw - base_hw, comp_cw - base_cw
         s_tmax_diff = c_s_tmax - b_s_tmax
@@ -867,21 +835,20 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         comp_pass_sum = float(df_comp['passengers'].sum()) if pass_col else 0.0
         p_diff = comp_pass_sum - base_pass_sum
 
-        period_label = f"{start_month}월~{end_month}월" if start_month != end_month else f"{start_month}월"
-        ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 ({period_label}) 전력 수요 AI 심층 분석 리포트\n\n"
+        ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 전력 수요 AI 심층 분석 리포트\n\n"
         
-        if b_valid == 0 and c_valid == 0:
+        if not asos_data:
             ai_report_text += f"⚠️ 현재 기상청 API 허브 서버의 응답이 없어 기상 지표를 불러오지 못했습니다. 백엔드 터미널 창의 로그를 확인해주세요.\n\n"
         
-        ai_report_text += f"[1] 계절별 기후 및 환경 지표 변동 현황 ({period_label})\n"
+        ai_report_text += f"[1] 계절별 기후 및 환경 지표 변동 현황\n"
         ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
         ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
         ai_report_text += f" • 폭염일수(33℃ 이상) : {base_hw}일 ➔ {comp_hw}일 ({hw_diff:+}일)\n"
         ai_report_text += f" • 한파일수(-10℃ 이하) : {base_cw}일 ➔ {comp_cw}일 ({cw_diff:+}일)\n"
         ai_report_text += f" • 초미세먼지 '나쁨' : {base_pm25}일 ➔ {comp_pm25}일 ({pm_diff:+}일)\n\n"
-        ai_report_text += f"[2] 캘린더 및 여객 지표 변동 현황 ({period_label})\n"
+        ai_report_text += f"[2] 캘린더 및 여객 지표 변동 현황\n"
         ai_report_text += f" • 휴일(비운무일) 총합 : {b_total_off}일 ➔ {c_total_off}일 ({off_diff:+}일)\n"
-        ai_report_text += f" • 기간 총 승객수 : {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
+        ai_report_text += f" • 연간 총 승객수 : {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
         ai_report_text += f"🧠 [3] AI 융합 증감 요인 심층 분석\n"
         
         is_climate_harsher = (s_tmax_diff > 0.3 or hw_diff > 0) or (w_tmin_diff < -0.3 or cw_diff > 0)
@@ -921,12 +888,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             else: ai_report_text += "승객수 변동폭이 작아 유의미한 여객 전력 변동은 관찰되지 않았습니다."
 
         res = {
-            "summary": { "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, "cost": diff_total*price, "ai_report": ai_report_text, "period_label": period_label }, 
+            "summary": { "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, "cost": diff_total*price, "ai_report": ai_report_text }, 
             "records": records
         }
-        # 기상 데이터가 정상 수신되었을 때만 결과 캐싱
-        if b_valid > 0 or c_valid > 0:
-            GLOBAL_API_CACHE["compare"][cache_key] = res
+        GLOBAL_API_CACHE["compare"][cache_key] = res
         return res
     except Exception as e:
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
@@ -1060,7 +1025,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                     if r_info.get('status') == '확인':
                         r_sub = r_info.get('substation', '')
                         is_match = False
-                        if station == '전체' and r_sub != '종합청사': is_match = True
+                        if station == '전체': is_match = True
                         elif station in LINE_STATIONS and r_sub in LINE_STATIONS[station]: is_match = True
                         elif station == r_sub: is_match = True
 
@@ -1203,7 +1168,7 @@ def export_master_backup():
         days_to_fetch = (yesterday - curr_date).days + 1
         
         if days_to_fetch > 0:
-            if days_to_fetch > 100: days_to_fetch = 100 
+            if days_to_fetch > 30: days_to_fetch = 30 
                 
             col_map = {}
             for c in df.columns:
