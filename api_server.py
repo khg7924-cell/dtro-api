@@ -322,7 +322,6 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
         
-        # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
         if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
@@ -400,7 +399,6 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
         ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
         ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
         
-        # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
         if not is_bypass and ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
@@ -495,7 +493,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
             
-            # 🌟 is_bypass가 참이면 기존 날씨 캐시를 무시
             if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
@@ -640,7 +637,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     diff = (end_dt - start_dt).days + 1
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
 
-    # 🌟 스레드풀에 weather 함수 호출 시 is_bypass 인자 전달
     with ThreadPoolExecutor(max_workers=3) as weather_exec:
         f_as = weather_exec.submit(fetch_asos_daily, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
         f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
@@ -1155,52 +1151,71 @@ def export_master_backup():
 
         date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
-        
         df = df.dropna(subset=[date_col])
 
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        last_date = pd.to_datetime(df[date_col].max())
-            
-        if pd.isna(last_date): return {"error": "엑셀 파일에서 유효한 날짜 데이터를 찾을 수 없습니다."}
-            
-        new_rows = []
-        curr_date = last_date + timedelta(days=1)
-        days_to_fetch = (yesterday - curr_date).days + 1
         
-        if days_to_fetch > 0:
-            if days_to_fetch > 30: days_to_fetch = 30 
+        # 🌟 수정 1: 2026-09-05 이후부터 어제까지 중 누락되거나 비어있는 날짜 전체 탐지
+        start_check_date = pd.to_datetime("2026-09-05")
+        existing_dates = set(df[date_col].tolist())
+        
+        col_map = {}
+        for c in df.columns:
+            for st in STATION_CUST_MAP.keys():
+                if st != '전체' and st in str(c):
+                    if 'total_kwh' in str(c): col_map.setdefault(st, {})['kwh'] = c
+                    if 'peak_kw' in str(c): col_map.setdefault(st, {})['peak'] = c
+
+        total_days = (yesterday - start_check_date).days + 1
+        missing_dates = []
+        for i in range(total_days):
+            target_dt = start_check_date + timedelta(days=i)
+            if target_dt not in existing_dates:
+                missing_dates.append(target_dt)
+            else:
+                sample_col = col_map.get('설화명곡', {}).get('kwh')
+                if sample_col:
+                    val = df.loc[df[date_col] == target_dt, sample_col].values
+                    if len(val) == 0 or pd.isna(val[0]) or val[0] == 0:
+                        missing_dates.append(target_dt)
+
+        # 🌟 수정 2: 최대 120일까지 한 번에 메우도록 제한 완화
+        if len(missing_dates) > 120:
+            missing_dates = missing_dates[:120]
+
+        new_rows = []
+        for target_dt in missing_dates:
+            d_str = target_dt.strftime("%Y-%m-%d")
+            is_existing_row = target_dt in existing_dates
+            row = {date_col: target_dt}
+            
+            def fetch_st(st):
+                usage, peak, _ = get_kepco_data_for_station(st, d_str)
+                return st, usage, peak
                 
-            col_map = {}
-            for c in df.columns:
-                for st in STATION_CUST_MAP.keys():
-                    if st != '전체' and st in str(c):
-                        if 'total_kwh' in str(c): col_map.setdefault(st, {})['kwh'] = c
-                        if 'peak_kw' in str(c): col_map.setdefault(st, {})['peak'] = c
-                        
-            for i in range(days_to_fetch):
-                target_dt = curr_date + timedelta(days=i)
-                d_str = target_dt.strftime("%Y-%m-%d")
-                row = {date_col: target_dt}
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                results = list(executor.map(fetch_st, [s for s in STATION_CUST_MAP.keys() if s != '전체']))
                 
-                def fetch_st(st):
-                    usage, peak, _ = get_kepco_data_for_station(st, d_str)
-                    return st, usage, peak
-                    
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    results = list(executor.map(fetch_st, [s for s in STATION_CUST_MAP.keys() if s != '전체']))
-                    
+            if is_existing_row:
+                row_idx = df[df[date_col] == target_dt].index[0]
+                for st, usage, peak in results:
+                    if st in col_map:
+                        if 'kwh' in col_map[st]: df.loc[row_idx, col_map[st]['kwh']] = usage
+                        if 'peak' in col_map[st]: df.loc[row_idx, col_map[st]['peak']] = peak
+            else:
                 for st, usage, peak in results:
                     if st in col_map:
                         if 'kwh' in col_map[st]: row[col_map[st]['kwh']] = usage
                         if 'peak' in col_map[st]: row[col_map[st]['peak']] = peak
-                
                 new_rows.append(row)
                 
         if new_rows:
             df_new = pd.DataFrame(new_rows)
             df = pd.concat([df, df_new], ignore_index=True)
-            df.sort_values(by=date_col, inplace=True)
-            df.reset_index(drop=True, inplace=True)
+
+        df.sort_values(by=date_col, inplace=True)
+        df.drop_duplicates(subset=[date_col], keep='last', inplace=True)
+        df.reset_index(drop=True, inplace=True)
 
         holi_col = next((c for c in df.columns if '휴일' in str(c) or 'is_holiday' in str(c)), '휴일\n(is_holiday)')
         kr_holidays = holidays.KR()
@@ -1216,20 +1231,28 @@ def export_master_backup():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for sheet_name, sheet_df in xls_dict.items():
-                if date_col in sheet_df.columns:
-                    sheet_df = sheet_df.dropna(subset=[date_col])
-                    if pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
-                        sheet_df[date_col] = sheet_df[date_col].dt.strftime('%Y-%m-%d')
+                temp_df = sheet_df.copy()
+                if date_col in temp_df.columns:
+                    temp_df = temp_df.dropna(subset=[date_col])
+                    if pd.api.types.is_datetime64_any_dtype(temp_df[date_col]):
+                        temp_df[date_col] = temp_df[date_col].dt.strftime('%Y-%m-%d')
                         
-                if '일자' in sheet_df.columns:
-                    sheet_df = sheet_df.dropna(subset=['일자'])
-                    if pd.api.types.is_datetime64_any_dtype(sheet_df['일자']):
-                        sheet_df['일자'] = sheet_df['일자'].dt.strftime('%Y-%m-%d')
+                if '일자' in temp_df.columns:
+                    temp_df = temp_df.dropna(subset=['일자'])
+                    if pd.api.types.is_datetime64_any_dtype(temp_df['일자']):
+                        temp_df['일자'] = temp_df['일자'].dt.strftime('%Y-%m-%d')
                 
-                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                temp_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
+        excel_bytes = output.getvalue()
+
+        # 🌟 수정 3: 백업된 최신 파일로 서버 디스크 및 Firebase 영구 저장소 자동 갱신
+        with open(file_path, "wb") as f:
+            f.write(excel_bytes)
+        backup_dataset_to_firebase(excel_bytes)
+        load_excel_dataset()
+
         output.seek(0)
-        
         return StreamingResponse(
             output, 
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
