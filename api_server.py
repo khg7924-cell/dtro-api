@@ -544,7 +544,6 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     cust_nos = []
     target_meter_no = "전체"
     
-    # 🌟 핵심 수정: '전체' 선택 시 종합청사 제외 (순수 1, 2, 3호선 고객번호만 합산)
     if station == '전체': 
         cust_nos = list(set([v for k, v in STATION_CUST_MAP.items() if k != '종합청사']))
     elif station in LINE_STATIONS: 
@@ -732,9 +731,14 @@ def get_realtime_data(station: str):
     GLOBAL_API_CACHE["realtime"][cache_key] = (time.time(), res)
     return res
 
+# 🌟 핵심 업그레이드: 월 단위 기간(start_month ~ end_month) 비교 지원
 @app.get("/api/compare/{station}")
-def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150):
-    cache_key = f"{station}_{base_year}_{comp_year}_{price}"
+def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150, start_month: int = 1, end_month: int = 12):
+    if start_month < 1: start_month = 1
+    if end_month > 12: end_month = 12
+    if start_month > end_month: start_month, end_month = end_month, start_month
+
+    cache_key = f"{station}_{base_year}_{comp_year}_{price}_{start_month}_{end_month}"
     if cache_key in GLOBAL_API_CACHE["compare"]:
         return GLOBAL_API_CACHE["compare"][cache_key]
 
@@ -742,7 +746,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         df = load_excel_dataset()
         if df is None: return {"error": "과거 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
         
-        # '전체' 선택 시 종합청사 제외 (기존 유지)
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
             df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
@@ -765,15 +768,18 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         df['target_power'] = df['target_power'].fillna(0)
         kr_holidays = holidays.KR()
         df['dayofweek'] = df['date'].dt.dayofweek
+        df['month'] = df['date'].dt.month
         df['is_offday'] = df.apply(lambda x: 1 if x['date'].dayofweek >= 5 or x['date'] in kr_holidays else 0, axis=1)
 
-        df_base = df[df['date'].dt.year == int(base_year)]
-        df_comp = df[df['date'].dt.year == int(comp_year)]
-        monthly_base = df_base.groupby(df_base['date'].dt.month)['target_power'].sum()
-        monthly_comp = df_comp.groupby(df_comp['date'].dt.month)['target_power'].sum()
+        # 🌟 선택된 월 범위(start_month ~ end_month)로 데이터 필터링
+        df_base = df[(df['date'].dt.year == int(base_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
+        df_comp = df[(df['date'].dt.year == int(comp_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
+        
+        monthly_base = df_base.groupby('month')['target_power'].sum()
+        monthly_comp = df_comp.groupby('month')['target_power'].sum()
 
         records, tb, tc = [], 0.0, 0.0
-        for m in range(1, 13):
+        for m in range(start_month, end_month + 1):
             bv = float(monthly_base.get(m, 0.0)); cv = float(monthly_comp.get(m, 0.0))
             if pd.isna(bv): bv = 0.0
             if pd.isna(cv): cv = 0.0
@@ -785,24 +791,32 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         diff_total = tc - tb
         diff_pct_total = round((diff_total / tb) * 100, 1) if tb > 0 else 0
 
-        b_total_off = df_base['is_offday'].sum()
-        c_total_off = df_comp['is_offday'].sum()
+        b_total_off = int(df_base['is_offday'].sum())
+        c_total_off = int(df_comp['is_offday'].sum())
         off_diff = c_total_off - b_total_off
 
-        asos_data = fetch_asos_daily(f"{base_year}-01-01", f"{comp_year}-12-31")
+        req_s_yr = min(int(base_year), int(comp_year))
+        req_e_yr = max(int(base_year), int(comp_year))
+        asos_data = fetch_asos_daily(f"{req_s_yr}-01-01", f"{req_e_yr}-12-31")
             
         def get_stats(year_str):
             hw, cw = 0, 0
             summer_tmax_sum, summer_tmax_cnt = 0.0, 0
             winter_tmin_sum, winter_tmin_cnt = 0.0, 0
+            all_tmax_sum, all_tmax_cnt = 0.0, 0
+            all_tmin_sum, all_tmin_cnt = 0.0, 0
             for date_str, v in asos_data.items():
                 if date_str.startswith(year_str):
                     m = int(date_str[5:7])
+                    # 🌟 선택된 기간(월)에 해당하는 기상 데이터만 집계
+                    if not (start_month <= m <= end_month):
+                        continue
                     tmax = v.get("tmax", "--")
                     tmin = v.get("tmin", "--")
                     if tmax != "--":
                         try:
                             tmax_f = float(tmax)
+                            all_tmax_sum += tmax_f; all_tmax_cnt += 1
                             if tmax_f >= 33.0: hw += 1
                             if m in [6, 7, 8]:
                                 summer_tmax_sum += tmax_f; summer_tmax_cnt += 1
@@ -810,20 +824,29 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                     if tmin != "--":
                         try:
                             tmin_f = float(tmin)
+                            all_tmin_sum += tmin_f; all_tmin_cnt += 1
                             if tmin_f <= -10.0: cw += 1
                             if m in [12, 1, 2]:
                                 winter_tmin_sum += tmin_f; winter_tmin_cnt += 1
                         except: pass
             s_avg_tmax = (summer_tmax_sum / summer_tmax_cnt) if summer_tmax_cnt > 0 else 0.0
             w_avg_tmin = (winter_tmin_sum / winter_tmin_cnt) if winter_tmin_cnt > 0 else 0.0
-            return hw, cw, s_avg_tmax, w_avg_tmin
+            a_avg_tmax = (all_tmax_sum / all_tmax_cnt) if all_tmax_cnt > 0 else 0.0
+            a_avg_tmin = (all_tmin_sum / all_tmin_cnt) if all_tmin_cnt > 0 else 0.0
+            return hw, cw, s_avg_tmax, w_avg_tmin, a_avg_tmax, a_avg_tmin
 
-        base_hw, base_cw, b_s_tmax, b_w_tmin = get_stats(base_year)
-        comp_hw, comp_cw, c_s_tmax, c_w_tmin = get_stats(comp_year)
+        base_hw, base_cw, b_s_tmax, b_w_tmin, b_a_tmax, b_a_tmin = get_stats(base_year)
+        comp_hw, comp_cw, c_s_tmax, c_w_tmin, c_a_tmax, c_a_tmin = get_stats(comp_year)
         
         hw_diff, cw_diff = comp_hw - base_hw, comp_cw - base_cw
         s_tmax_diff = c_s_tmax - b_s_tmax
         w_tmin_diff = c_w_tmin - b_w_tmin
+        a_tmax_diff = c_a_tmax - b_a_tmax
+        a_tmin_diff = c_a_tmin - b_a_tmin
+
+        selected_months = list(range(start_month, end_month + 1))
+        has_summer = any(m in [6, 7, 8] for m in selected_months)
+        has_winter = any(m in [12, 1, 2] for m in selected_months)
 
         base_pm25 = int(df_base['is_pm25_bad'].sum())
         comp_pm25 = int(df_comp['is_pm25_bad'].sum())
@@ -833,60 +856,81 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         comp_pass_sum = float(df_comp['passengers'].sum()) if pass_col else 0.0
         p_diff = comp_pass_sum - base_pass_sum
 
-        ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 전력 수요 AI 심층 분석 리포트\n\n"
+        period_label = f"{start_month}월~{end_month}월" if start_month != end_month else f"{start_month}월"
+        disp_station = "전체 (1~3호선)" if station == "전체" else station
+        ai_report_text = f"📊 [{disp_station}] {base_year}년 vs {comp_year}년 ({period_label}) 전력 수요 AI 심층 분석 리포트\n\n"
         
         if not asos_data:
             ai_report_text += f"⚠️ 현재 기상청 API 허브 서버의 응답이 없어 기상 지표를 불러오지 못했습니다. 백엔드 터미널 창의 로그를 확인해주세요.\n\n"
         
-        ai_report_text += f"[1] 계절별 기후 및 환경 지표 변동 현황\n"
-        ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
-        ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
+        ai_report_text += f"[1] 조회 기간({period_label}) 기후 및 환경 지표 변동 현황\n"
+        ai_report_text += f" • 기간 내 평균 최고기온 : {b_a_tmax:.1f}℃ ➔ {c_a_tmax:.1f}℃ ({a_tmax_diff:+.1f}℃)\n"
+        ai_report_text += f" • 기간 내 평균 최저기온 : {b_a_tmin:.1f}℃ ➔ {c_a_tmin:.1f}℃ ({a_tmin_diff:+.1f}℃)\n"
+        if has_summer:
+            ai_report_text += f" • 하절기(6~8월 중 해당월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
+        else:
+            ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : 해당 기간 미포함\n"
+        if has_winter:
+            ai_report_text += f" • 동절기(12~2월 중 해당월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
+        else:
+            ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : 해당 기간 미포함\n"
         ai_report_text += f" • 폭염일수(33℃ 이상) : {base_hw}일 ➔ {comp_hw}일 ({hw_diff:+}일)\n"
         ai_report_text += f" • 한파일수(-10℃ 이하) : {base_cw}일 ➔ {comp_cw}일 ({cw_diff:+}일)\n"
         ai_report_text += f" • 초미세먼지 '나쁨' : {base_pm25}일 ➔ {comp_pm25}일 ({pm_diff:+}일)\n\n"
-        ai_report_text += f"[2] 캘린더 및 여객 지표 변동 현황\n"
-        ai_report_text += f" • 휴일(비운무일) 총합 : {b_total_off}일 ➔ {c_total_off}일 ({off_diff:+}일)\n"
-        ai_report_text += f" • 연간 총 승객수 : {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
-        ai_report_text += f"🧠 [3] AI 융합 증감 요인 심층 분석\n"
         
-        is_climate_harsher = (s_tmax_diff > 0.3 or hw_diff > 0) or (w_tmin_diff < -0.3 or cw_diff > 0)
+        ai_report_text += f"[2] 조회 기간({period_label}) 캘린더 및 여객 지표 변동 현황\n"
+        ai_report_text += f" • 휴일(비운무일) 총합 : {b_total_off}일 ➔ {c_total_off}일 ({off_diff:+}일)\n"
+        ai_report_text += f" • 기간 내 총 승객수 : {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
+        ai_report_text += f"🧠 [3] AI 융합 증감 요인 심층 분석 ({period_label} 기준)\n"
+        
+        is_climate_harsher = (has_summer and (s_tmax_diff > 0.3 or hw_diff > 0)) or (has_winter and (w_tmin_diff < -0.3 or cw_diff > 0)) or (not has_summer and not has_winter and abs(a_tmax_diff) > 0.5)
         is_passenger_up = p_diff > 0
 
         if diff_total < 0 and (is_climate_harsher or is_passenger_up or off_diff < 0):
-            ai_report_text += f"🚨 [주목] 전력 부하가 가중될 조건임에도, 총 전력량은 오히려 감소({diff_pct_total:+.1f}%)하는 긍정적 결과가 도출되었습니다.\n\n"
+            ai_report_text += f"🚨 [주목] 전력 부하가 가중될 조건임에도, 조회 기간({period_label}) 총 전력량은 오히려 감소({diff_pct_total:+.1f}%)하는 긍정적 결과가 도출되었습니다.\n\n"
             climate_str = []
-            if s_tmax_diff > 0.3 or hw_diff > 0: climate_str.append("하절기 기온/폭염 상승")
-            if w_tmin_diff < -0.3 or cw_diff > 0: climate_str.append("동절기 한파 심화")
-            if p_diff > 0: climate_str.append(f"승객수 {p_diff:+,.0f}명 폭증")
+            if has_summer and (s_tmax_diff > 0.3 or hw_diff > 0): climate_str.append("하절기 기온/폭염 상승")
+            if has_winter and (w_tmin_diff < -0.3 or cw_diff > 0): climate_str.append("동절기 한파 심화")
+            if not has_summer and not has_winter and abs(a_tmax_diff) > 0.5: climate_str.append("기온 변동에 따른 공조 부하 증가")
+            if p_diff > 0: climate_str.append(f"승객수 {p_diff:+,.0f}명 증가")
             if off_diff < 0: climate_str.append(f"평일 열차 운행일수 {abs(off_diff)}일 증가")
             
             ai_report_text += f"① 공사의 전사적 절전 성과 가시화 (핵심 요인): \n"
-            ai_report_text += f"{', '.join(climate_str)} 등으로 역사 및 열차의 공조/동력 부하가 팩트 데이터상 명확히 가중될 조건이었습니다. 그럼에도 불구하고 전력량이 총 {abs(diff_total):,.0f} kWh 줄어든 원인은, 당 공사가 23년부터 전사적으로 추진해 온 '절전 아이템 발굴 및 운영 최적화' 노력이 환경적 악조건을 완벽히 극복하고 상쇄한 성과로 AI는 분석합니다.\n\n"
+            ai_report_text += f"{', '.join(climate_str)} 등으로 역사 및 열차의 공조/동력 부하가 팩트 데이터상 명확히 가중될 조건이었습니다. 그럼에도 불구하고 해당 기간 전력량이 총 {abs(diff_total):,.0f} kWh 줄어든 원인은, 당 공사가 23년부터 전사적으로 추진해 온 '절전 아이템 발굴 및 운영 최적화' 노력이 환경적 악조건을 완벽히 극복하고 상쇄한 성과로 AI는 분석합니다.\n\n"
             
             ai_report_text += "② 캘린더 부하 효과 판단: \n"
-            if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 늘어나 열차 운행 횟수(다이아)가 줄어든 점도, 공사의 절전 노력과 시너지를 일으켜 전력 절감에 긍정적으로 작용했습니다."
+            if off_diff > 0: ai_report_text += f"동 기간 내 휴일이 전년 대비 {off_diff}일 늘어나 열차 운행 횟수(다이아)가 줄어든 점도, 공사의 절전 노력과 시너지를 일으켜 전력 절감에 긍정적으로 작용했습니다."
             elif off_diff < 0: ai_report_text += f"심지어 휴일 일수마저 감소하여 평일 열차 운행 횟수가 증가하는 악조건이었으나, 전사적인 절전 성과가 이를 모두 성공적으로 방어해 냈습니다."
-            else: ai_report_text += "휴일 일수는 전년과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
+            else: ai_report_text += "휴일 일수는 전년 동기간과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
         else:
             direction = "증가" if diff_total > 0 else "감소"
-            ai_report_text += f"XGBoost 알고리즘 분석 결과, 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
+            ai_report_text += f"XGBoost 알고리즘 분석 결과, 조회 기간({period_label}) 동안 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
             
             ai_report_text += "① 캘린더 및 열차 운행(다이아) 요인: \n"
-            if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
-            elif off_diff < 0: ai_report_text += f"휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
-            else: ai_report_text += "휴일 일수는 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
+            if off_diff > 0: ai_report_text += f"조회 기간 내 휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
+            elif off_diff < 0: ai_report_text += f"조회 기간 내 휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
+            else: ai_report_text += "조회 기간 내 휴일 일수는 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
 
-            ai_report_text += "\n\n② 계절별 기상 및 공조 설비 부하 요인: \n"
-            ai_report_text += f"[하절기 냉방] 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다. "
-            ai_report_text += f"\n[동절기 난방] 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다."
+            ai_report_text += "\n\n② 기상 및 공조 설비 부하 요인: \n"
+            weather_comments = []
+            if has_summer:
+                weather_comments.append(f"[하절기 냉방] 선택 기간 내 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다.")
+            if has_winter:
+                weather_comments.append(f"[동절기 난방] 선택 기간 내 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다.")
+            if not has_summer and not has_winter:
+                weather_comments.append(f"[환절기 공조] 선택 기간({period_label}) 평균 최고기온이 {abs(a_tmax_diff):.1f}℃ {'상승' if a_tmax_diff > 0 else '하락'}, 평균 최저기온이 {abs(a_tmin_diff):.1f}℃ {'상승' if a_tmin_diff > 0 else '하락'}하며 환기 및 공조 설비 가동률에 영향을 미쳤습니다.")
+            ai_report_text += "\n".join(weather_comments)
                 
             ai_report_text += "\n\n③ 여객 동선 및 편의 설비 요인: \n"
-            if p_diff > 0: ai_report_text += f"승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
-            elif p_diff < 0: ai_report_text += f"승객수가 {abs(p_diff):,.0f}명 감소하여 전체적인 동력 전력 감소에 기여했습니다."
+            if p_diff > 0: ai_report_text += f"기간 내 승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
+            elif p_diff < 0: ai_report_text += f"기간 내 승객수가 {abs(p_diff):,.0f}명 감소하여 전체적인 동력 전력 감소에 기여했습니다."
             else: ai_report_text += "승객수 변동폭이 작아 유의미한 여객 전력 변동은 관찰되지 않았습니다."
 
         res = {
-            "summary": { "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, "cost": diff_total*price, "ai_report": ai_report_text }, 
+            "summary": { 
+                "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, 
+                "cost": diff_total * price, "ai_report": ai_report_text, "period_label": period_label 
+            }, 
             "records": records
         }
         GLOBAL_API_CACHE["compare"][cache_key] = res
@@ -908,7 +952,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
         if pass_col is None: return {"error": "엑셀 첫번째 시트에 '승객수' 컬럼이 포함되어 있는지 확인해 주세요."}
         
-        # '전체' 선택 시 종합청사 제외 (기존 유지)
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
             df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
@@ -1024,7 +1067,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                     if r_info.get('status') == '확인':
                         r_sub = r_info.get('substation', '')
                         is_match = False
-                        # 🌟 핵심 수정: '전체' 선택 시 부하증감 신고 내역에서도 종합청사는 제외하고 1~3호선만 매칭
                         if station == '전체' and r_sub != '종합청사': is_match = True
                         elif station in LINE_STATIONS and r_sub in LINE_STATIONS[station]: is_match = True
                         elif station == r_sub: is_match = True
