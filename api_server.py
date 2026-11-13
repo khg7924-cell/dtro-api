@@ -198,11 +198,15 @@ async def auto_cache_warmer():
         try:
             logger.info("🔥 [상시 캐싱] 백그라운드에서 9월 5일 이후 전체 데이터를 미리 준비합니다...")
             def warm_up():
-                today_str = get_kst_now().strftime("%Y-%m-%d")
+                now_kst = get_kst_now()
+                today_str = now_kst.strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
+                default_14d_start = max((now_kst - timedelta(days=14)).strftime("%Y-%m-%d"), api_start)
+                
+                # 1. 비교 및 예측에 쓰이는 2023년~현재 기상청 ASOS 데이터를 충돌 없이 가장 먼저 단독 캐싱
+                fetch_asos_daily("2023-01-01", today_str)
                 
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
-                    weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
@@ -212,7 +216,11 @@ async def auto_cache_warmer():
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
                 
                 for st in target_stations:
+                    # 9월 5일~오늘 전체 캐싱 (이 과정에서 각 날짜별 한전/기상 캐시 적재 완료)
                     get_dashboard_data(st, api_start, today_str)
+                    # 프론트엔드 기본 접속 기간(14일 전~오늘)도 API 응답 캐시에 즉시 등록
+                    if default_14d_start != api_start:
+                        get_dashboard_data(st, default_14d_start, today_str)
                     
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
@@ -305,7 +313,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS) - 연도별 분할 호출 및 "--" 불량 캐시 방지 적용
+# 🌟 기상청 대표 관측소 (ASOS) - 순수 원본 로직 유지 + "--" 캐시 오염 버그 차단
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -322,7 +330,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
         
-        # 🌟 수정 포인트 1: 캐시에 값이 있더라도 "--"(실패값)이면 캐시를 무시하고 다시 요청
+        # 캐시에 값이 있더라도 "--"이면 무시하고 기상청에서 다시 받아오도록 처리
         if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_tmax] != "--":
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
@@ -336,63 +344,50 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     if not missing_dates: 
         return cached_res
 
-    # 🌟 수정 포인트 2: 기상청 API의 최대 조회 기간 제한(1년)에 걸리지 않도록 연도별로 쪼개서 호출
-    min_dt = datetime.strptime(min(missing_dates), "%Y-%m-%d")
-    max_dt = datetime.strptime(max(missing_dates), "%Y-%m-%d")
-    
-    chunks = []
-    curr_s = min_dt
-    while curr_s <= max_dt:
-        curr_e = min(datetime(curr_s.year, 12, 31), max_dt)
-        chunks.append((curr_s.strftime("%Y%m%d"), curr_e.strftime("%Y%m%d")))
-        curr_s = curr_e + timedelta(days=1)
-
+    req_start = min(missing_dates).replace("-", "")
+    req_end = max(missing_dates).replace("-", "")
+    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    
     res = {}
-
-    for req_start, req_end in chunks:
-        url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
-        for _ in range(2):
-            try:
-                r = http_session.get(url, headers=headers, timeout=10)
-                r.encoding = 'EUC-KR'
-                lines = r.text.split('\n')
-                headers_list = []
-                chunk_success = False
-                for line in lines:
-                    if line.startswith('#') and ':' in line and '.' in line:
-                        left_side = line.split(':')[0].strip()
-                        if left_side.replace('#', '').strip()[0].isdigit():
-                            col_name = left_side.split('.')[1].strip().split()[0]
-                            if col_name not in headers_list: headers_list.append(col_name)
-                    elif line.strip() and not line.startswith('#') and headers_list:
-                        parts = line.split()
-                        if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
-                            row_dict = dict(zip(headers_list, parts))
-                            date_key = row_dict.get('TM')
-                            if date_key and len(date_key) >= 8:
-                                d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                                def parse_val(v):
-                                    if not v: return "--"
-                                    try:
-                                        fv = float(v)
-                                        return fv if fv > -50.0 else "--"
-                                    except: return "--"
-                                res[d_str] = {
-                                    "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                    "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                    "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                    "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
-                                }
-                                chunk_success = True
-                if chunk_success: break
-            except:
-                time.sleep(0.5)
+    for _ in range(3):
+        try:
+            r = http_session.get(url, headers=headers, timeout=15)
+            r.encoding = 'EUC-KR'
+            lines = r.text.split('\n')
+            headers_list = []
+            for line in lines:
+                if line.startswith('#') and ':' in line and '.' in line:
+                    left_side = line.split(':')[0].strip()
+                    if left_side.replace('#', '').strip()[0].isdigit():
+                        col_name = left_side.split('.')[1].strip().split()[0]
+                        if col_name not in headers_list: headers_list.append(col_name)
+                elif line.strip() and not line.startswith('#') and headers_list:
+                    parts = line.split()
+                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
+                        row_dict = dict(zip(headers_list, parts))
+                        date_key = row_dict.get('TM')
+                        if date_key and len(date_key) >= 8:
+                            d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                            def parse_val(v):
+                                if not v: return "--"
+                                try:
+                                    fv = float(v)
+                                    return fv if fv > -50.0 else "--"
+                                except: return "--"
+                            res[d_str] = {
+                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                            }
+            if res: break
+        except: time.sleep(0.5)
 
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
         cached_res[d_str] = v
-        # 🌟 수정 포인트 3: 정상적으로 기온 값을 받아온 경우에만 캐시에 저장 ("--" 저장 방지)
+        # 정상적으로 기상청 데이터를 받아왔을 때만 캐시에 저장 ("--" 영구 캐싱 방지)
         if d_str < today_str and v["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
@@ -401,7 +396,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (기온 보완 및 미세먼지)
+# 🌟 Open-Meteo 환경 데이터 (대시보드 금일 기온 보완 및 미세먼지 전용)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -508,7 +503,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
             
-            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[cache_key] != "--":
+            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
                 missing_tasks.append((d_str, tm2, obs, key, cache_key))
@@ -529,6 +524,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                             if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = fv
                             return d_str, key, fv
         except: pass
+        if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = "--"
         return d_str, key, "--"
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -561,6 +557,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     cust_nos = []
     target_meter_no = "전체"
     
+    # '전체' 선택 시 종합청사 제외 (순수 1~3호선 고객번호만 합산)
     if station == '전체': 
         cust_nos = list(set([v for k, v in STATION_CUST_MAP.items() if k != '종합청사']))
     elif station in LINE_STATIONS: 
@@ -572,6 +569,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
             
     total_interval_usage = [0.0] * 96
+    today_str = get_kst_now().strftime("%Y-%m-%d")
     
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
@@ -590,7 +588,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                     if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
             except: pass
             
-            if date_str < get_kst_now().strftime("%Y-%m-%d") and day_list:
+            if date_str < today_str and day_list:
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
         
         m_target = target_meter_no if c_no == '0526314773' else "전체"
@@ -606,7 +604,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     total_usage = sum(total_interval_usage)
     max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
     
-    if date_str == get_kst_now().strftime("%Y-%m-%d"):
+    if date_str == today_str:
         check_and_send_alert(station, max_peak)
     
     details = []
@@ -847,10 +845,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             w_avg_tmin = (winter_tmin_sum / winter_tmin_cnt) if winter_tmin_cnt > 0 else 0.0
             a_avg_tmax = (all_tmax_sum / all_tmax_cnt) if all_tmax_cnt > 0 else 0.0
             a_avg_tmin = (all_tmin_sum / all_tmin_cnt) if all_tmin_cnt > 0 else 0.0
-            return hw, cw, s_avg_tmax, w_avg_tmin, a_avg_tmax, a_avg_tmin
+            return hw, cw, s_avg_tmax, w_avg_tmin, a_avg_tmax, a_avg_tmin, all_tmax_cnt
 
-        base_hw, base_cw, b_s_tmax, b_w_tmin, b_a_tmax, b_a_tmin = get_stats(base_year)
-        comp_hw, comp_cw, c_s_tmax, c_w_tmin, c_a_tmax, c_a_tmin = get_stats(comp_year)
+        base_hw, base_cw, b_s_tmax, b_w_tmin, b_a_tmax, b_a_tmin, b_cnt = get_stats(base_year)
+        comp_hw, comp_cw, c_s_tmax, c_w_tmin, c_a_tmax, c_a_tmin, c_cnt = get_stats(comp_year)
         
         hw_diff, cw_diff = comp_hw - base_hw, comp_cw - base_cw
         s_tmax_diff = c_s_tmax - b_s_tmax
@@ -874,7 +872,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         disp_station = "전체 (1~3호선)" if station == "전체" else station
         ai_report_text = f"📊 [{disp_station}] {base_year}년 vs {comp_year}년 ({period_label}) 전력 수요 AI 심층 분석 리포트\n\n"
         
-        if not asos_data:
+        if not asos_data or (b_cnt == 0 and c_cnt == 0):
             ai_report_text += f"⚠️ 현재 기상청 API 허브 서버의 응답이 없어 기상 지표를 불러오지 못했습니다. 백엔드 터미널 창의 로그를 확인해주세요.\n\n"
         
         ai_report_text += f"[1] 조회 기간({period_label}) 기후 및 환경 지표 변동 현황\n"
@@ -948,7 +946,8 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             }, 
             "records": records
         }
-        GLOBAL_API_CACHE["compare"][cache_key] = res
+        if b_cnt > 0 or c_cnt > 0:
+            GLOBAL_API_CACHE["compare"][cache_key] = res
         return res
     except Exception as e:
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
