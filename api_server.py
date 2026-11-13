@@ -305,7 +305,6 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS)
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -386,7 +385,6 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (기온 보완 및 미세먼지)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -470,7 +468,6 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS)
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -547,9 +544,13 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     cust_nos = []
     target_meter_no = "전체"
     
-    if station == '전체': cust_nos = list(set(STATION_CUST_MAP.values()))
-    elif station in LINE_STATIONS: cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
-    elif station == '종합청사': cust_nos = [STATION_CUST_MAP['종합청사']]
+    # 🌟 핵심 수정: '전체' 선택 시 종합청사 제외 (순수 1, 2, 3호선 고객번호만 합산)
+    if station == '전체': 
+        cust_nos = list(set([v for k, v in STATION_CUST_MAP.items() if k != '종합청사']))
+    elif station in LINE_STATIONS: 
+        cust_nos = list(set([STATION_CUST_MAP[s] for s in LINE_STATIONS[station]]))
+    elif station == '종합청사': 
+        cust_nos = [STATION_CUST_MAP['종합청사']]
     else:
         cust_nos = [STATION_CUST_MAP.get(station)]
         if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
@@ -741,6 +742,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         df = load_excel_dataset()
         if df is None: return {"error": "과거 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
         
+        # '전체' 선택 시 종합청사 제외 (기존 유지)
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
             df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
@@ -906,6 +908,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
         if pass_col is None: return {"error": "엑셀 첫번째 시트에 '승객수' 컬럼이 포함되어 있는지 확인해 주세요."}
         
+        # '전체' 선택 시 종합청사 제외 (기존 유지)
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
             df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
@@ -1021,7 +1024,8 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                     if r_info.get('status') == '확인':
                         r_sub = r_info.get('substation', '')
                         is_match = False
-                        if station == '전체': is_match = True
+                        # 🌟 핵심 수정: '전체' 선택 시 부하증감 신고 내역에서도 종합청사는 제외하고 1~3호선만 매칭
+                        if station == '전체' and r_sub != '종합청사': is_match = True
                         elif station in LINE_STATIONS and r_sub in LINE_STATIONS[station]: is_match = True
                         elif station == r_sub: is_match = True
 
@@ -1081,7 +1085,7 @@ def get_bill_data(station: str, year: str):
         return GLOBAL_API_CACHE["bill"][cache_key]
 
     if station in ['전체', '2호선', '3호선']:
-        return {"error": "전기요금 조회는 개별 역사/기지 또는 1호선(통합)을 선택해야 정확한 내역을 확인할 수 있습니다. 좌측 메뉴에서 선택해 주세요."}
+        return {"error": "전기요금 조회는 개별 역사/기지, 1호선(통합), 또는 종합청사를 선택해야 정확한 내역을 확인할 수 있습니다. 좌측 메뉴에서 선택해 주세요."}
         
     if station == '1호선': target_cust = '0526314773'
     else: target_cust = STATION_CUST_MAP.get(station)
@@ -1155,7 +1159,6 @@ def export_master_backup():
 
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # 🌟 수정 1: 2026-09-05 이후부터 어제까지 중 누락되거나 비어있는 날짜 전체 탐지
         start_check_date = pd.to_datetime("2026-09-05")
         existing_dates = set(df[date_col].tolist())
         
@@ -1179,7 +1182,6 @@ def export_master_backup():
                     if len(val) == 0 or pd.isna(val[0]) or val[0] == 0:
                         missing_dates.append(target_dt)
 
-        # 🌟 수정 2: 최대 120일까지 한 번에 메우도록 제한 완화
         if len(missing_dates) > 120:
             missing_dates = missing_dates[:120]
 
@@ -1246,7 +1248,6 @@ def export_master_backup():
             
         excel_bytes = output.getvalue()
 
-        # 🌟 수정 3: 백업된 최신 파일로 서버 디스크 및 Firebase 영구 저장소 자동 갱신
         with open(file_path, "wb") as f:
             f.write(excel_bytes)
         backup_dataset_to_firebase(excel_bytes)
