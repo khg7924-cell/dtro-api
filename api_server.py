@@ -305,6 +305,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
+# 🌟 기상청 대표 관측소 (ASOS) - 연도별 분할 호출 및 "--" 불량 캐시 방지 적용
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -321,7 +322,8 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
         
-        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE:
+        # 🌟 수정 포인트 1: 캐시에 값이 있더라도 "--"(실패값)이면 캐시를 무시하고 다시 요청
+        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_tmax] != "--":
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
                 "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
@@ -334,50 +336,64 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     if not missing_dates: 
         return cached_res
 
-    req_start = min(missing_dates).replace("-", "")
-    req_end = max(missing_dates).replace("-", "")
-    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    # 🌟 수정 포인트 2: 기상청 API의 최대 조회 기간 제한(1년)에 걸리지 않도록 연도별로 쪼개서 호출
+    min_dt = datetime.strptime(min(missing_dates), "%Y-%m-%d")
+    max_dt = datetime.strptime(max(missing_dates), "%Y-%m-%d")
     
+    chunks = []
+    curr_s = min_dt
+    while curr_s <= max_dt:
+        curr_e = min(datetime(curr_s.year, 12, 31), max_dt)
+        chunks.append((curr_s.strftime("%Y%m%d"), curr_e.strftime("%Y%m%d")))
+        curr_s = curr_e + timedelta(days=1)
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     res = {}
-    for _ in range(2):
-        try:
-            r = http_session.get(url, headers=headers, timeout=8)
-            r.encoding = 'EUC-KR'
-            lines = r.text.split('\n')
-            headers_list = []
-            for line in lines:
-                if line.startswith('#') and ':' in line and '.' in line:
-                    left_side = line.split(':')[0].strip()
-                    if left_side.replace('#', '').strip()[0].isdigit():
-                        col_name = left_side.split('.')[1].strip().split()[0]
-                        if col_name not in headers_list: headers_list.append(col_name)
-                elif line.strip() and not line.startswith('#') and headers_list:
-                    parts = line.split()
-                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
-                        row_dict = dict(zip(headers_list, parts))
-                        date_key = row_dict.get('TM')
-                        if date_key and len(date_key) >= 8:
-                            d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                            def parse_val(v):
-                                if not v: return "--"
-                                try:
-                                    fv = float(v)
-                                    return fv if fv > -50.0 else "--"
-                                except: return "--"
-                            res[d_str] = {
-                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
-                            }
-            if res: break
-        except: time.sleep(0.5)
+
+    for req_start, req_end in chunks:
+        url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
+        for _ in range(2):
+            try:
+                r = http_session.get(url, headers=headers, timeout=10)
+                r.encoding = 'EUC-KR'
+                lines = r.text.split('\n')
+                headers_list = []
+                chunk_success = False
+                for line in lines:
+                    if line.startswith('#') and ':' in line and '.' in line:
+                        left_side = line.split(':')[0].strip()
+                        if left_side.replace('#', '').strip()[0].isdigit():
+                            col_name = left_side.split('.')[1].strip().split()[0]
+                            if col_name not in headers_list: headers_list.append(col_name)
+                    elif line.strip() and not line.startswith('#') and headers_list:
+                        parts = line.split()
+                        if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
+                            row_dict = dict(zip(headers_list, parts))
+                            date_key = row_dict.get('TM')
+                            if date_key and len(date_key) >= 8:
+                                d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                                def parse_val(v):
+                                    if not v: return "--"
+                                    try:
+                                        fv = float(v)
+                                        return fv if fv > -50.0 else "--"
+                                    except: return "--"
+                                res[d_str] = {
+                                    "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                    "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                    "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                    "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                }
+                                chunk_success = True
+                if chunk_success: break
+            except:
+                time.sleep(0.5)
 
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
         cached_res[d_str] = v
-        if d_str < today_str:
+        # 🌟 수정 포인트 3: 정상적으로 기온 값을 받아온 경우에만 캐시에 저장 ("--" 저장 방지)
+        if d_str < today_str and v["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
@@ -385,6 +401,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
+# 🌟 Open-Meteo 환경 데이터 (기온 보완 및 미세먼지)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -460,7 +477,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
             "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
         }
-        if d_str < today_str:
+        if d_str < today_str and cached_res[d_str]["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
@@ -468,6 +485,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
+# 🌟 기상청 방재 기상 관측장비 (AWS)
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -490,7 +508,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
             
-            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
+            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[cache_key] != "--":
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
                 missing_tasks.append((d_str, tm2, obs, key, cache_key))
@@ -511,7 +529,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                             if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = fv
                             return d_str, key, fv
         except: pass
-        if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = "--"
         return d_str, key, "--"
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -573,7 +590,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                     if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
             except: pass
             
-            if date_str < get_kst_now().strftime("%Y-%m-%d"):
+            if date_str < get_kst_now().strftime("%Y-%m-%d") and day_list:
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
         
         m_target = target_meter_no if c_no == '0526314773' else "전체"
@@ -731,7 +748,6 @@ def get_realtime_data(station: str):
     GLOBAL_API_CACHE["realtime"][cache_key] = (time.time(), res)
     return res
 
-# 🌟 핵심 업그레이드: 월 단위 기간(start_month ~ end_month) 비교 지원
 @app.get("/api/compare/{station}")
 def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 150, start_month: int = 1, end_month: int = 12):
     if start_month < 1: start_month = 1
@@ -771,7 +787,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         df['month'] = df['date'].dt.month
         df['is_offday'] = df.apply(lambda x: 1 if x['date'].dayofweek >= 5 or x['date'] in kr_holidays else 0, axis=1)
 
-        # 🌟 선택된 월 범위(start_month ~ end_month)로 데이터 필터링
         df_base = df[(df['date'].dt.year == int(base_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
         df_comp = df[(df['date'].dt.year == int(comp_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
         
@@ -808,7 +823,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             for date_str, v in asos_data.items():
                 if date_str.startswith(year_str):
                     m = int(date_str[5:7])
-                    # 🌟 선택된 기간(월)에 해당하는 기상 데이터만 집계
                     if not (start_month <= m <= end_month):
                         continue
                     tmax = v.get("tmax", "--")
@@ -864,16 +878,17 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             ai_report_text += f"⚠️ 현재 기상청 API 허브 서버의 응답이 없어 기상 지표를 불러오지 못했습니다. 백엔드 터미널 창의 로그를 확인해주세요.\n\n"
         
         ai_report_text += f"[1] 조회 기간({period_label}) 기후 및 환경 지표 변동 현황\n"
-        ai_report_text += f" • 기간 내 평균 최고기온 : {b_a_tmax:.1f}℃ ➔ {c_a_tmax:.1f}℃ ({a_tmax_diff:+.1f}℃)\n"
-        ai_report_text += f" • 기간 내 평균 최저기온 : {b_a_tmin:.1f}℃ ➔ {c_a_tmin:.1f}℃ ({a_tmin_diff:+.1f}℃)\n"
-        if has_summer:
-            ai_report_text += f" • 하절기(6~8월 중 해당월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
+        if start_month == 1 and end_month == 12:
+            ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
+            ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
         else:
-            ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : 해당 기간 미포함\n"
-        if has_winter:
-            ai_report_text += f" • 동절기(12~2월 중 해당월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
-        else:
-            ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : 해당 기간 미포함\n"
+            ai_report_text += f" • 기간 내 평균 최고기온 : {b_a_tmax:.1f}℃ ➔ {c_a_tmax:.1f}℃ ({a_tmax_diff:+.1f}℃)\n"
+            ai_report_text += f" • 기간 내 평균 최저기온 : {b_a_tmin:.1f}℃ ➔ {c_a_tmin:.1f}℃ ({a_tmin_diff:+.1f}℃)\n"
+            if has_summer:
+                ai_report_text += f" • 하절기(6~8월 중 해당월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
+            if has_winter:
+                ai_report_text += f" • 동절기(12~2월 중 해당월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
+
         ai_report_text += f" • 폭염일수(33℃ 이상) : {base_hw}일 ➔ {comp_hw}일 ({hw_diff:+}일)\n"
         ai_report_text += f" • 한파일수(-10℃ 이하) : {base_cw}일 ➔ {comp_cw}일 ({cw_diff:+}일)\n"
         ai_report_text += f" • 초미세먼지 '나쁨' : {base_pm25}일 ➔ {comp_pm25}일 ({pm_diff:+}일)\n\n"
@@ -892,44 +907,44 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             if has_summer and (s_tmax_diff > 0.3 or hw_diff > 0): climate_str.append("하절기 기온/폭염 상승")
             if has_winter and (w_tmin_diff < -0.3 or cw_diff > 0): climate_str.append("동절기 한파 심화")
             if not has_summer and not has_winter and abs(a_tmax_diff) > 0.5: climate_str.append("기온 변동에 따른 공조 부하 증가")
-            if p_diff > 0: climate_str.append(f"승객수 {p_diff:+,.0f}명 증가")
+            if p_diff > 0: climate_str.append(f"승객수 {p_diff:+,.0f}명 폭증")
             if off_diff < 0: climate_str.append(f"평일 열차 운행일수 {abs(off_diff)}일 증가")
             
             ai_report_text += f"① 공사의 전사적 절전 성과 가시화 (핵심 요인): \n"
-            ai_report_text += f"{', '.join(climate_str)} 등으로 역사 및 열차의 공조/동력 부하가 팩트 데이터상 명확히 가중될 조건이었습니다. 그럼에도 불구하고 해당 기간 전력량이 총 {abs(diff_total):,.0f} kWh 줄어든 원인은, 당 공사가 23년부터 전사적으로 추진해 온 '절전 아이템 발굴 및 운영 최적화' 노력이 환경적 악조건을 완벽히 극복하고 상쇄한 성과로 AI는 분석합니다.\n\n"
+            ai_report_text += f"{', '.join(climate_str)} 등으로 역사 및 열차의 공조/동력 부하가 팩트 데이터상 명확히 가중될 조건이었습니다. 그럼에도 불구하고 전력량이 총 {abs(diff_total):,.0f} kWh 줄어든 원인은, 당 공사가 23년부터 전사적으로 추진해 온 '절전 아이템 발굴 및 운영 최적화' 노력이 환경적 악조건을 완벽히 극복하고 상쇄한 성과로 AI는 분석합니다.\n\n"
             
             ai_report_text += "② 캘린더 부하 효과 판단: \n"
-            if off_diff > 0: ai_report_text += f"동 기간 내 휴일이 전년 대비 {off_diff}일 늘어나 열차 운행 횟수(다이아)가 줄어든 점도, 공사의 절전 노력과 시너지를 일으켜 전력 절감에 긍정적으로 작용했습니다."
+            if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 늘어나 열차 운행 횟수(다이아)가 줄어든 점도, 공사의 절전 노력과 시너지를 일으켜 전력 절감에 긍정적으로 작용했습니다."
             elif off_diff < 0: ai_report_text += f"심지어 휴일 일수마저 감소하여 평일 열차 운행 횟수가 증가하는 악조건이었으나, 전사적인 절전 성과가 이를 모두 성공적으로 방어해 냈습니다."
-            else: ai_report_text += "휴일 일수는 전년 동기간과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
+            else: ai_report_text += "휴일 일수는 전년과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
         else:
             direction = "증가" if diff_total > 0 else "감소"
-            ai_report_text += f"XGBoost 알고리즘 분석 결과, 조회 기간({period_label}) 동안 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
+            ai_report_text += f"XGBoost 알고리즘 분석 결과, 조회 기간({period_label}) 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
             
             ai_report_text += "① 캘린더 및 열차 운행(다이아) 요인: \n"
-            if off_diff > 0: ai_report_text += f"조회 기간 내 휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
-            elif off_diff < 0: ai_report_text += f"조회 기간 내 휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
-            else: ai_report_text += "조회 기간 내 휴일 일수는 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
+            if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
+            elif off_diff < 0: ai_report_text += f"휴일이 {abs(off_diff)}일 줄어 운행 횟수가 가장 많은 '평일 다이아' 적용 일수가 늘어남에 따라 베이스 부하가 구조적으로 상승했습니다."
+            else: ai_report_text += "휴일 일수는 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
 
-            ai_report_text += "\n\n② 기상 및 공조 설비 부하 요인: \n"
+            ai_report_text += "\n\n② 계절별 기상 및 공조 설비 부하 요인: \n"
             weather_comments = []
             if has_summer:
-                weather_comments.append(f"[하절기 냉방] 선택 기간 내 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다.")
+                weather_comments.append(f"[하절기 냉방] 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다.")
             if has_winter:
-                weather_comments.append(f"[동절기 난방] 선택 기간 내 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다.")
+                weather_comments.append(f"[동절기 난방] 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다.")
             if not has_summer and not has_winter:
-                weather_comments.append(f"[환절기 공조] 선택 기간({period_label}) 평균 최고기온이 {abs(a_tmax_diff):.1f}℃ {'상승' if a_tmax_diff > 0 else '하락'}, 평균 최저기온이 {abs(a_tmin_diff):.1f}℃ {'상승' if a_tmin_diff > 0 else '하락'}하며 환기 및 공조 설비 가동률에 영향을 미쳤습니다.")
+                weather_comments.append(f"[환절기 공조] 조회 기간({period_label}) 평균 최고기온이 {abs(a_tmax_diff):.1f}℃ {'상승' if a_tmax_diff > 0 else '하락'}, 평균 최저기온이 {abs(a_tmin_diff):.1f}℃ {'상승' if a_tmin_diff > 0 else '하락'}하며 환기 및 공조 설비 가동률에 영향을 미쳤습니다.")
             ai_report_text += "\n".join(weather_comments)
                 
             ai_report_text += "\n\n③ 여객 동선 및 편의 설비 요인: \n"
-            if p_diff > 0: ai_report_text += f"기간 내 승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
-            elif p_diff < 0: ai_report_text += f"기간 내 승객수가 {abs(p_diff):,.0f}명 감소하여 전체적인 동력 전력 감소에 기여했습니다."
+            if p_diff > 0: ai_report_text += f"승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
+            elif p_diff < 0: ai_report_text += f"승객수가 {abs(p_diff):,.0f}명 감소하여 전체적인 동력 전력 감소에 기여했습니다."
             else: ai_report_text += "승객수 변동폭이 작아 유의미한 여객 전력 변동은 관찰되지 않았습니다."
 
         res = {
             "summary": { 
                 "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, 
-                "cost": diff_total * price, "ai_report": ai_report_text, "period_label": period_label 
+                "cost": diff_total*price, "ai_report": ai_report_text, "period_label": period_label 
             }, 
             "records": records
         }
