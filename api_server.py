@@ -192,21 +192,18 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
+# 🌟 원본 상시 캐싱 로직 100% 복원
 async def auto_cache_warmer():
     await asyncio.sleep(3)
     while True:
         try:
             logger.info("🔥 [상시 캐싱] 백그라운드에서 9월 5일 이후 전체 데이터를 미리 준비합니다...")
             def warm_up():
-                now_kst = get_kst_now()
-                today_str = now_kst.strftime("%Y-%m-%d")
+                today_str = get_kst_now().strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
-                default_14d_start = max((now_kst - timedelta(days=14)).strftime("%Y-%m-%d"), api_start)
-                
-                # 1. 비교 및 예측에 쓰이는 2023년~현재 기상청 ASOS 데이터를 충돌 없이 가장 먼저 단독 캐싱
-                fetch_asos_daily("2023-01-01", today_str)
                 
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
+                    weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
@@ -216,11 +213,7 @@ async def auto_cache_warmer():
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
                 
                 for st in target_stations:
-                    # 9월 5일~오늘 전체 캐싱 (이 과정에서 각 날짜별 한전/기상 캐시 적재 완료)
                     get_dashboard_data(st, api_start, today_str)
-                    # 프론트엔드 기본 접속 기간(14일 전~오늘)도 API 응답 캐시에 즉시 등록
-                    if default_14d_start != api_start:
-                        get_dashboard_data(st, default_14d_start, today_str)
                     
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
@@ -313,7 +306,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS) - 순수 원본 로직 유지 + "--" 캐시 오염 버그 차단
+# 🌟 기상청 대표 관측소 (ASOS) - 원본 코드 100% 복원
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -330,8 +323,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
         
-        # 캐시에 값이 있더라도 "--"이면 무시하고 기상청에서 다시 받아오도록 처리
-        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_tmax] != "--":
+        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE:
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
                 "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
@@ -350,9 +342,9 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
     res = {}
-    for _ in range(3):
+    for _ in range(2):
         try:
-            r = http_session.get(url, headers=headers, timeout=15)
+            r = http_session.get(url, headers=headers, timeout=8)
             r.encoding = 'EUC-KR'
             lines = r.text.split('\n')
             headers_list = []
@@ -387,8 +379,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
         cached_res[d_str] = v
-        # 정상적으로 기상청 데이터를 받아왔을 때만 캐시에 저장 ("--" 영구 캐싱 방지)
-        if d_str < today_str and v["tmax"] != "--":
+        if d_str < today_str:
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
@@ -396,7 +387,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (대시보드 금일 기온 보완 및 미세먼지 전용)
+# 🌟 Open-Meteo 환경 데이터 - 원본 코드 100% 복원
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -472,7 +463,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
             "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
         }
-        if d_str < today_str and cached_res[d_str]["tmax"] != "--":
+        if d_str < today_str:
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
@@ -480,7 +471,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS)
+# 🌟 기상청 방재 기상 관측장비 (AWS) - 원본 코드 100% 복원
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -553,11 +544,11 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
+# 🌟 한전 데이터 수집 - 원본 코드 복원 ('전체'에서 종합청사 제외만 적용)
 def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = False):
     cust_nos = []
     target_meter_no = "전체"
     
-    # '전체' 선택 시 종합청사 제외 (순수 1~3호선 고객번호만 합산)
     if station == '전체': 
         cust_nos = list(set([v for k, v in STATION_CUST_MAP.items() if k != '종합청사']))
     elif station in LINE_STATIONS: 
@@ -569,7 +560,6 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
             
     total_interval_usage = [0.0] * 96
-    today_str = get_kst_now().strftime("%Y-%m-%d")
     
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
@@ -588,7 +578,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                     if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
             except: pass
             
-            if date_str < today_str and day_list:
+            if date_str < get_kst_now().strftime("%Y-%m-%d"):
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
         
         m_target = target_meter_no if c_no == '0526314773' else "전체"
@@ -604,7 +594,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     total_usage = sum(total_interval_usage)
     max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
     
-    if date_str == today_str:
+    if date_str == get_kst_now().strftime("%Y-%m-%d"):
         check_and_send_alert(station, max_peak)
     
     details = []
@@ -787,9 +777,8 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
 
         df_base = df[(df['date'].dt.year == int(base_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
         df_comp = df[(df['date'].dt.year == int(comp_year)) & (df['month'] >= start_month) & (df['month'] <= end_month)]
-        
-        monthly_base = df_base.groupby('month')['target_power'].sum()
-        monthly_comp = df_comp.groupby('month')['target_power'].sum()
+        monthly_base = df_base.groupby(df_base['date'].dt.month)['target_power'].sum()
+        monthly_comp = df_comp.groupby(df_comp['date'].dt.month)['target_power'].sum()
 
         records, tb, tc = [], 0.0, 0.0
         for m in range(start_month, end_month + 1):
@@ -804,20 +793,16 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         diff_total = tc - tb
         diff_pct_total = round((diff_total / tb) * 100, 1) if tb > 0 else 0
 
-        b_total_off = int(df_base['is_offday'].sum())
-        c_total_off = int(df_comp['is_offday'].sum())
+        b_total_off = df_base['is_offday'].sum()
+        c_total_off = df_comp['is_offday'].sum()
         off_diff = c_total_off - b_total_off
 
-        req_s_yr = min(int(base_year), int(comp_year))
-        req_e_yr = max(int(base_year), int(comp_year))
-        asos_data = fetch_asos_daily(f"{req_s_yr}-01-01", f"{req_e_yr}-12-31")
+        asos_data = fetch_asos_daily(f"{base_year}-01-01", f"{comp_year}-12-31")
             
         def get_stats(year_str):
             hw, cw = 0, 0
             summer_tmax_sum, summer_tmax_cnt = 0.0, 0
             winter_tmin_sum, winter_tmin_cnt = 0.0, 0
-            all_tmax_sum, all_tmax_cnt = 0.0, 0
-            all_tmin_sum, all_tmin_cnt = 0.0, 0
             for date_str, v in asos_data.items():
                 if date_str.startswith(year_str):
                     m = int(date_str[5:7])
@@ -828,7 +813,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                     if tmax != "--":
                         try:
                             tmax_f = float(tmax)
-                            all_tmax_sum += tmax_f; all_tmax_cnt += 1
                             if tmax_f >= 33.0: hw += 1
                             if m in [6, 7, 8]:
                                 summer_tmax_sum += tmax_f; summer_tmax_cnt += 1
@@ -836,29 +820,20 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                     if tmin != "--":
                         try:
                             tmin_f = float(tmin)
-                            all_tmin_sum += tmin_f; all_tmin_cnt += 1
                             if tmin_f <= -10.0: cw += 1
                             if m in [12, 1, 2]:
                                 winter_tmin_sum += tmin_f; winter_tmin_cnt += 1
                         except: pass
             s_avg_tmax = (summer_tmax_sum / summer_tmax_cnt) if summer_tmax_cnt > 0 else 0.0
             w_avg_tmin = (winter_tmin_sum / winter_tmin_cnt) if winter_tmin_cnt > 0 else 0.0
-            a_avg_tmax = (all_tmax_sum / all_tmax_cnt) if all_tmax_cnt > 0 else 0.0
-            a_avg_tmin = (all_tmin_sum / all_tmin_cnt) if all_tmin_cnt > 0 else 0.0
-            return hw, cw, s_avg_tmax, w_avg_tmin, a_avg_tmax, a_avg_tmin, all_tmax_cnt
+            return hw, cw, s_avg_tmax, w_avg_tmin
 
-        base_hw, base_cw, b_s_tmax, b_w_tmin, b_a_tmax, b_a_tmin, b_cnt = get_stats(base_year)
-        comp_hw, comp_cw, c_s_tmax, c_w_tmin, c_a_tmax, c_a_tmin, c_cnt = get_stats(comp_year)
+        base_hw, base_cw, b_s_tmax, b_w_tmin = get_stats(base_year)
+        comp_hw, comp_cw, c_s_tmax, c_w_tmin = get_stats(comp_year)
         
         hw_diff, cw_diff = comp_hw - base_hw, comp_cw - base_cw
         s_tmax_diff = c_s_tmax - b_s_tmax
         w_tmin_diff = c_w_tmin - b_w_tmin
-        a_tmax_diff = c_a_tmax - b_a_tmax
-        a_tmin_diff = c_a_tmin - b_a_tmin
-
-        selected_months = list(range(start_month, end_month + 1))
-        has_summer = any(m in [6, 7, 8] for m in selected_months)
-        has_winter = any(m in [12, 1, 2] for m in selected_months)
 
         base_pm25 = int(df_base['is_pm25_bad'].sum())
         comp_pm25 = int(df_comp['is_pm25_bad'].sum())
@@ -869,42 +844,30 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         p_diff = comp_pass_sum - base_pass_sum
 
         period_label = f"{start_month}월~{end_month}월" if start_month != end_month else f"{start_month}월"
-        disp_station = "전체 (1~3호선)" if station == "전체" else station
-        ai_report_text = f"📊 [{disp_station}] {base_year}년 vs {comp_year}년 ({period_label}) 전력 수요 AI 심층 분석 리포트\n\n"
+        ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 ({period_label}) 전력 수요 AI 심층 분석 리포트\n\n"
         
-        if not asos_data or (b_cnt == 0 and c_cnt == 0):
+        if not asos_data:
             ai_report_text += f"⚠️ 현재 기상청 API 허브 서버의 응답이 없어 기상 지표를 불러오지 못했습니다. 백엔드 터미널 창의 로그를 확인해주세요.\n\n"
         
-        ai_report_text += f"[1] 조회 기간({period_label}) 기후 및 환경 지표 변동 현황\n"
-        if start_month == 1 and end_month == 12:
-            ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
-            ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
-        else:
-            ai_report_text += f" • 기간 내 평균 최고기온 : {b_a_tmax:.1f}℃ ➔ {c_a_tmax:.1f}℃ ({a_tmax_diff:+.1f}℃)\n"
-            ai_report_text += f" • 기간 내 평균 최저기온 : {b_a_tmin:.1f}℃ ➔ {c_a_tmin:.1f}℃ ({a_tmin_diff:+.1f}℃)\n"
-            if has_summer:
-                ai_report_text += f" • 하절기(6~8월 중 해당월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
-            if has_winter:
-                ai_report_text += f" • 동절기(12~2월 중 해당월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
-
+        ai_report_text += f"[1] 계절별 기후 및 환경 지표 변동 현황 ({period_label})\n"
+        ai_report_text += f" • 하절기(6~8월) 평균 최고기온 : {b_s_tmax:.1f}℃ ➔ {c_s_tmax:.1f}℃ ({s_tmax_diff:+.1f}℃)\n"
+        ai_report_text += f" • 동절기(12~2월) 평균 최저기온 : {b_w_tmin:.1f}℃ ➔ {c_w_tmin:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
         ai_report_text += f" • 폭염일수(33℃ 이상) : {base_hw}일 ➔ {comp_hw}일 ({hw_diff:+}일)\n"
         ai_report_text += f" • 한파일수(-10℃ 이하) : {base_cw}일 ➔ {comp_cw}일 ({cw_diff:+}일)\n"
         ai_report_text += f" • 초미세먼지 '나쁨' : {base_pm25}일 ➔ {comp_pm25}일 ({pm_diff:+}일)\n\n"
-        
-        ai_report_text += f"[2] 조회 기간({period_label}) 캘린더 및 여객 지표 변동 현황\n"
+        ai_report_text += f"[2] 캘린더 및 여객 지표 변동 현황 ({period_label})\n"
         ai_report_text += f" • 휴일(비운무일) 총합 : {b_total_off}일 ➔ {c_total_off}일 ({off_diff:+}일)\n"
-        ai_report_text += f" • 기간 내 총 승객수 : {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
-        ai_report_text += f"🧠 [3] AI 융합 증감 요인 심층 분석 ({period_label} 기준)\n"
+        ai_report_text += f" • 기간 총 승객수 : {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
+        ai_report_text += f"🧠 [3] AI 융합 증감 요인 심층 분석\n"
         
-        is_climate_harsher = (has_summer and (s_tmax_diff > 0.3 or hw_diff > 0)) or (has_winter and (w_tmin_diff < -0.3 or cw_diff > 0)) or (not has_summer and not has_winter and abs(a_tmax_diff) > 0.5)
+        is_climate_harsher = (s_tmax_diff > 0.3 or hw_diff > 0) or (w_tmin_diff < -0.3 or cw_diff > 0)
         is_passenger_up = p_diff > 0
 
         if diff_total < 0 and (is_climate_harsher or is_passenger_up or off_diff < 0):
-            ai_report_text += f"🚨 [주목] 전력 부하가 가중될 조건임에도, 조회 기간({period_label}) 총 전력량은 오히려 감소({diff_pct_total:+.1f}%)하는 긍정적 결과가 도출되었습니다.\n\n"
+            ai_report_text += f"🚨 [주목] 전력 부하가 가중될 조건임에도, 총 전력량은 오히려 감소({diff_pct_total:+.1f}%)하는 긍정적 결과가 도출되었습니다.\n\n"
             climate_str = []
-            if has_summer and (s_tmax_diff > 0.3 or hw_diff > 0): climate_str.append("하절기 기온/폭염 상승")
-            if has_winter and (w_tmin_diff < -0.3 or cw_diff > 0): climate_str.append("동절기 한파 심화")
-            if not has_summer and not has_winter and abs(a_tmax_diff) > 0.5: climate_str.append("기온 변동에 따른 공조 부하 증가")
+            if s_tmax_diff > 0.3 or hw_diff > 0: climate_str.append("하절기 기온/폭염 상승")
+            if w_tmin_diff < -0.3 or cw_diff > 0: climate_str.append("동절기 한파 심화")
             if p_diff > 0: climate_str.append(f"승객수 {p_diff:+,.0f}명 폭증")
             if off_diff < 0: climate_str.append(f"평일 열차 운행일수 {abs(off_diff)}일 증가")
             
@@ -917,7 +880,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             else: ai_report_text += "휴일 일수는 전년과 동일하여 운행 다이아 차이에 따른 영향은 없었습니다."
         else:
             direction = "증가" if diff_total > 0 else "감소"
-            ai_report_text += f"XGBoost 알고리즘 분석 결과, 조회 기간({period_label}) 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
+            ai_report_text += f"XGBoost 알고리즘 분석 결과, 전력량이 총 {abs(diff_total):,.0f} kWh ({diff_pct_total:+.1f}%) {direction}한 주요 팩트 요인은 다음과 같습니다.\n\n"
             
             ai_report_text += "① 캘린더 및 열차 운행(다이아) 요인: \n"
             if off_diff > 0: ai_report_text += f"휴일이 전년 대비 {off_diff}일 더 많았습니다. 평일 대비 운행 횟수가 적은 휴일 다이아가 확대 적용되어 추진 전력 및 에스컬레이터, 스크린도어 등 연동 설비의 부하가 감소했습니다."
@@ -925,14 +888,8 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             else: ai_report_text += "휴일 일수는 전년과 동일하여 다이아 차이로 인한 변동은 발생하지 않았습니다."
 
             ai_report_text += "\n\n② 계절별 기상 및 공조 설비 부하 요인: \n"
-            weather_comments = []
-            if has_summer:
-                weather_comments.append(f"[하절기 냉방] 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다.")
-            if has_winter:
-                weather_comments.append(f"[동절기 난방] 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다.")
-            if not has_summer and not has_winter:
-                weather_comments.append(f"[환절기 공조] 조회 기간({period_label}) 평균 최고기온이 {abs(a_tmax_diff):.1f}℃ {'상승' if a_tmax_diff > 0 else '하락'}, 평균 최저기온이 {abs(a_tmin_diff):.1f}℃ {'상승' if a_tmin_diff > 0 else '하락'}하며 환기 및 공조 설비 가동률에 영향을 미쳤습니다.")
-            ai_report_text += "\n".join(weather_comments)
+            ai_report_text += f"[하절기 냉방] 여름철(6~8월) 평균 최고기온이 {abs(s_tmax_diff):.1f}℃ {'상승' if s_tmax_diff > 0 else '하락'}하고 폭염일수가 {hw_diff:+}일 변동하여 역사 냉방기 부하가 {'증가' if s_tmax_diff > 0 or hw_diff > 0 else '감소'}했습니다. "
+            ai_report_text += f"\n[동절기 난방] 겨울철(12~2월) 평균 최저기온이 {abs(w_tmin_diff):.1f}℃ {'상승(따뜻함)' if w_tmin_diff > 0 else '하락(추워짐)'}하고 한파일수가 {cw_diff:+}일 변동하여, 동절기 난방 부하는 {'감소' if w_tmin_diff > 0 and cw_diff <= 0 else '상승'}한 것으로 파악됩니다."
                 
             ai_report_text += "\n\n③ 여객 동선 및 편의 설비 요인: \n"
             if p_diff > 0: ai_report_text += f"승객수가 {p_diff:+,.0f}명 증가하여 동력 설비 가동 빈도가 누적 상승하고 환기 부하 연쇄 상승이 발생했습니다."
@@ -940,14 +897,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             else: ai_report_text += "승객수 변동폭이 작아 유의미한 여객 전력 변동은 관찰되지 않았습니다."
 
         res = {
-            "summary": { 
-                "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, 
-                "cost": diff_total*price, "ai_report": ai_report_text, "period_label": period_label 
-            }, 
+            "summary": { "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, "cost": diff_total*price, "ai_report": ai_report_text, "period_label": period_label }, 
             "records": records
         }
-        if b_cnt > 0 or c_cnt > 0:
-            GLOBAL_API_CACHE["compare"][cache_key] = res
+        GLOBAL_API_CACHE["compare"][cache_key] = res
         return res
     except Exception as e:
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
@@ -1141,7 +1094,7 @@ def get_bill_data(station: str, year: str):
         return GLOBAL_API_CACHE["bill"][cache_key]
 
     if station in ['전체', '2호선', '3호선']:
-        return {"error": "전기요금 조회는 개별 역사/기지, 1호선(통합), 또는 종합청사를 선택해야 정확한 내역을 확인할 수 있습니다. 좌측 메뉴에서 선택해 주세요."}
+        return {"error": "전기요금 조회는 개별 역사/기지 또는 1호선(통합)을 선택해야 정확한 내역을 확인할 수 있습니다. 좌측 메뉴에서 선택해 주세요."}
         
     if station == '1호선': target_cust = '0526314773'
     else: target_cust = STATION_CUST_MAP.get(station)
@@ -1211,69 +1164,52 @@ def export_master_backup():
 
         date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
+        
         df = df.dropna(subset=[date_col])
 
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        start_check_date = pd.to_datetime("2026-09-05")
-        existing_dates = set(df[date_col].tolist())
-        
-        col_map = {}
-        for c in df.columns:
-            for st in STATION_CUST_MAP.keys():
-                if st != '전체' and st in str(c):
-                    if 'total_kwh' in str(c): col_map.setdefault(st, {})['kwh'] = c
-                    if 'peak_kw' in str(c): col_map.setdefault(st, {})['peak'] = c
-
-        total_days = (yesterday - start_check_date).days + 1
-        missing_dates = []
-        for i in range(total_days):
-            target_dt = start_check_date + timedelta(days=i)
-            if target_dt not in existing_dates:
-                missing_dates.append(target_dt)
-            else:
-                sample_col = col_map.get('설화명곡', {}).get('kwh')
-                if sample_col:
-                    val = df.loc[df[date_col] == target_dt, sample_col].values
-                    if len(val) == 0 or pd.isna(val[0]) or val[0] == 0:
-                        missing_dates.append(target_dt)
-
-        if len(missing_dates) > 120:
-            missing_dates = missing_dates[:120]
-
-        new_rows = []
-        for target_dt in missing_dates:
-            d_str = target_dt.strftime("%Y-%m-%d")
-            is_existing_row = target_dt in existing_dates
-            row = {date_col: target_dt}
+        last_date = pd.to_datetime(df[date_col].max())
             
-            def fetch_st(st):
-                usage, peak, _ = get_kepco_data_for_station(st, d_str)
-                return st, usage, peak
+        if pd.isna(last_date): return {"error": "엑셀 파일에서 유효한 날짜 데이터를 찾을 수 없습니다."}
+            
+        new_rows = []
+        curr_date = last_date + timedelta(days=1)
+        days_to_fetch = (yesterday - curr_date).days + 1
+        
+        if days_to_fetch > 0:
+            if days_to_fetch > 100: days_to_fetch = 100 
                 
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                results = list(executor.map(fetch_st, [s for s in STATION_CUST_MAP.keys() if s != '전체']))
+            col_map = {}
+            for c in df.columns:
+                for st in STATION_CUST_MAP.keys():
+                    if st != '전체' and st in str(c):
+                        if 'total_kwh' in str(c): col_map.setdefault(st, {})['kwh'] = c
+                        if 'peak_kw' in str(c): col_map.setdefault(st, {})['peak'] = c
+                        
+            for i in range(days_to_fetch):
+                target_dt = curr_date + timedelta(days=i)
+                d_str = target_dt.strftime("%Y-%m-%d")
+                row = {date_col: target_dt}
                 
-            if is_existing_row:
-                row_idx = df[df[date_col] == target_dt].index[0]
-                for st, usage, peak in results:
-                    if st in col_map:
-                        if 'kwh' in col_map[st]: df.loc[row_idx, col_map[st]['kwh']] = usage
-                        if 'peak' in col_map[st]: df.loc[row_idx, col_map[st]['peak']] = peak
-            else:
+                def fetch_st(st):
+                    usage, peak, _ = get_kepco_data_for_station(st, d_str)
+                    return st, usage, peak
+                    
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    results = list(executor.map(fetch_st, [s for s in STATION_CUST_MAP.keys() if s != '전체']))
+                    
                 for st, usage, peak in results:
                     if st in col_map:
                         if 'kwh' in col_map[st]: row[col_map[st]['kwh']] = usage
                         if 'peak' in col_map[st]: row[col_map[st]['peak']] = peak
+                
                 new_rows.append(row)
                 
         if new_rows:
             df_new = pd.DataFrame(new_rows)
             df = pd.concat([df, df_new], ignore_index=True)
-
-        df.sort_values(by=date_col, inplace=True)
-        df.drop_duplicates(subset=[date_col], keep='last', inplace=True)
-        df.reset_index(drop=True, inplace=True)
+            df.sort_values(by=date_col, inplace=True)
+            df.reset_index(drop=True, inplace=True)
 
         holi_col = next((c for c in df.columns if '휴일' in str(c) or 'is_holiday' in str(c)), '휴일\n(is_holiday)')
         kr_holidays = holidays.KR()
@@ -1289,27 +1225,20 @@ def export_master_backup():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for sheet_name, sheet_df in xls_dict.items():
-                temp_df = sheet_df.copy()
-                if date_col in temp_df.columns:
-                    temp_df = temp_df.dropna(subset=[date_col])
-                    if pd.api.types.is_datetime64_any_dtype(temp_df[date_col]):
-                        temp_df[date_col] = temp_df[date_col].dt.strftime('%Y-%m-%d')
+                if date_col in sheet_df.columns:
+                    sheet_df = sheet_df.dropna(subset=[date_col])
+                    if pd.api.types.is_datetime64_any_dtype(sheet_df[date_col]):
+                        sheet_df[date_col] = sheet_df[date_col].dt.strftime('%Y-%m-%d')
                         
-                if '일자' in temp_df.columns:
-                    temp_df = temp_df.dropna(subset=['일자'])
-                    if pd.api.types.is_datetime64_any_dtype(temp_df['일자']):
-                        temp_df['일자'] = temp_df['일자'].dt.strftime('%Y-%m-%d')
+                if '일자' in sheet_df.columns:
+                    sheet_df = sheet_df.dropna(subset=['일자'])
+                    if pd.api.types.is_datetime64_any_dtype(sheet_df['일자']):
+                        sheet_df['일자'] = sheet_df['일자'].dt.strftime('%Y-%m-%d')
                 
-                temp_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
-        excel_bytes = output.getvalue()
-
-        with open(file_path, "wb") as f:
-            f.write(excel_bytes)
-        backup_dataset_to_firebase(excel_bytes)
-        load_excel_dataset()
-
         output.seek(0)
+        
         return StreamingResponse(
             output, 
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
