@@ -127,6 +127,7 @@ http_session.mount('https://', adapter)
 http_session.verify = False
 
 GLOBAL_KEPCO_CACHE = {}
+GLOBAL_KEPCO_TODAY_CACHE = {}  # 🌟 금일 한전 데이터 10분(600초) 캐싱용
 GLOBAL_WEATHER_CACHE = {}
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
@@ -196,20 +197,34 @@ async def auto_cache_warmer():
     await asyncio.sleep(3)
     while True:
         try:
-            logger.info("🔥 [상시 캐싱] 백그라운드에서 9월 5일 이후 전체 데이터를 미리 준비합니다...")
+            logger.info("🔥 [상시 캐싱] 백그라운드에서 데이터를 미리 준비합니다...")
             def warm_up():
-                today_str = get_kst_now().strftime("%Y-%m-%d")
+                now_kst = get_kst_now()
+                today_str = now_kst.strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
+                default_14d = max((now_kst - timedelta(days=14)).strftime("%Y-%m-%d"), api_start)
                 
+                target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
+                                  LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
+
+                # 🌟 1단계: 프론트엔드 기본 접속 구간(최근 14일)을 먼저 빠르게 캐싱
+                with ThreadPoolExecutor(max_workers=5) as weather_exec:
+                    weather_exec.submit(fetch_asos_daily, default_14d, today_str)
+                    for aws_stn in set(STATION_AWS_MAP.values()):
+                        weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, default_14d, today_str)
+                    for lat, lon in set(STATION_COORD_MAP.values()):
+                        weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str)
+                
+                for st in target_stations:
+                    get_dashboard_data(st, default_14d, today_str)
+
+                # 🌟 2단계: 9월 5일~오늘 전체 구간 마스터 캐싱 (이후 모든 기간 조회 시 Slicing에 사용됨)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
-                
-                target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
-                                  LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
                 
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str)
@@ -294,7 +309,6 @@ def load_excel_dataset():
                     df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
                     all_pm25.append(df_pm[['date', 'pm25_merged']])
             
-            # 🌟 엑셀 파일 안에 '기상청_ASOS' 시트가 존재하면 읽어서 즉시 메모리 캐시에 적재
             elif '기상청_ASOS' in sheet or 'ASOS' in sheet:
                 try:
                     df_asos = pd.read_excel(xls, sheet_name=sheet)
@@ -342,7 +356,6 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
         
-        # "--"로 잘못 들어간 값은 캐시로 치지 않고 재요청
         if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_tmax] != "--":
             cached_res[d_str] = {
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
@@ -399,7 +412,6 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
         cached_res[d_str] = v
-        # 정상 숫자인 경우에만 캐시에 저장 ("--" 저장 방지)
         if d_str < today_str and v["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
@@ -580,26 +592,39 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
             
     total_interval_usage = [0.0] * 96
+    today_str = get_kst_now().strftime("%Y-%m-%d")
     
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
         cache_key = f"{c_no}_{date_str}"
+        day_list = None
         
-        if not is_bypass and cache_key in GLOBAL_KEPCO_CACHE:
-            day_list = GLOBAL_KEPCO_CACHE[cache_key]
-        else:
+        # 🌟 속도 개선: 과거 날짜는 영구 캐시, 오늘 날짜는 10분(600초) 캐시에서 즉시 반환
+        if not is_bypass:
+            if date_str < today_str and cache_key in GLOBAL_KEPCO_CACHE:
+                day_list = GLOBAL_KEPCO_CACHE[cache_key]
+            elif date_str == today_str and cache_key in GLOBAL_KEPCO_TODAY_CACHE:
+                c_time, c_data = GLOBAL_KEPCO_TODAY_CACHE[cache_key]
+                if time.time() - c_time < 600:
+                    day_list = c_data
+
+        if day_list is None:
             url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
             params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
             day_list = []
+            req_ok = False
             try:
                 res = http_session.get(url, params=params, timeout=3)
                 if res.status_code == 200:
+                    req_ok = True
                     data = res.json()
                     if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
             except: pass
             
-            if date_str < get_kst_now().strftime("%Y-%m-%d"):
+            if date_str < today_str and day_list:
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
+            elif date_str == today_str and req_ok:
+                GLOBAL_KEPCO_TODAY_CACHE[cache_key] = (time.time(), day_list)
         
         m_target = target_meter_no if c_no == '0526314773' else "전체"
         return process_kepco_day_data(day_list, m_target)
@@ -614,7 +639,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
     total_usage = sum(total_interval_usage)
     max_peak = max(total_interval_usage) * 4 if total_interval_usage else 0.0
     
-    if date_str == get_kst_now().strftime("%Y-%m-%d"):
+    if date_str == today_str:
         check_and_send_alert(station, max_peak)
     
     details = []
@@ -631,18 +656,44 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     is_bypass = bypass.lower() == "true"
     cache_key = f"{station}_{start}_{end}"
     today_str = get_kst_now().strftime("%Y-%m-%d")
+    master_key = f"{station}_2026-09-05_{today_str}"
+    aws_stn = STATION_AWS_MAP.get(station, '143')
     
+    if is_bypass:
+        GLOBAL_API_CACHE["dashboard"].pop(master_key, None)
+
+    # 1. 정확히 일치하는 기간 캐시가 있으면 즉시 반환
     if not is_bypass and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
         if end < today_str or (time.time() - c_time < 600):
-            c_res["is_cached"] = True
-            return c_res
+            res_copy = dict(c_res)
+            res_copy["is_cached"] = True
+            return res_copy
 
     start_dt = datetime.strptime(start, "%Y-%m-%d")
     end_dt = datetime.strptime(end, "%Y-%m-%d")
-    
     api_start_date = datetime.strptime("2026-09-05", "%Y-%m-%d")
-    aws_stn = STATION_AWS_MAP.get(station, '143')
+
+    # 🌟 2. 상시 캐싱된 전체 기간(2026-09-05~오늘) 데이터가 있으면 외부 호출 없이 즉시 잘라내어(Slicing) 반환
+    if not is_bypass and master_key in GLOBAL_API_CACHE["dashboard"] and end <= today_str:
+        m_time, m_res = GLOBAL_API_CACHE["dashboard"][master_key]
+        if time.time() - m_time < 600:
+            eff_start = max(start_dt, api_start_date).strftime("%Y-%m-%d")
+            eff_end = end_dt.strftime("%Y-%m-%d")
+            sliced_records = [r for r in m_res.get("daily_records", []) if eff_start <= r["date"] <= eff_end]
+            tot_u = sum(r["usage_kwh"] for r in sliced_records)
+            max_p = max((r["peak_kw"] for r in sliced_records), default=0.0)
+            tot_c = sum(r["co2"] for r in sliced_records)
+            sliced_res = {
+                "station_name": station,
+                "mapped_location": m_res.get("mapped_location", f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)"),
+                "summary": { "total_usage": round(tot_u), "max_peak": round(max_p, 1), "total_co2": round(tot_c, 1) },
+                "daily_records": sliced_records,
+                "cached_at": m_res.get("cached_at", get_kst_now().strftime("%Y-%m-%d %H:%M:%S")),
+                "is_cached": True
+            }
+            GLOBAL_API_CACHE["dashboard"][cache_key] = (m_time, sliced_res)
+            return sliced_res
     
     if end_dt < api_start_date:
         res = {
@@ -1188,7 +1239,6 @@ def export_master_backup():
 
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # 1. 2026-09-05 이후부터 어제까지 누락된 전력량 데이터 탐지 및 보완
         start_check_date = pd.to_datetime("2026-09-05")
         existing_dates = set(df[date_col].tolist())
         
@@ -1259,7 +1309,6 @@ def export_master_backup():
         if df[date_col].dt.tz is not None: df[date_col] = df[date_col].dt.tz_localize(None)
         xls_dict[main_sheet_name] = df
 
-        # 🌟 2. '기상청_ASOS' 시트 자동 생성 및 최신화하여 마스터 엑셀에 함께 백업
         yesterday_str = yesterday.strftime("%Y-%m-%d")
         asos_all = fetch_asos_daily("2023-01-01", yesterday_str)
         asos_rows = []
@@ -1294,7 +1343,6 @@ def export_master_backup():
             
         excel_bytes = output.getvalue()
 
-        # 백업본을 서버 로컬 및 Firebase에도 즉시 반영
         with open(file_path, "wb") as f:
             f.write(excel_bytes)
         backup_dataset_to_firebase(excel_bytes)
