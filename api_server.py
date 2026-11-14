@@ -39,6 +39,9 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
+# 🌟 Vercel 서울(icn1) 리전 기상청 중계 서버 주소
+KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
+
 # =========================================================================
 # 🚨 영구 저장소 (Firebase Realtime Database) 연동 설정
 # =========================================================================
@@ -339,7 +342,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS)
+# 🌟 기상청 대표 관측소 (ASOS) - Vercel 서울(icn1) 중계 서버 경유
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -371,41 +374,52 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
 
     req_start = min(missing_dates).replace("-", "")
     req_end = max(missing_dates).replace("-", "")
-    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
+    url = f"{KMA_PROXY_URL}?type=asos&tm1={req_start}&tm2={req_end}&stn=143&authKey={KMA_API_HUB_KEY}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
     res = {}
     for _ in range(2):
         try:
             r = http_session.get(url, headers=headers, timeout=15)
-            r.encoding = 'EUC-KR'
+            r.encoding = 'utf-8'
             lines = r.text.split('\n')
             headers_list = []
             for line in lines:
                 if line.startswith('#') and ':' in line and '.' in line:
                     left_side = line.split(':')[0].strip()
-                    if left_side.replace('#', '').strip()[0].isdigit():
+                    cleaned = left_side.replace('#', '').strip()
+                    if cleaned and cleaned[0].isdigit():
                         col_name = left_side.split('.')[1].strip().split()[0]
                         if col_name not in headers_list: headers_list.append(col_name)
-                elif line.strip() and not line.startswith('#') and headers_list:
+                elif line.strip() and not line.startswith('#'):
                     parts = line.split()
-                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
-                        row_dict = dict(zip(headers_list, parts))
-                        date_key = row_dict.get('TM')
-                        if date_key and len(date_key) >= 8:
+                    if len(parts) >= 15:
+                        def parse_val(v):
+                            if not v: return "--"
+                            try:
+                                fv = float(v)
+                                return fv if fv > -50.0 else "--"
+                            except: return "--"
+                        if len(parts[0]) == 8 and parts[0].isdigit():
+                            date_key = parts[0]
                             d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                            def parse_val(v):
-                                if not v: return "--"
-                                try:
-                                    fv = float(v)
-                                    return fv if fv > -50.0 else "--"
-                                except: return "--"
                             res[d_str] = {
-                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                "tavg": parse_val(parts[10]),
+                                "tmax": parse_val(parts[11]),
+                                "tmin": parse_val(parts[13]),
+                                "humi": parse_val(parts[18]) if len(parts) > 18 else "--"
                             }
+                        elif headers_list and len(parts) >= len(headers_list) - 5:
+                            row_dict = dict(zip(headers_list, parts))
+                            date_key = row_dict.get('TM')
+                            if date_key and len(date_key) >= 8:
+                                d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                                res[d_str] = {
+                                    "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                    "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                    "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                    "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                }
             if res: break
         except: time.sleep(0.5)
 
@@ -504,7 +518,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS)
+# 🌟 기상청 방재 기상 관측장비 (AWS) - Vercel 서울(icn1) 중계 서버 경유
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -535,9 +549,10 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     if not missing_tasks: return res
 
     def fetch_single_element(d_str, tm2, obs, key, cache_key):
-        url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
+        url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn={stn_id}&authKey={KMA_API_HUB_KEY}"
         try:
-            r = http_session.get(url, headers=headers, timeout=2.5)
+            r = http_session.get(url, headers=headers, timeout=4.0)
+            r.encoding = 'utf-8'
             lines = r.text.split('\n')
             for line in lines:
                 if line.strip() and not line.startswith('#'):
