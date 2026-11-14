@@ -48,6 +48,9 @@ KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
 # =========================================================================
 FIREBASE_DB_URL = "https://datacenter-app-7a69a-default-rtdb.firebaseio.com"
 
+def is_valid_value(val):
+    return val is not None and val not in ["--", "-", "", "None", "null"]
+
 def backup_dataset_to_firebase(file_bytes):
     if "여기에_파이어베이스" in FIREBASE_DB_URL:
         logger.warning("⚠️ Firebase DB URL이 설정되지 않아 엑셀 데이터가 영구 저장되지 않습니다.")
@@ -84,16 +87,18 @@ def restore_thresholds_from_firebase():
     except Exception:
         pass
 
-# 🌟 1. 기상청 동네 AWS 과거 데이터 Firebase 영구 저장 및 복구
-def save_aws_cache_to_firebase():
+# 🌟 1. 기상청 동네 AWS 과거 데이터 Firebase 병합 저장(PATCH) 및 복구 (과거 데이터 삭제 원천 방지)
+def save_aws_cache_to_firebase(new_items: dict = None):
     if "여기에_파이어베이스" in FIREBASE_DB_URL: return
     try:
-        aws_only = {k: v for k, v in GLOBAL_WEATHER_CACHE.items() if k.startswith("AWS_")}
-        if not aws_only: return
+        aws_all = {k: v for k, v in GLOBAL_WEATHER_CACHE.items() if k.startswith("AWS_")}
+        if not aws_all: return
         with open("aws_cache.json", "w", encoding="utf-8") as f:
-            json.dump(aws_only, f, ensure_ascii=False)
-        requests.put(f"{FIREBASE_DB_URL}/aws_weather_cache.json", json=aws_only, timeout=10)
-        logger.info(f"✅ 기상청 AWS 과거 캐시 Firebase 영구 저장 완료 ({len(aws_only)}건)")
+            json.dump(aws_all, f, ensure_ascii=False)
+        payload = new_items if new_items else aws_all
+        # 🌟 PUT 대신 PATCH를 사용하여 Firebase의 기존 과거 데이터를 지우지 않고 새 데이터만 누적 병합
+        requests.patch(f"{FIREBASE_DB_URL}/aws_weather_cache.json", json=payload, timeout=10)
+        logger.info(f"✅ 기상청 AWS 캐시 Firebase 누적 병합(PATCH) 완료 (신규/갱신 {len(payload)}건, 총 {len(aws_all)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase AWS 캐시 저장 실패: {e}")
 
@@ -119,15 +124,17 @@ def restore_aws_cache_from_firebase():
     except Exception as e:
         logger.error(f"❌ Firebase AWS 캐시 복구 실패: {e}")
 
-# 🌟 2. 환경공단(에어코리아) 과거 일평균 초미세먼지 Firebase 영구 저장 및 복구
-def save_airkorea_cache_to_firebase():
+# 🌟 2. 환경공단(에어코리아) 과거 일평균 초미세먼지 Firebase 병합 저장(PATCH) 및 복구 (3개월 이후에도 영구 보존)
+def save_airkorea_cache_to_firebase(new_items: dict = None):
     if "여기에_파이어베이스" in FIREBASE_DB_URL: return
     try:
         if not GLOBAL_AIRKOREA_CACHE: return
         with open("airkorea_cache.json", "w", encoding="utf-8") as f:
             json.dump(GLOBAL_AIRKOREA_CACHE, f, ensure_ascii=False)
-        requests.put(f"{FIREBASE_DB_URL}/airkorea_cache.json", json=GLOBAL_AIRKOREA_CACHE, timeout=10)
-        logger.info(f"✅ 환경공단 초미세먼지 과거 캐시 Firebase 영구 저장 완료 ({len(GLOBAL_AIRKOREA_CACHE)}건)")
+        payload = new_items if new_items else GLOBAL_AIRKOREA_CACHE
+        # 🌟 PUT 대신 PATCH를 사용하여 3개월이 지난 과거 데이터도 절대 지워지지 않고 영구 보존됨
+        requests.patch(f"{FIREBASE_DB_URL}/airkorea_cache.json", json=payload, timeout=10)
+        logger.info(f"✅ 환경공단 초미세먼지 캐시 Firebase 누적 병합(PATCH) 완료 (신규/갱신 {len(payload)}건, 총 {len(GLOBAL_AIRKOREA_CACHE)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase 환경공단 캐시 저장 실패: {e}")
 
@@ -210,7 +217,7 @@ GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 AWS_FETCH_LOCK = threading.Lock()
 AIR_FETCH_LOCK = threading.Lock()
 KMA_AWS_COOLDOWN_UNTIL = 0.0
-AIR_DIRTY_FLAG = False
+PENDING_AIR_UPDATES = {}
 
 GLOBAL_API_CACHE = {
     "dashboard": {},
@@ -237,7 +244,6 @@ STATION_AWS_MAP = {
 }
 TARGET_AWS_STNS = set(STATION_AWS_MAP.values())
 
-# 🌟 개소별 한국환경공단(에어코리아) 대구 도시대기 측정소 매핑
 STATION_AIR_MAP = {
     '전체': '수창동', '1호선': '수창동', '2호선': '수창동', '3호선': '수창동',
     '종합청사': '본동',
@@ -295,7 +301,6 @@ async def auto_cache_warmer():
         try:
             logger.info("🔥 [상시 캐싱] 백그라운드에서 데이터를 미리 준비합니다...")
             def warm_up():
-                global AIR_DIRTY_FLAG
                 now_kst = get_kst_now()
                 today_str = now_kst.strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
@@ -316,9 +321,10 @@ async def auto_cache_warmer():
                     for lat, lon in set(STATION_COORD_MAP.values()):
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str)
                 
-                if AIR_DIRTY_FLAG:
-                    save_airkorea_cache_to_firebase()
-                    AIR_DIRTY_FLAG = False
+                with AIR_FETCH_LOCK:
+                    if PENDING_AIR_UPDATES:
+                        save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
+                        PENDING_AIR_UPDATES.clear()
 
                 for st in target_stations:
                     get_dashboard_data(st, default_14d, today_str)
@@ -332,10 +338,10 @@ async def auto_cache_warmer():
                     for lat, lon in set(STATION_COORD_MAP.values()):
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
                 
-                # 🌟 환경공단 새로운 과거 데이터가 수집되었으면 완료 즉시 Firebase에 영구 저장
-                if AIR_DIRTY_FLAG:
-                    save_airkorea_cache_to_firebase()
-                    AIR_DIRTY_FLAG = False
+                with AIR_FETCH_LOCK:
+                    if PENDING_AIR_UPDATES:
+                        save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
+                        PENDING_AIR_UPDATES.clear()
 
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str)
@@ -554,13 +560,14 @@ def fetch_airkorea_sido_realtime(is_bypass: bool = False):
 
     return GLOBAL_AIRKOREA_REALTIME_CACHE["data"]
 
-# 🌟 [환경공단 2] 측정소별 공식 일평균 초미세먼지 조회 및 Firebase 영구 캐싱 연동
+# 🌟 [환경공단 2] 측정소별 공식 일평균 초미세먼지 조회 (3개월 지난 과거 데이터 영구 보호 적용)
 def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, is_bypass: bool = False, save_immediately: bool = True):
-    global AIR_DIRTY_FLAG
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     today_dt = get_kst_now().replace(tzinfo=None)
     today_str = today_dt.strftime("%Y-%m-%d")
+    # 🌟 환경공단 API는 최근 3개월(약 90일)까지만 제공하므로, 85일 이전 과거 날짜는 강제 갱신 시에도 기존 캐시를 절대 지우지 않고 보호
+    retention_cutoff_str = (today_dt - timedelta(days=85)).strftime("%Y-%m-%d")
     diff = (e_dt - s_dt).days + 1
 
     res = {}
@@ -575,10 +582,17 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
             res[d_str] = v if v is not None else "--"
         else:
             ck = f"AIR_{air_stn}_{d_str}"
-            if not is_bypass and ck in GLOBAL_AIRKOREA_CACHE:
+            if ck in GLOBAL_AIRKOREA_CACHE:
                 res[d_str] = GLOBAL_AIRKOREA_CACHE[ck]
+                # 강제 갱신(is_bypass)이더라도 최근 85일 이내 날짜만 API 재확인 대상에 포함
+                if is_bypass and d_str >= retention_cutoff_str:
+                    missing_past_dates.append(d_str)
             else:
-                missing_past_dates.append(d_str)
+                # 캐시에 없는 날짜라도 최근 85일 이내(환경공단 조회 가능 기간)일 때만 API 호출
+                if d_str >= retention_cutoff_str:
+                    missing_past_dates.append(d_str)
+                else:
+                    res[d_str] = "--"
 
     if not missing_past_dates:
         return res
@@ -611,16 +625,35 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
         logger.warning(f"에어코리아 일평균 [{air_stn}] 조회 오류: {e}")
 
     if api_success:
+        newly_updated = {}
         with AIR_FETCH_LOCK:
             for d_str in missing_past_dates:
-                val = fetched_dates.get(d_str, "--")
-                res[d_str] = val
-                if d_str < today_str:
-                    GLOBAL_AIRKOREA_CACHE[f"AIR_{air_stn}_{d_str}"] = val
-            AIR_DIRTY_FLAG = True
-            if save_immediately:
-                save_airkorea_cache_to_firebase()
-                AIR_DIRTY_FLAG = False
+                ck = f"AIR_{air_stn}_{d_str}"
+                old_val = GLOBAL_AIRKOREA_CACHE.get(ck)
+                new_val = fetched_dates.get(d_str)
+
+                if new_val is not None:
+                    # 새로운 유효 숫자가 수신된 경우에만 업데이트
+                    res[d_str] = new_val
+                    if d_str < today_str and old_val != new_val:
+                        GLOBAL_AIRKOREA_CACHE[ck] = new_val
+                        newly_updated[ck] = new_val
+                        PENDING_AIR_UPDATES[ck] = new_val
+                else:
+                    # 🌟 핵심 보호 로직: API에서 값이 안 왔더라도 기존에 유효 숫자가 저장되어 있으면 절대 "--"로 덮어쓰지 않음!
+                    if is_valid_value(old_val):
+                        res[d_str] = old_val
+                    else:
+                        res[d_str] = "--"
+                        if d_str < today_str and ck not in GLOBAL_AIRKOREA_CACHE:
+                            GLOBAL_AIRKOREA_CACHE[ck] = "--"
+                            newly_updated[ck] = "--"
+                            PENDING_AIR_UPDATES[ck] = "--"
+
+            if save_immediately and newly_updated:
+                save_airkorea_cache_to_firebase(newly_updated)
+                for k in newly_updated:
+                    PENDING_AIR_UPDATES.pop(k, None)
     else:
         for d_str in missing_past_dates:
             res[d_str] = GLOBAL_AIRKOREA_CACHE.get(f"AIR_{air_stn}_{d_str}", "--")
@@ -710,12 +743,17 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
 
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
-        cached_res[d_str] = v
         if d_str < today_str and v["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
             GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v["humi"]
+        cached_res[d_str] = {
+            "tmax": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", v["tmax"]),
+            "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", v["tmin"]),
+            "tavg": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", v["tavg"]),
+            "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", v["humi"])
+        }
             
     return cached_res
 
@@ -795,7 +833,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
             "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
         }
-        if d_str < today_str:
+        if d_str < today_str and cached_res[d_str]["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
@@ -803,7 +841,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 및 Firebase 영구 캐싱
+# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 및 Firebase 누적 병합(PATCH) 캐싱
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     global KMA_AWS_COOLDOWN_UNTIL
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -828,11 +866,11 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                     missing_tasks.append((d_str, tm2, obs, key))
 
         if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
-            new_aws_saved = False
+            newly_aws_updated = {}
             quota_failed = False
 
             def fetch_all_stations_element(d_str, tm2, obs, key):
-                nonlocal new_aws_saved, quota_failed
+                nonlocal quota_failed
                 if quota_failed:
                     return
                 url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn=0&authKey={KMA_API_HUB_KEY}"
@@ -859,8 +897,16 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                     if valid_line_count >= 10:
                         if d_str < today_str:
                             for s_id in TARGET_AWS_STNS:
-                                GLOBAL_WEATHER_CACHE[f"AWS_{s_id}_{d_str}_{key}"] = found_vals.get(s_id, "--")
-                            new_aws_saved = True
+                                ck = f"AWS_{s_id}_{d_str}_{key}"
+                                old_val = GLOBAL_WEATHER_CACHE.get(ck)
+                                new_val = found_vals.get(s_id)
+                                if new_val is not None:
+                                    GLOBAL_WEATHER_CACHE[ck] = new_val
+                                    newly_aws_updated[ck] = new_val
+                                elif not is_valid_value(old_val):
+                                    # 🌟 기존에 유효한 실측 숫자가 있으면 절대 "--"로 덮어쓰지 않음
+                                    GLOBAL_WEATHER_CACHE[ck] = "--"
+                                    newly_aws_updated[ck] = "--"
                     else:
                         quota_failed = True
                 except Exception:
@@ -876,8 +922,8 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                 with ThreadPoolExecutor(max_workers=5) as executor:
                     list(executor.map(lambda t: fetch_all_stations_element(*t), missing_tasks[1:]))
 
-            if new_aws_saved:
-                save_aws_cache_to_firebase()
+            if newly_aws_updated:
+                save_aws_cache_to_firebase(newly_aws_updated)
 
     res = {}
     for i in range(diff):
@@ -1086,7 +1132,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
             if tmin == "--": tmin = om_data.get(d_str, {}).get("tmin", "--")
             if humi == "--": humi = om_data.get(d_str, {}).get("humi", "--")
             
-        # 🌟 초미세먼지: 1순위 환경공단 해당 측정소 -> 2순위 환경공단 대구 대표(수창동) -> 3순위 Open-Meteo
         pm25 = airkorea_data.get(d_str, "--")
         if pm25 == "--":
             pm25 = GLOBAL_AIRKOREA_CACHE.get(f"AIR_수창동_{d_str}", "--")
