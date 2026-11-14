@@ -6,6 +6,7 @@ import logging
 import asyncio
 import hashlib
 import base64
+import threading
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
@@ -83,6 +84,41 @@ def restore_thresholds_from_firebase():
     except Exception:
         pass
 
+# 🌟 기상청 동네 AWS 과거 데이터 Firebase 영구 저장 및 복구 (서버 재시작 시 재호출 0건 보장)
+def save_aws_cache_to_firebase():
+    if "여기에_파이어베이스" in FIREBASE_DB_URL: return
+    try:
+        aws_only = {k: v for k, v in GLOBAL_WEATHER_CACHE.items() if k.startswith("AWS_")}
+        if not aws_only: return
+        with open("aws_cache.json", "w", encoding="utf-8") as f:
+            json.dump(aws_only, f, ensure_ascii=False)
+        requests.put(f"{FIREBASE_DB_URL}/aws_weather_cache.json", json=aws_only, timeout=10)
+        logger.info(f"✅ 기상청 AWS 과거 캐시 Firebase 영구 저장 완료 ({len(aws_only)}건)")
+    except Exception as e:
+        logger.error(f"❌ Firebase AWS 캐시 저장 실패: {e}")
+
+def restore_aws_cache_from_firebase():
+    if os.path.exists("aws_cache.json"):
+        try:
+            with open("aws_cache.json", "r", encoding="utf-8") as f:
+                local_aws = json.load(f)
+                if isinstance(local_aws, dict):
+                    GLOBAL_WEATHER_CACHE.update(local_aws)
+        except Exception:
+            pass
+    if "여기에_파이어베이스" in FIREBASE_DB_URL: return
+    try:
+        res = requests.get(f"{FIREBASE_DB_URL}/aws_weather_cache.json", timeout=10)
+        if res.status_code == 200 and res.json():
+            fb_aws = res.json()
+            if isinstance(fb_aws, dict):
+                GLOBAL_WEATHER_CACHE.update(fb_aws)
+                with open("aws_cache.json", "w", encoding="utf-8") as f:
+                    json.dump(fb_aws, f, ensure_ascii=False)
+                logger.info(f"✅ 서버 시작됨 - Firebase에서 기상청 AWS 캐시 복구 완료 ({len(fb_aws)}건)")
+    except Exception as e:
+        logger.error(f"❌ Firebase AWS 캐시 복구 실패: {e}")
+
 # =========================================================================
 # 🚨 카카오워크 알림 시스템
 # =========================================================================
@@ -134,6 +170,10 @@ GLOBAL_KEPCO_TODAY_CACHE = {}  # 🌟 금일 한전 데이터 10분(600초) 캐�
 GLOBAL_WEATHER_CACHE = {}
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
+# 🌟 기상청 AWS 동시 중복 호출 방지 락 및 일일 한도 초과 시 쿨다운 타이머
+AWS_FETCH_LOCK = threading.Lock()
+KMA_AWS_COOLDOWN_UNTIL = 0.0
+
 GLOBAL_API_CACHE = {
     "dashboard": {},
     "realtime": {},
@@ -157,6 +197,7 @@ STATION_AWS_MAP = {
     '문양기지': '992', '대실': '992',
     '칠곡기지': '845', '팔달시장': '845'
 }
+TARGET_AWS_STNS = set(STATION_AWS_MAP.values())
 
 STATION_CUST_MAP = {
     '설화명곡': '0526314773', '월배기지': '0526314773', '서부정류장': '0526314773', 
@@ -210,11 +251,10 @@ async def auto_cache_warmer():
                 target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
 
-                # 🌟 1단계: 프론트엔드 기본 접속 구간(최근 14일)을 먼저 빠르게 캐싱
+                # 🌟 1단계: 프론트엔드 기본 접속 구간(최근 14일)을 먼저 빠르게 캐싱 (AWS는 stn=0으로 1회만 호출하면 8개 지점 모두 적재됨)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, default_14d, today_str)
-                    for aws_stn in set(STATION_AWS_MAP.values()):
-                        weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, default_14d, today_str)
+                    weather_exec.submit(fetch_aws_daily_for_dashboard, '143', default_14d, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str)
                 
@@ -224,8 +264,7 @@ async def auto_cache_warmer():
                 # 🌟 2단계: 9월 5일~오늘 전체 구간 마스터 캐싱 (이후 모든 기간 조회 시 Slicing에 사용됨)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
-                    for aws_stn in set(STATION_AWS_MAP.values()):
-                        weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
+                    weather_exec.submit(fetch_aws_daily_for_dashboard, '143', api_start, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
                 
@@ -244,6 +283,7 @@ async def auto_cache_warmer():
 async def startup_event():
     restore_dataset_from_firebase()     
     restore_thresholds_from_firebase()  
+    restore_aws_cache_from_firebase()   # 🌟 서버 시작 시 Firebase에서 과거 AWS 기상 캐시 복구
     
     load_excel_dataset()
     load_thresholds()
@@ -518,60 +558,96 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS) - Vercel 서울(icn1) 중계 서버 경유
+# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 및 Firebase 영구 캐싱 (호출량 1/8 감소 + 재시작 시 0건)
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
+    global KMA_AWS_COOLDOWN_UNTIL
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     yesterday = get_kst_now() - timedelta(days=1)
     if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
     if s_dt > e_dt: return {} 
 
-    res = {}
     diff = (e_dt - s_dt).days + 1
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     today_str = get_kst_now().strftime("%Y-%m-%d")
-    
-    missing_tasks = []
+
+    with AWS_FETCH_LOCK:
+        missing_tasks = []
+        for i in range(diff):
+            curr = s_dt + timedelta(days=i)
+            d_str = curr.strftime("%Y-%m-%d")
+            tm2 = curr.strftime("%Y%m%d")
+            for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
+                cache_key = f"AWS_{stn_id}_{d_str}_{key}"
+                if is_bypass or cache_key not in GLOBAL_WEATHER_CACHE:
+                    missing_tasks.append((d_str, tm2, obs, key))
+
+        # 기상청 일일 한도 초과 쿨다운 중이면 불필요한 외부 호출 없이 기존 캐시만 즉시 반환
+        if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
+            new_aws_saved = False
+            quota_failed = False
+
+            def fetch_all_stations_element(d_str, tm2, obs, key):
+                nonlocal new_aws_saved, quota_failed
+                if quota_failed:
+                    return
+                # 🌟 stn=0을 지정하여 단 1번의 호출로 대구 8개 관측소 데이터를 한꺼번에 수신
+                url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn=0&authKey={KMA_API_HUB_KEY}"
+                try:
+                    r = http_session.get(url, headers=headers, timeout=5.0)
+                    r.encoding = 'utf-8'
+                    lines = r.text.split('\n')
+                    valid_line_count = 0
+                    found_vals = {}
+                    for line in lines:
+                        s_line = line.strip()
+                        if s_line and not s_line.startswith('#'):
+                            parts = s_line.split()
+                            if len(parts) >= 6 and parts[0].isdigit() and len(parts[0]) == 8:
+                                valid_line_count += 1
+                                s_id = parts[1]
+                                if s_id in TARGET_AWS_STNS:
+                                    try:
+                                        fv = float(parts[5])
+                                        if fv > -50.0:
+                                            found_vals[s_id] = fv
+                                    except:
+                                        pass
+                    # 정상적인 전국 관측표(10개 이상 지점)가 내려왔을 때만 8개 관측소 캐시 및 Firebase에 기록
+                    if valid_line_count >= 10:
+                        if d_str < today_str:
+                            for s_id in TARGET_AWS_STNS:
+                                GLOBAL_WEATHER_CACHE[f"AWS_{s_id}_{d_str}_{key}"] = found_vals.get(s_id, "--")
+                            new_aws_saved = True
+                    else:
+                        # 일일 한도 초과 또는 에러 응답 시 캐시 오염을 막고 쿨다운 설정
+                        quota_failed = True
+                except Exception:
+                    pass
+
+            # 먼저 첫 1건을 테스트 호출하여 일일 한도 초과 여부를 확인
+            first_task = missing_tasks[0]
+            fetch_all_stations_element(*first_task)
+
+            if quota_failed:
+                KMA_AWS_COOLDOWN_UNTIL = time.time() + 600
+                logger.warning("⚠️ 기상청 AWS 응답 없음(일일 한도 초과 등) - 10분간 추가 AWS 호출을 일시 중단하고 ASOS/Open-Meteo로 대체합니다.")
+            elif len(missing_tasks) > 1:
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    list(executor.map(lambda t: fetch_all_stations_element(*t), missing_tasks[1:]))
+
+            if new_aws_saved:
+                save_aws_cache_to_firebase()
+
+    res = {}
     for i in range(diff):
         curr = s_dt + timedelta(days=i)
         d_str = curr.strftime("%Y-%m-%d")
-        tm2 = curr.strftime("%Y%m%d")
-        res[d_str] = {"tmax": "--", "tmin": "--", "humi": "--"}
-        
-        for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
-            cache_key = f"AWS_{stn_id}_{d_str}_{key}"
-            
-            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
-                res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
-            else:
-                missing_tasks.append((d_str, tm2, obs, key, cache_key))
-
-    if not missing_tasks: return res
-
-    def fetch_single_element(d_str, tm2, obs, key, cache_key):
-        url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn={stn_id}&authKey={KMA_API_HUB_KEY}"
-        try:
-            r = http_session.get(url, headers=headers, timeout=4.0)
-            r.encoding = 'utf-8'
-            lines = r.text.split('\n')
-            for line in lines:
-                if line.strip() and not line.startswith('#'):
-                    parts = line.split()
-                    if len(parts) >= 6 and parts[1] == stn_id:
-                        fv = float(parts[5])
-                        if fv > -50.0:
-                            if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = fv
-                            return d_str, key, fv
-        except: pass
-        if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = "--"
-        return d_str, key, "--"
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(fetch_single_element, *t) for t in missing_tasks]
-        for f in futures:
-            d_str, k, val = f.result()
-            res[d_str][k] = val
-            
+        res[d_str] = {
+            "tmax": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmax", "--"),
+            "tmin": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmin", "--"),
+            "humi": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_humi", "--")
+        }
     return res
 
 def process_kepco_day_data(day_list, target_meter_no):
@@ -1324,6 +1400,7 @@ def export_master_backup():
         if df[date_col].dt.tz is not None: df[date_col] = df[date_col].dt.tz_localize(None)
         xls_dict[main_sheet_name] = df
 
+        load_excel_dataset()
         yesterday_str = yesterday.strftime("%Y-%m-%d")
         asos_all = fetch_asos_daily("2023-01-01", yesterday_str)
         asos_rows = []
@@ -1361,6 +1438,8 @@ def export_master_backup():
         with open(file_path, "wb") as f:
             f.write(excel_bytes)
         backup_dataset_to_firebase(excel_bytes)
+        GLOBAL_API_CACHE["compare"].clear()
+        GLOBAL_API_CACHE["predict"].clear()
         load_excel_dataset()
 
         output.seek(0)
