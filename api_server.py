@@ -127,7 +127,7 @@ http_session.mount('https://', adapter)
 http_session.verify = False
 
 GLOBAL_KEPCO_CACHE = {}
-GLOBAL_KEPCO_TODAY_CACHE = {}  # 🌟 금일 한전 데이터 10분(600초) 캐싱용
+GLOBAL_KEPCO_TODAY_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
@@ -194,11 +194,12 @@ STATION_COORD_MAP = {
 }
 
 async def auto_cache_warmer():
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
+    is_first_run = True
     while True:
         try:
             logger.info("🔥 [상시 캐싱] 백그라운드에서 데이터를 미리 준비합니다...")
-            def warm_up():
+            def warm_up(first_flag):
                 now_kst = get_kst_now()
                 today_str = now_kst.strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
@@ -207,18 +208,27 @@ async def auto_cache_warmer():
                 target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
 
-                # 🌟 1단계: 프론트엔드 기본 접속 구간(최근 14일)을 먼저 빠르게 캐싱
+                # 🌟 1순위: 접속 시 가장 먼저 조회하는 '전체' 및 주요 노선의 최근 14일 데이터를 최우선 캐싱
+                if first_flag:
+                    for st in ['전체', '1호선', '2호선', '3호선', '종합청사']:
+                        get_dashboard_data(st, default_14d, today_str)
+                else:
+                    # 두 번째 주기부터는 오늘 날짜 한전/기상 데이터만 최신으로 강제 갱신
+                    get_kepco_data_for_station('전체', today_str, is_bypass=True)
+                    get_kepco_data_for_station('종합청사', today_str, is_bypass=True)
+
+                # 🌟 2순위: 전 역사 최근 14일 캐시 최신화 (cache_refresh=True로 만료 시간 연장)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, default_14d, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, default_14d, today_str)
                     for lat, lon in set(STATION_COORD_MAP.values()):
-                        weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str)
+                        weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str, not first_flag)
                 
                 for st in target_stations:
-                    get_dashboard_data(st, default_14d, today_str)
+                    get_dashboard_data(st, default_14d, today_str, bypass="refresh")
 
-                # 🌟 2단계: 9월 5일~오늘 전체 구간 마스터 캐싱 (이후 모든 기간 조회 시 Slicing에 사용됨)
+                # 🌟 3순위: 9월 5일~오늘 전체 구간 마스터 캐시 적재 (구간 Slicing용)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
@@ -227,15 +237,17 @@ async def auto_cache_warmer():
                         weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
                 
                 for st in target_stations:
-                    get_dashboard_data(st, api_start, today_str)
+                    get_dashboard_data(st, api_start, today_str, bypass="refresh")
                     
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, warm_up)
+            await loop.run_in_executor(None, warm_up, is_first_run)
+            is_first_run = False
             logger.info("✅ [상시 캐싱 완료] 데이터 100% 적재 완료. 임계치 감시 대기중.")
         except Exception as e:
             logger.error(f"상시 캐싱 중 오류 발생: {e}")
             
-        await asyncio.sleep(600)
+        # 🌟 캐시 유효시간(30분)이 만료되기 전에 8분(480초)마다 미리 백그라운드 갱신
+        await asyncio.sleep(480)
 
 @app.on_event("startup")
 async def startup_event():
@@ -420,7 +432,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (기온 보완 및 미세먼지)
+# 🌟 Open-Meteo 환경 데이터 (금일 데이터도 캐시에 보관하여 재조회 딜레이 제거)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -496,7 +508,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
             "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
         }
-        if d_str < today_str:
+        if d_str <= today_str and cached_res[d_str]["tmax"] != "--":
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
             GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
@@ -599,13 +611,13 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         cache_key = f"{c_no}_{date_str}"
         day_list = None
         
-        # 🌟 속도 개선: 과거 날짜는 영구 캐시, 오늘 날짜는 10분(600초) 캐시에서 즉시 반환
+        # 🌟 금일 캐시 유효시간을 30분(1800초)으로 유지 (백그라운드가 8분마다 갱신하므로 공백 없음)
         if not is_bypass:
             if date_str < today_str and cache_key in GLOBAL_KEPCO_CACHE:
                 day_list = GLOBAL_KEPCO_CACHE[cache_key]
             elif date_str == today_str and cache_key in GLOBAL_KEPCO_TODAY_CACHE:
                 c_time, c_data = GLOBAL_KEPCO_TODAY_CACHE[cache_key]
-                if time.time() - c_time < 600:
+                if time.time() - c_time < 1800:
                     day_list = c_data
 
         if day_list is None:
@@ -654,6 +666,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
 @app.get("/api/dashboard/{station}")
 def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"):
     is_bypass = bypass.lower() == "true"
+    is_bg_refresh = bypass.lower() == "refresh"
     cache_key = f"{station}_{start}_{end}"
     today_str = get_kst_now().strftime("%Y-%m-%d")
     master_key = f"{station}_2026-09-05_{today_str}"
@@ -662,10 +675,10 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     if is_bypass:
         GLOBAL_API_CACHE["dashboard"].pop(master_key, None)
 
-    # 1. 정확히 일치하는 기간 캐시가 있으면 즉시 반환
-    if not is_bypass and cache_key in GLOBAL_API_CACHE["dashboard"]:
+    # 1. 정확히 일치하는 기간 캐시가 있으면 즉시 반환 (유효시간 30분)
+    if not is_bypass and not is_bg_refresh and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
-        if end < today_str or (time.time() - c_time < 600):
+        if end < today_str or (time.time() - c_time < 1800):
             res_copy = dict(c_res)
             res_copy["is_cached"] = True
             return res_copy
@@ -674,10 +687,10 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     end_dt = datetime.strptime(end, "%Y-%m-%d")
     api_start_date = datetime.strptime("2026-09-05", "%Y-%m-%d")
 
-    # 🌟 2. 상시 캐싱된 전체 기간(2026-09-05~오늘) 데이터가 있으면 외부 호출 없이 즉시 잘라내어(Slicing) 반환
-    if not is_bypass and master_key in GLOBAL_API_CACHE["dashboard"] and end <= today_str:
+    # 2. 상시 캐싱된 전체 기간(2026-09-05~오늘) 데이터가 있으면 외부 호출 없이 즉시 잘라내어 반환
+    if not is_bypass and not is_bg_refresh and master_key in GLOBAL_API_CACHE["dashboard"] and end <= today_str:
         m_time, m_res = GLOBAL_API_CACHE["dashboard"][master_key]
-        if time.time() - m_time < 600:
+        if time.time() - m_time < 1800:
             eff_start = max(start_dt, api_start_date).strftime("%Y-%m-%d")
             eff_end = end_dt.strftime("%Y-%m-%d")
             sliced_records = [r for r in m_res.get("daily_records", []) if eff_start <= r["date"] <= eff_end]
