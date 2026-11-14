@@ -39,7 +39,7 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
-# 🌟 Vercel 서울(icn1) 리전 기상청 중계 서버 주소
+# 🌟 Vercel 서울(icn1) 리전 기상청 및 환경공단(에어코리아) 중계 서버 주소
 KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
 
 # =========================================================================
@@ -132,6 +132,7 @@ http_session.verify = False
 GLOBAL_KEPCO_CACHE = {}
 GLOBAL_KEPCO_TODAY_CACHE = {}
 GLOBAL_WEATHER_CACHE = {}
+GLOBAL_AIRKOREA_CACHE = {}  # 🌟 한국환경공단 측정소별 일별 PM2.5 캐시
 GLOBAL_EXCEL_CACHE = {"df": None, "mtime": 0}
 
 GLOBAL_API_CACHE = {
@@ -156,6 +157,27 @@ STATION_AWS_MAP = {
     '금락': '840',
     '문양기지': '992', '대실': '992',
     '칠곡기지': '845', '팔달시장': '845'
+}
+
+# 🌟 마스터 엑셀의 대구 26개 측정소 순서 (53열 양식 유지용)
+DAEGU_AIR_STATIONS = [
+    '수창동', '지산동', '서호동', '이현동', '대명동', '신암동', '태전동', '만촌동',
+    '호림동', '유가읍', '시지동', '진천동', '다사읍', '본동', '산격동', '화원읍',
+    '내당동', '침산동', '남산1동', '군위읍', '평리동', '이곡동', '충혼탑', '서변동',
+    '연호동', '용계동'
+]
+
+# 🌟 DTRO 개소별 한국환경공단 공식 측정소 매핑
+STATION_AIR_MAP = {
+    '전체': '수창동', '1호선': '수창동', '2호선': '수창동', '3호선': '수창동',
+    '종합청사': '본동',
+    '설화명곡': '화원읍', '월배기지': '진천동', '서부정류장': '본동',
+    '반월당': '수창동', '신천': '신암동', '방촌': '용계동',
+    '안심': '서호동', '숙천': '서호동', '금락': '서호동',
+    '문양기지': '다사읍', '대실': '다사읍', '성서산단': '호림동',
+    '죽전': '이곡동', '반고개': '내당동', '대구은행': '대명동',
+    '만촌': '만촌동', '수성알파시티': '연호동', '사월': '시지동', '영남대': '시지동',
+    '칠곡기지': '태전동', '팔달시장': '침산동', '남산': '남산1동', '범물기지': '지산동'
 }
 
 STATION_CUST_MAP = {
@@ -196,6 +218,18 @@ STATION_COORD_MAP = {
     '남산': (35.8600, 128.5830), '범물기지': (35.8150, 128.6450)
 }
 
+def get_pm25_grade_text(val):
+    if val is None or val == "--" or val == "-" or pd.isna(val):
+        return "점검중"
+    try:
+        v = int(round(float(val)))
+        if v <= 15: return "좋음"
+        elif v <= 35: return "보통"
+        elif v <= 75: return "나쁨"
+        else: return "매우나쁨"
+    except:
+        return "점검중"
+
 async def auto_cache_warmer():
     await asyncio.sleep(2)
     is_first_run = True
@@ -222,8 +256,8 @@ async def auto_cache_warmer():
                     weather_exec.submit(fetch_asos_daily, default_14d, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, default_14d, today_str)
-                    for lat, lon in set(STATION_COORD_MAP.values()):
-                        weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str, not first_flag)
+                    for air_stn in set(STATION_AIR_MAP.values()):
+                        weather_exec.submit(fetch_airkorea_station_daily, air_stn, default_14d, today_str, not first_flag)
                 
                 for st in target_stations:
                     get_dashboard_data(st, default_14d, today_str, bypass="refresh")
@@ -232,8 +266,8 @@ async def auto_cache_warmer():
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
                         weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, api_start, today_str)
-                    for lat, lon in set(STATION_COORD_MAP.values()):
-                        weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
+                    for air_stn in set(STATION_AIR_MAP.values()):
+                        weather_exec.submit(fetch_airkorea_station_daily, air_stn, api_start, today_str)
                 
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str, bypass="refresh")
@@ -310,14 +344,41 @@ def load_excel_dataset():
         for sheet in xls.sheet_names:
             if '초미세먼지' in sheet or '미세먼지' in sheet:
                 df_pm = pd.read_excel(xls, sheet_name=sheet)
-                df_pm = df_pm.iloc[1:].copy() 
                 pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
                 if pm_date_col:
-                    df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
-                    num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
-                    for c in num_cols: df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
-                    df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
-                    all_pm25.append(df_pm[['date', 'pm25_merged']])
+                    # 첫 행이 '등급/농도' 헤더인지 날짜인지 판별하여 날짜 행만 추출
+                    df_pm['parsed_date'] = pd.to_datetime(df_pm[pm_date_col], errors='coerce').dt.normalize()
+                    df_pm_valid = df_pm.dropna(subset=['parsed_date']).copy()
+                    
+                    # 🌟 26개 측정소별(짝수 열) 수치 캐싱 및 일별 대구 전체 평균 산출
+                    cols_list = list(df_pm_valid.columns)
+                    num_cols = []
+                    st_col_pairs = []
+                    for idx, col_name in enumerate(cols_list):
+                        if col_name in DAEGU_AIR_STATIONS and idx + 1 < len(cols_list):
+                            val_col = cols_list[idx + 1]
+                            num_cols.append(val_col)
+                            st_col_pairs.append((col_name, val_col))
+                            df_pm_valid[val_col] = pd.to_numeric(df_pm_valid[val_col], errors='coerce')
+                    
+                    if not num_cols:
+                        num_cols = [c for c in df_pm_valid.columns if 'Unnamed' in str(c)]
+                        for c in num_cols:
+                            df_pm_valid[c] = pd.to_numeric(df_pm_valid[c], errors='coerce')
+
+                    df_pm_valid['pm25_merged'] = df_pm_valid[num_cols].mean(axis=1)
+                    
+                    # 엑셀에 저장된 측정소별 PM2.5를 GLOBAL_AIRKOREA_CACHE에 미리 적재
+                    for _, r_row in df_pm_valid.iterrows():
+                        d_str = r_row['parsed_date'].strftime('%Y-%m-%d')
+                        if pd.notna(r_row['pm25_merged']):
+                            GLOBAL_AIRKOREA_CACHE[f"AIR_AVG_{d_str}"] = round(float(r_row['pm25_merged']), 1)
+                        for st_name, v_col in st_col_pairs:
+                            if pd.notna(r_row[v_col]):
+                                GLOBAL_AIRKOREA_CACHE[f"AIR_{st_name}_{d_str}"] = int(round(float(r_row[v_col])))
+
+                    df_pm_valid['date'] = df_pm_valid['parsed_date']
+                    all_pm25.append(df_pm_valid[['date', 'pm25_merged']])
             
             elif '기상청_ASOS' in sheet or 'ASOS' in sheet:
                 try:
@@ -348,6 +409,71 @@ def load_excel_dataset():
         return df_main.copy()
     except Exception: 
         return None
+
+# 🌟 한국환경공단(에어코리아) 공식 측정소별 일평균 초미세먼지(PM2.5) 조회
+def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, is_bypass: bool = False):
+    s_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    e_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    diff = (e_dt - s_dt).days + 1
+    today_str = get_kst_now().strftime("%Y-%m-%d")
+
+    res = {}
+    missing_dates = []
+    for i in range(diff):
+        d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+        ck = f"AIR_{air_stn}_{d_str}"
+        if not is_bypass and ck in GLOBAL_AIRKOREA_CACHE and GLOBAL_AIRKOREA_CACHE[ck] != "--":
+            res[d_str] = GLOBAL_AIRKOREA_CACHE[ck]
+        else:
+            missing_dates.append(d_str)
+
+    if not missing_dates:
+        return res
+
+    # 누락된 날짜가 오늘 하루뿐이면 DAILY, 한 달 이내면 MONTH, 그 이상이면 3MONTH로 요청
+    oldest_missing = min(missing_dates)
+    days_ago = (get_kst_now().replace(tzinfo=None) - datetime.strptime(oldest_missing, "%Y-%m-%d")).days
+    if days_ago <= 1:
+        data_term = "DAILY"
+        num_rows = 48
+    elif days_ago <= 30:
+        data_term = "MONTH"
+        num_rows = 750
+    else:
+        data_term = "3MONTH"
+        num_rows = 2200
+
+    url = f"{KMA_PROXY_URL}?type=air_station&stationName={air_stn}&dataTerm={data_term}&numOfRows={num_rows}&serviceKey={DATA_GO_KR_API_KEY}"
+    try:
+        r = requests.get(url, verify=False, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("response", {}).get("body", {}).get("items", [])
+            day_buckets = {}
+            for item in items:
+                dt_raw = str(item.get("dataTime", "")).strip()
+                val_raw = str(item.get("pm25Value", "")).strip()
+                if len(dt_raw) >= 10 and val_raw and val_raw != "-":
+                    try:
+                        fv = float(val_raw)
+                        d_key = dt_raw[:10]
+                        day_buckets.setdefault(d_key, []).append(fv)
+                    except:
+                        pass
+            for d_key, v_list in day_buckets.items():
+                if v_list:
+                    avg_v = int(round(sum(v_list) / len(v_list)))
+                    res[d_key] = avg_v
+                    if d_key < today_str:
+                        GLOBAL_AIRKOREA_CACHE[f"AIR_{air_stn}_{d_key}"] = avg_v
+    except Exception as e:
+        logger.warning(f"에어코리아 [{air_stn}] 조회 오류: {e}")
+
+    for d_str in missing_dates:
+        if d_str not in res:
+            res[d_str] = GLOBAL_AIRKOREA_CACHE.get(f"AIR_AVG_{d_str}", "--")
+
+    return res
 
 # 🌟 기상청 대표 관측소 (ASOS) - Vercel 서울(icn1) 중계 서버 경유
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
@@ -449,7 +575,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (금일 실시간 기온 및 초미세먼지)
+# 🌟 Open-Meteo 환경 데이터 (금일 실시간 기온 보완 및 에어코리아 점검 시 백업용)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -687,6 +813,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     today_str = get_kst_now().strftime("%Y-%m-%d")
     master_key = f"{station}_2026-09-05_{today_str}"
     aws_stn = STATION_AWS_MAP.get(station, '143')
+    air_stn = STATION_AIR_MAP.get(station, '수창동')
     
     if is_bypass:
         GLOBAL_API_CACHE["dashboard"].pop(master_key, None)
@@ -713,7 +840,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
             tot_c = sum(r["co2"] for r in sliced_records)
             sliced_res = {
                 "station_name": station,
-                "mapped_location": m_res.get("mapped_location", f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)"),
+                "mapped_location": m_res.get("mapped_location", f"{station} (기상청 AWS {aws_stn}번 · 환경공단 [{air_stn}] 측정소 연동)"),
                 "summary": { "total_usage": round(tot_u), "max_peak": round(max_p, 1), "total_co2": round(tot_c, 1) },
                 "daily_records": sliced_records,
                 "cached_at": m_res.get("cached_at", get_kst_now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -725,7 +852,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     if end_dt < api_start_date:
         res = {
             "station_name": station, 
-            "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
+            "mapped_location": f"{station} (기상청 AWS {aws_stn}번 · 환경공단 [{air_stn}] 측정소 연동)",
             "summary": { "total_usage": 0, "max_peak": 0, "total_co2": 0 },
             "daily_records": [],
             "cached_at": get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -740,13 +867,15 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     diff = (end_dt - start_dt).days + 1
     lat, lon = STATION_COORD_MAP.get(station, (35.8714, 128.6014))
 
-    with ThreadPoolExecutor(max_workers=3) as weather_exec:
+    with ThreadPoolExecutor(max_workers=4) as weather_exec:
         f_as = weather_exec.submit(fetch_asos_daily, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
         f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
+        f_ak = weather_exec.submit(fetch_airkorea_station_daily, air_stn, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
         f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), is_bypass)
         
     asos_data = f_as.result()
     aws_data = f_aw.result()
+    airkorea_data = f_ak.result()
     om_data = f_om.result()
     
     records = []
@@ -778,7 +907,10 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
             if tmin == "--": tmin = om_data.get(d_str, {}).get("tmin", "--")
             if humi == "--": humi = om_data.get(d_str, {}).get("humi", "--")
             
-        pm25 = om_data.get(d_str, {}).get("pm25", "--")
+        # 🌟 초미세먼지: 1순위 한국환경공단 공식 측정소 -> 결측 시 Open-Meteo 보완
+        pm25 = airkorea_data.get(d_str, "--")
+        if pm25 == "--":
+            pm25 = om_data.get(d_str, {}).get("pm25", "--")
 
         co2 = usage * 0.466 / 1000
         records.append({
@@ -791,7 +923,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
 
     res = {
         "station_name": station, 
-        "mapped_location": f"{station} (기상청 동네 AWS {aws_stn}번 매핑 완료 / 습도는 대표 ASOS 143 보완)",
+        "mapped_location": f"{station} (기상청 AWS {aws_stn}번 · 환경공단 [{air_stn}] 측정소 연동)",
         "summary": { "total_usage": round(tot_usage), "max_peak": round(max_peak, 1), "total_co2": round(tot_co2, 1) },
         "daily_records": records,
         "cached_at": get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1265,6 +1397,7 @@ def export_master_backup():
         df = df.dropna(subset=[date_col])
 
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_str = yesterday.strftime("%Y-%m-%d")
         
         start_check_date = pd.to_datetime("2026-09-05")
         existing_dates = set(df[date_col].tolist())
@@ -1336,10 +1469,54 @@ def export_master_backup():
         if df[date_col].dt.tz is not None: df[date_col] = df[date_col].dt.tz_localize(None)
         xls_dict[main_sheet_name] = df
 
-        # 🌟 '기상청_ASOS' 시트 기존 데이터 보존 + 서울 중계 서버를 통해 어제 날짜까지 누적
+        # 🌟 2. '2026년 초미세먼지' 시트 기존 53열 양식 그대로 누락일 자동 누적 백업
         load_excel_dataset()
-        yesterday_str = yesterday.strftime("%Y-%m-%d")
-        
+        pm_sheet_name = f"{yesterday.year}년 초미세먼지"
+        if pm_sheet_name in xls_dict:
+            df_pm_sheet = xls_dict[pm_sheet_name].copy()
+            df_pm_sheet['parsed_dt'] = pd.to_datetime(df_pm_sheet['일자'], errors='coerce').dt.normalize()
+            df_pm_sheet = df_pm_sheet.dropna(subset=['parsed_dt'])
+            
+            max_pm_dt = df_pm_sheet['parsed_dt'].max()
+            start_pm_dt = (max_pm_dt + timedelta(days=1)) if pd.notna(max_pm_dt) else pd.to_datetime(f"{yesterday.year}-01-01")
+            
+            if start_pm_dt <= yesterday:
+                s_pm_str = start_pm_dt.strftime("%Y-%m-%d")
+                
+                def fetch_one_air_station(st_name):
+                    return st_name, fetch_airkorea_station_daily(st_name, s_pm_str, yesterday_str, is_bypass=True)
+                
+                with ThreadPoolExecutor(max_workers=8) as air_exec:
+                    air_results = dict(air_exec.map(fetch_one_air_station, DAEGU_AIR_STATIONS))
+                
+                cols_list = [c for c in xls_dict[pm_sheet_name].columns if c != 'parsed_dt']
+                pm_new_rows = []
+                for dt_obj in pd.date_range(start_pm_dt, yesterday):
+                    d_s = dt_obj.strftime("%Y-%m-%d")
+                    row_dict = {'일자': d_s}
+                    for idx, st_name in enumerate(DAEGU_AIR_STATIONS):
+                        val_col = f"Unnamed: {2 * idx + 2}"
+                        # 실제 시트 컬럼명 매칭
+                        if 2 * idx + 2 < len(cols_list):
+                            val_col = cols_list[2 * idx + 2]
+                        v = air_results.get(st_name, {}).get(d_s, "--")
+                        if v == "--" or v is None or pd.isna(v):
+                            row_dict[st_name] = "점검중"
+                            row_dict[val_col] = "-"
+                        else:
+                            iv = int(round(float(v)))
+                            row_dict[st_name] = get_pm25_grade_text(iv)
+                            row_dict[val_col] = iv
+                    pm_new_rows.append(row_dict)
+                
+                if pm_new_rows:
+                    df_pm_clean = df_pm_sheet.drop(columns=['parsed_dt'])
+                    df_pm_clean['일자'] = pd.to_datetime(df_pm_clean['일자']).dt.strftime('%Y-%m-%d')
+                    df_pm_merged = pd.concat([df_pm_clean, pd.DataFrame(pm_new_rows)], ignore_index=True)
+                    df_pm_merged.drop_duplicates(subset=['일자'], keep='last', inplace=True)
+                    xls_dict[pm_sheet_name] = df_pm_merged
+
+        # 🌟 3. '기상청_ASOS' 시트 기존 데이터 보존 + 서울 중계 서버를 통해 어제 날짜까지 누적
         last_asos_date = "2023-01-01"
         if "기상청_ASOS" in xls_dict and not xls_dict["기상청_ASOS"].empty:
             df_existing_asos = xls_dict["기상청_ASOS"]
@@ -1376,25 +1553,19 @@ def export_master_backup():
                         
                 if '일자' in temp_df.columns:
                     temp_df = temp_df.dropna(subset=['일자'])
-                    if pd.api.types.is_datetime64_any_dtype(temp_df['일자']):
-                        temp_df['일자'] = temp_df['일자'].dt.strftime('%Y-%m-%d')
+                    temp_df['일자'] = pd.to_datetime(temp_df['일자'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    temp_df = temp_df.dropna(subset=['일자'])
                 
                 temp_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
         excel_bytes = output.getvalue()
 
-        # 1. 서버 로컬 엑셀 파일 즉시 덮어쓰기 (자동 업로드 효과)
         with open(file_path, "wb") as f:
             f.write(excel_bytes)
-            
-        # 2. Firebase 영구 저장소에 최신 백업본 자동 저장
         backup_dataset_to_firebase(excel_bytes)
         
-        # 🌟 3. 연도별 비교 및 AI 예측 결과 캐시 초기화 (백업 직후 재조회 시 최신 데이터 즉시 반영)
         GLOBAL_API_CACHE["compare"].clear()
         GLOBAL_API_CACHE["predict"].clear()
-        
-        # 4. 서버 메모리에 최신 엑셀 데이터셋 다시 로드
         load_excel_dataset()
 
         output.seek(0)
