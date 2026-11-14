@@ -39,6 +39,9 @@ DATA_GO_KR_API_KEY = "4480c93a63159f09aebc2d0aa5ec7cff37503e60d6297b500e6da8d91e
 KEPCO_API_KEY = "6lrb2gu8t5dzg3a3505s"
 KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
+# 🌟 Vercel 서울(icn1) 리전 기상청 중계 서버 주소
+KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
+
 # =========================================================================
 # 🚨 영구 저장소 (Firebase Realtime Database) 연동 설정
 # =========================================================================
@@ -208,16 +211,13 @@ async def auto_cache_warmer():
                 target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
 
-                # 1순위: 접속 시 가장 먼저 조회하는 '전체' 및 주요 노선의 최근 14일 데이터를 최우선 캐싱
                 if first_flag:
                     for st in ['전체', '1호선', '2호선', '3호선', '종합청사']:
                         get_dashboard_data(st, default_14d, today_str)
                 else:
-                    # 두 번째 주기부터는 오늘 날짜 한전 데이터를 최신으로 갱신
                     get_kepco_data_for_station('전체', today_str, is_bypass=True)
                     get_kepco_data_for_station('종합청사', today_str, is_bypass=True)
 
-                # 2순위: 전 역사 최근 14일 캐시 최신화
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, default_14d, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
@@ -228,7 +228,6 @@ async def auto_cache_warmer():
                 for st in target_stations:
                     get_dashboard_data(st, default_14d, today_str, bypass="refresh")
 
-                # 3순위: 9월 5일~오늘 전체 구간 마스터 캐시 적재 (구간 Slicing용)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
@@ -246,7 +245,6 @@ async def auto_cache_warmer():
         except Exception as e:
             logger.error(f"상시 캐싱 중 오류 발생: {e}")
             
-        # 8분(480초) 주기로 백그라운드 갱신 유지
         await asyncio.sleep(480)
 
 @app.on_event("startup")
@@ -351,7 +349,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS) - 최근 누락일 우선 조회 및 안전 파싱 적용
+# 🌟 기상청 대표 관측소 (ASOS) - Vercel 서울(icn1) 중계 서버 경유
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -381,21 +379,22 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     if not missing_dates: 
         return cached_res
 
-    # 과거(2023~2025년) 자체 결측일 때문에 4년 전체가 재호출되지 않도록 최근 60일 이내의 누락일만 API로 요청
     recent_cutoff = (yesterday - timedelta(days=60)).strftime("%Y-%m-%d")
     recent_missing = [d for d in missing_dates if d >= recent_cutoff]
     target_fetch_dates = recent_missing if recent_missing else missing_dates
 
     req_start = min(target_fetch_dates).replace("-", "")
     req_end = max(target_fetch_dates).replace("-", "")
-    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
+    
+    # 🌟 서울 중계 서버 URL 호출
+    url = f"{KMA_PROXY_URL}?type=asos&tm1={req_start}&tm2={req_end}&stn=143&authKey={KMA_API_HUB_KEY}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
     res = {}
     for _ in range(3):
         try:
             r = requests.get(url, headers=headers, verify=False, timeout=20)
-            r.encoding = 'EUC-KR'
+            r.encoding = 'utf-8'
             lines = r.text.split('\n')
             headers_list = []
             for line in lines:
@@ -437,7 +436,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
                             }
             if res: break
         except Exception as e:
-            logger.error(f"기상청 ASOS 호출 오류: {e}")
+            logger.error(f"기상청 ASOS 중계 호출 오류: {e}")
             time.sleep(0.5)
 
     for d_str in missing_dates:
@@ -451,7 +450,7 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (금일 데이터도 캐시에 보관하여 재조회 딜레이 제거)
+# 🌟 Open-Meteo 환경 데이터 (금일 실시간 기온 및 초미세먼지)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -535,7 +534,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS)
+# 🌟 기상청 방재 기상 관측장비 (AWS) - Vercel 서울(icn1) 중계 서버 경유
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -558,7 +557,8 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
             
-            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE:
+            # 🌟 정상 수치(--가 아닌 값)가 캐시되어 있을 때만 캐시 사용
+            if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[cache_key] != "--":
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
                 missing_tasks.append((d_str, tm2, obs, key, cache_key))
@@ -566,9 +566,10 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     if not missing_tasks: return res
 
     def fetch_single_element(d_str, tm2, obs, key, cache_key):
-        url = f"https://apihub.kma.go.kr/api/typ01/url/sfc_aws_day.php?tm2={tm2}&obs={obs}&stn={stn_id}&disp=0&help=0&authKey={KMA_API_HUB_KEY}"
+        url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn={stn_id}&authKey={KMA_API_HUB_KEY}"
         try:
-            r = http_session.get(url, headers=headers, timeout=2.5)
+            r = http_session.get(url, headers=headers, timeout=4.0)
+            r.encoding = 'utf-8'
             lines = r.text.split('\n')
             for line in lines:
                 if line.strip() and not line.startswith('#'):
@@ -579,7 +580,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                             if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = fv
                             return d_str, key, fv
         except: pass
-        if d_str < today_str: GLOBAL_WEATHER_CACHE[cache_key] = "--"
         return d_str, key, "--"
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -693,7 +693,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     if is_bypass:
         GLOBAL_API_CACHE["dashboard"].pop(master_key, None)
 
-    # 1. 정확히 일치하는 기간 캐시가 있으면 즉시 반환 (유효시간 30분)
     if not is_bypass and not is_bg_refresh and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
         if end < today_str or (time.time() - c_time < 1800):
@@ -705,7 +704,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     end_dt = datetime.strptime(end, "%Y-%m-%d")
     api_start_date = datetime.strptime("2026-09-05", "%Y-%m-%d")
 
-    # 2. 상시 캐싱된 전체 기간(2026-09-05~오늘) 데이터가 있으면 외부 호출 없이 즉시 잘라내어 반환
     if not is_bypass and not is_bg_refresh and master_key in GLOBAL_API_CACHE["dashboard"] and end <= today_str:
         m_time, m_res = GLOBAL_API_CACHE["dashboard"][master_key]
         if time.time() - m_time < 1800:
@@ -1340,7 +1338,7 @@ def export_master_backup():
         if df[date_col].dt.tz is not None: df[date_col] = df[date_col].dt.tz_localize(None)
         xls_dict[main_sheet_name] = df
 
-        # 🌟 '기상청_ASOS' 시트 기존 데이터 보존 + 마지막 날짜 이후~어제까지만 추가 수집
+        # 🌟 '기상청_ASOS' 시트 기존 데이터 보존 + 서울 중계 서버를 통해 어제 날짜까지 누적
         load_excel_dataset()
         yesterday_str = yesterday.strftime("%Y-%m-%d")
         
