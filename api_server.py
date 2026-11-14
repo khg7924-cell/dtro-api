@@ -128,15 +128,12 @@ def restore_aws_cache_from_firebase():
         bad_keys = {}
         for k, v in raw_dict.items():
             parts = k.split("_")
-            # 1) 습도(humi)가 0 이하(-9 등) 또는 100 초과로 잘못 저장된 항목 제거
             if k.endswith("_humi") and is_valid_value(v) and not is_valid_humi(v):
                 bad_keys[k] = None
                 continue
-            # 2) 기온이 유효 범위를 벗어난 항목 제거
             if (k.endswith("_tmax") or k.endswith("_tmin")) and is_valid_value(v) and not is_valid_temp(v):
                 bad_keys[k] = None
                 continue
-            # 3) 최근 3일 이내 날짜가 "--"로 저장된 경우 자동 재수집을 위해 제거
             if len(parts) >= 4 and parts[2] >= recent_cutoff and not is_valid_value(v):
                 bad_keys[k] = None
                 continue
@@ -190,7 +187,6 @@ def restore_airkorea_cache_from_firebase():
         bad_keys = {}
         for k, v in raw_dict.items():
             parts = k.split("_")
-            # 🌟 자정 직후 미집계로 인해 최근 3일 이내 날짜가 "--"로 저장된 항목은 제거하여 자동 재수집 유도
             if len(parts) >= 3 and parts[2] >= recent_cutoff and not is_valid_value(v):
                 bad_keys[k] = None
                 continue
@@ -375,13 +371,13 @@ async def auto_cache_warmer():
                 # 🌟 0단계: 금일 대구 전체 실시간 초미세먼지 단 1회 호출로 갱신
                 fetch_airkorea_sido_realtime(is_bypass=True)
 
-                # 🌟 1단계: 최근 14일 구간 캐싱 (기상청 동일 인증키 동시 호출 충돌 방지를 위해 ASOS -> AWS 순차 실행)
+                # 🌟 1단계: 최근 14일 구간 캐싱 (Open-Meteo는 오직 오늘 날짜만 조회)
                 fetch_asos_daily(default_14d, today_str)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     for air_stn in TARGET_AIR_STNS:
                         weather_exec.submit(fetch_airkorea_station_daily, air_stn, default_14d, today_str, False, False)
                     for lat, lon in set(STATION_COORD_MAP.values()):
-                        weather_exec.submit(fetch_openmeteo_env, lat, lon, default_14d, today_str)
+                        weather_exec.submit(fetch_openmeteo_env, lat, lon, today_str, today_str)
                 
                 with AIR_FETCH_LOCK:
                     if PENDING_AIR_UPDATES:
@@ -399,8 +395,6 @@ async def auto_cache_warmer():
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     for air_stn in TARGET_AIR_STNS:
                         weather_exec.submit(fetch_airkorea_station_daily, air_stn, api_start, today_str, False, False)
-                    for lat, lon in set(STATION_COORD_MAP.values()):
-                        weather_exec.submit(fetch_openmeteo_env, lat, lon, api_start, today_str)
                 
                 with AIR_FETCH_LOCK:
                     if PENDING_AIR_UPDATES:
@@ -410,7 +404,6 @@ async def auto_cache_warmer():
                 # 기상청 AWS 전체 과거 구간 단일 스레드 순차 수집 (10회마다 Firebase 자동 중간 저장)
                 fetch_aws_daily_for_dashboard('143', api_start, today_str, is_bypass=False, is_background=True)
 
-                # AWS 신규 수집분을 대시보드 마스터 캐시에 즉시 반영하기 위해 기존 대시보드 캐시 갱신
                 GLOBAL_API_CACHE["dashboard"].clear()
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str)
@@ -578,7 +571,6 @@ def load_excel_dataset():
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = float(r_row['tmin'])
                             if pd.notna(r_row.get('tavg')) and is_valid_temp(r_row.get('tavg')):
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = float(r_row['tavg'])
-                            # 🌟 엑셀 시트에 혹시 -9.0 등 음수 습도가 저장되어 있어도 걸러냄
                             if pd.notna(r_row.get('humi')) and is_valid_humi(r_row.get('humi')):
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = float(r_row['humi'])
                             else:
@@ -640,7 +632,6 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
     today_dt = get_kst_now().replace(tzinfo=None)
     today_str = today_dt.strftime("%Y-%m-%d")
     retention_cutoff_str = (today_dt - timedelta(days=85)).strftime("%Y-%m-%d")
-    # 🌟 자정 직후 미집계 대응: 최근 3일 이내 날짜는 유효한 숫자가 아니면 캐시를 건너뛰고 매번 재확인
     recent_3d_str = (today_dt - timedelta(days=3)).strftime("%Y-%m-%d")
     diff = (e_dt - s_dt).days + 1
 
@@ -757,7 +748,6 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         tmax_v = GLOBAL_WEATHER_CACHE.get(ck_tmax, "--")
         humi_v = GLOBAL_WEATHER_CACHE.get(ck_humi, "--")
         
-        # 🌟 최근 3일 이내 날짜는 기온뿐만 아니라 습도(humi)가 아직 미집계('--')이거나 잘못된 값이면 재수집
         is_fully_valid = is_valid_temp(tmax_v) and (is_valid_humi(humi_v) or d_str < recent_3d_str)
         if not is_bypass and is_fully_valid:
             cached_res[d_str] = {
@@ -838,41 +828,16 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
             
     return cached_res
 
-# 🌟 Open-Meteo 환경 데이터 (금일 기온 및 결측 보완용)
+# 🌟 Open-Meteo 환경 데이터 (오직 금일 기온·습도 표시 전용으로만 작동, 과거 날짜는 조회하지 않음)
 def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False):
-    s_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    diff = (e_dt - s_dt).days + 1
-    
-    missing_dates = []
-    cached_res = {}
-    for i in range(diff):
-        d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
-        ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
-        ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
-        ck_humi = f"OM_{lat}_{lon}_{d_str}_humi"
-        
-        if (not is_bypass and 
-            is_valid_value(GLOBAL_WEATHER_CACHE.get(ck_pm25)) and 
-            is_valid_temp(GLOBAL_WEATHER_CACHE.get(ck_tmax)) and 
-            is_valid_humi(GLOBAL_WEATHER_CACHE.get(ck_humi))):
-            cached_res[d_str] = {
-                "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
-                "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
-                "tmin": GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_tmin", "--"),
-                "humi": GLOBAL_WEATHER_CACHE[ck_humi]
-            }
-        else:
-            missing_dates.append(d_str)
-            
-    if not missing_dates: return cached_res
+    today_str = get_kst_now().strftime("%Y-%m-%d")
+    # 🌟 조회 종료일이 오늘보다 이전(과거 기간 조회)이면 Open-Meteo를 아예 호출하지 않음
+    if end_date < today_str:
+        return {}
 
-    req_start = min(missing_dates)
-    req_end = max(missing_dates)
-    
     env_data = {}
     url_a = "https://air-quality-api.open-meteo.com/v1/air-quality"
-    params_a = {"latitude": lat, "longitude": lon, "start_date": req_start, "end_date": req_end, "hourly": "pm2_5", "timezone": "Asia/Seoul"}
+    params_a = {"latitude": lat, "longitude": lon, "start_date": today_str, "end_date": today_str, "hourly": "pm2_5", "timezone": "Asia/Seoul"}
     try:
         r_a = http_session.get(url_a, params=params_a, timeout=4)
         if r_a.status_code == 200:
@@ -888,7 +853,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
     except: pass
 
     url_w = "https://api.open-meteo.com/v1/forecast"
-    params_w = {"latitude": lat, "longitude": lon, "start_date": req_start, "end_date": req_end, "daily": "temperature_2m_max,temperature_2m_min", "hourly": "relative_humidity_2m", "timezone": "Asia/Seoul"}
+    params_w = {"latitude": lat, "longitude": lon, "start_date": today_str, "end_date": today_str, "daily": "temperature_2m_max,temperature_2m_min", "hourly": "relative_humidity_2m", "timezone": "Asia/Seoul"}
     try:
         r_w = http_session.get(url_w, params=params_w, timeout=4)
         if r_w.status_code == 200:
@@ -911,28 +876,22 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
                 if t in humi_dict: env_data[t]["humi"] = round(sum(humi_dict[t])/len(humi_dict[t]), 1)
     except: pass
 
-    today_str = get_kst_now().strftime("%Y-%m-%d")
-    for d_str in missing_dates:
-        v = env_data.get(d_str, {})
-        cached_res[d_str] = {
-            "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
-            "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
+    v = env_data.get(today_str, {})
+    return {
+        today_str: {
+            "pm25": v.get("pm25", "--"),
+            "tmax": v.get("tmax", "--"),
+            "tmin": v.get("tmin", "--"),
+            "humi": v.get("humi", "--")
         }
-        if d_str < today_str:
-            if is_valid_value(cached_res[d_str]["pm25"]):
-                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
-            if is_valid_temp(cached_res[d_str]["tmax"]):
-                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
-            if is_valid_temp(cached_res[d_str]["tmin"]):
-                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
-            if is_valid_humi(cached_res[d_str]["humi"]):
-                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_humi"] = cached_res[d_str]["humi"]
-            
-    return cached_res
+    }
 
 # 🌟 기상청 방재 기상 관측장비 (AWS) - 단일 스레드 0.7초 순차 호출 + 10회마다 Firebase 중간 저장 (습도는 ASOS 전담)
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False, is_background: bool = False):
     global KMA_AWS_COOLDOWN_UNTIL
+    if is_bypass:
+        KMA_AWS_COOLDOWN_UNTIL = 0.0
+
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     now_kst = get_kst_now().replace(tzinfo=None)
@@ -945,7 +904,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     today_str = now_kst.strftime("%Y-%m-%d")
     recent_3d_str = (now_kst - timedelta(days=3)).strftime("%Y-%m-%d")
 
-    # 🌟 일반 웹 조회(is_background=False, is_bypass=False)는 기상청 호출을 기다리지 않고 즉시 메모리 캐시를 반환하여 화면 멈춤 방지
     if (is_background or is_bypass) and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
         with AWS_FETCH_LOCK:
             missing_tasks = []
@@ -953,7 +911,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                 curr = s_dt + timedelta(days=i)
                 d_str = curr.strftime("%Y-%m-%d")
                 tm2 = curr.strftime("%Y%m%d")
-                # 🌟 습도(humi)는 대표 ASOS(143번)에서 가져오므로 AWS는 최고/최저기온 2개만 호출 (호출량 1/3 절감)
                 for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin")]:
                     cache_key = f"AWS_{stn_id}_{d_str}_{key}"
                     cached_v = GLOBAL_WEATHER_CACHE.get(cache_key)
@@ -965,7 +922,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                 consecutive_failures = 0
                 quota_failed = False
 
-                # 🌟 멀티스레드 동시 호출을 제거하고 1개씩 순차 호출(0.7초 간격)하여 기상청 방화벽 차단 원천 방지
                 for idx, (d_str, tm2, obs, key) in enumerate(missing_tasks):
                     if quota_failed:
                         break
@@ -1018,7 +974,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                         if attempt == 0:
                             time.sleep(1.2)
 
-                    # 🌟 10회 호출(80건)마다 Firebase에 중간 병합 저장
                     if len(newly_aws_updated) >= 80:
                         save_aws_cache_to_firebase(dict(newly_aws_updated))
                         newly_aws_updated.clear()
@@ -1034,7 +989,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
 
                 if quota_failed:
                     KMA_AWS_COOLDOWN_UNTIL = time.time() + 600
-                    logger.warning("⚠️ 기상청 AWS 연속 3회 응답 없음 - 10분간 추가 AWS 호출을 일시 중단하고 ASOS/Open-Meteo로 대체합니다.")
+                    logger.warning("⚠️ 기상청 AWS 연속 3회 응답 없음 - 10분간 추가 AWS 호출을 일시 중단하고 ASOS로 대체합니다.")
 
     res = {}
     for i in range(diff):
@@ -1043,7 +998,7 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         res[d_str] = {
             "tmax": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmax", "--"),
             "tmin": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmin", "--"),
-            "humi": "--"  # 습도는 대구 대표 ASOS(143번)에서 자동 보완됨
+            "humi": "--"
         }
     return res
 
@@ -1236,17 +1191,22 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
         if not is_valid_temp(tmin): tmin = asos_data.get(d_str, {}).get("tmin", "--")
         if not is_valid_humi(humi): humi = asos_data.get(d_str, {}).get("humi", "--")
         
-        # 🌟 기온은 나왔지만 습도만 아직 미집계('--')인 날에도 Open-Meteo 습도로 즉시 보완
-        if not is_valid_temp(tmax): tmax = om_data.get(d_str, {}).get("tmax", "--")
-        if not is_valid_temp(tmin): tmin = om_data.get(d_str, {}).get("tmin", "--")
-        if not is_valid_humi(humi): humi = om_data.get(d_str, {}).get("humi", "--")
+        # 🌟 오늘 날짜(d_str >= today_str)만 Open-Meteo를 사용하고, 어제 이전 과거 날짜는 미집계 시 무조건 '--' 표시
+        if d_str >= today_str:
+            if not is_valid_temp(tmax): tmax = om_data.get(d_str, {}).get("tmax", "--")
+            if not is_valid_temp(tmin): tmin = om_data.get(d_str, {}).get("tmin", "--")
+            if not is_valid_humi(humi): humi = om_data.get(d_str, {}).get("humi", "--")
+        else:
+            if not is_valid_temp(tmax): tmax = "--"
+            if not is_valid_temp(tmin): tmin = "--"
+            if not is_valid_humi(humi): humi = "--"
             
-        # 🌟 초미세먼지: 1순위 환경공단 해당 측정소 -> 2순위 환경공단 대구 대표(수창동) -> 3순위 Open-Meteo
+        # 🌟 초미세먼지: 과거 날짜는 환경공단(해당 측정소 -> 수창동) 공식 통계만 사용하고 미집계 시 '--' 표시
         pm25 = airkorea_data.get(d_str, "--")
         if not is_valid_value(pm25):
             pm25 = GLOBAL_AIRKOREA_CACHE.get(f"AIR_수창동_{d_str}", "--")
         if not is_valid_value(pm25):
-            pm25 = om_data.get(d_str, {}).get("pm25", "--")
+            pm25 = om_data.get(d_str, {}).get("pm25", "--") if d_str >= today_str else "--"
 
         co2 = usage * 0.466 / 1000
         records.append({
