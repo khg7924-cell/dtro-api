@@ -208,16 +208,16 @@ async def auto_cache_warmer():
                 target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
                                   LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
 
-                # 🌟 1순위: 접속 시 가장 먼저 조회하는 '전체' 및 주요 노선의 최근 14일 데이터를 최우선 캐싱
+                # 1순위: 접속 시 가장 먼저 조회하는 '전체' 및 주요 노선의 최근 14일 데이터를 최우선 캐싱
                 if first_flag:
                     for st in ['전체', '1호선', '2호선', '3호선', '종합청사']:
                         get_dashboard_data(st, default_14d, today_str)
                 else:
-                    # 두 번째 주기부터는 오늘 날짜 한전/기상 데이터만 최신으로 강제 갱신
+                    # 두 번째 주기부터는 오늘 날짜 한전 데이터를 최신으로 갱신
                     get_kepco_data_for_station('전체', today_str, is_bypass=True)
                     get_kepco_data_for_station('종합청사', today_str, is_bypass=True)
 
-                # 🌟 2순위: 전 역사 최근 14일 캐시 최신화 (cache_refresh=True로 만료 시간 연장)
+                # 2순위: 전 역사 최근 14일 캐시 최신화
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, default_14d, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
@@ -228,7 +228,7 @@ async def auto_cache_warmer():
                 for st in target_stations:
                     get_dashboard_data(st, default_14d, today_str, bypass="refresh")
 
-                # 🌟 3순위: 9월 5일~오늘 전체 구간 마스터 캐시 적재 (구간 Slicing용)
+                # 3순위: 9월 5일~오늘 전체 구간 마스터 캐시 적재 (구간 Slicing용)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
                     weather_exec.submit(fetch_asos_daily, api_start, today_str)
                     for aws_stn in set(STATION_AWS_MAP.values()):
@@ -246,7 +246,7 @@ async def auto_cache_warmer():
         except Exception as e:
             logger.error(f"상시 캐싱 중 오류 발생: {e}")
             
-        # 🌟 캐시 유효시간(30분)이 만료되기 전에 8분(480초)마다 미리 백그라운드 갱신
+        # 8분(480초) 주기로 백그라운드 갱신 유지
         await asyncio.sleep(480)
 
 @app.on_event("startup")
@@ -351,7 +351,7 @@ def load_excel_dataset():
     except Exception: 
         return None
 
-# 🌟 기상청 대표 관측소 (ASOS)
+# 🌟 기상청 대표 관측소 (ASOS) - 최근 누락일 우선 조회 및 안전 파싱 적용
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -381,45 +381,64 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     if not missing_dates: 
         return cached_res
 
-    req_start = min(missing_dates).replace("-", "")
-    req_end = max(missing_dates).replace("-", "")
+    # 과거(2023~2025년) 자체 결측일 때문에 4년 전체가 재호출되지 않도록 최근 60일 이내의 누락일만 API로 요청
+    recent_cutoff = (yesterday - timedelta(days=60)).strftime("%Y-%m-%d")
+    recent_missing = [d for d in missing_dates if d >= recent_cutoff]
+    target_fetch_dates = recent_missing if recent_missing else missing_dates
+
+    req_start = min(target_fetch_dates).replace("-", "")
+    req_end = max(target_fetch_dates).replace("-", "")
     url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php?tm1={req_start}&tm2={req_end}&stn=143&help=1&authKey={KMA_API_HUB_KEY}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
     res = {}
-    for _ in range(2):
+    for _ in range(3):
         try:
-            r = http_session.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=headers, verify=False, timeout=20)
             r.encoding = 'EUC-KR'
             lines = r.text.split('\n')
             headers_list = []
             for line in lines:
                 if line.startswith('#') and ':' in line and '.' in line:
                     left_side = line.split(':')[0].strip()
-                    if left_side.replace('#', '').strip()[0].isdigit():
+                    cleaned = left_side.replace('#', '').strip()
+                    if cleaned and cleaned[0].isdigit():
                         col_name = left_side.split('.')[1].strip().split()[0]
                         if col_name not in headers_list: headers_list.append(col_name)
-                elif line.strip() and not line.startswith('#') and headers_list:
+                elif line.strip() and not line.startswith('#'):
                     parts = line.split()
-                    if len(parts) >= len(headers_list) - 5 and len(parts) >= 10:
-                        row_dict = dict(zip(headers_list, parts))
-                        date_key = row_dict.get('TM')
-                        if date_key and len(date_key) >= 8:
+                    if len(parts) >= 15:
+                        def parse_val(v):
+                            if not v: return "--"
+                            try:
+                                fv = float(v)
+                                return fv if fv > -50.0 else "--"
+                            except: return "--"
+                        
+                        if headers_list and len(parts) >= len(headers_list) - 5:
+                            row_dict = dict(zip(headers_list, parts))
+                            date_key = row_dict.get('TM')
+                            if date_key and len(date_key) >= 8:
+                                d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                                res[d_str] = {
+                                    "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                    "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                    "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                    "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                }
+                        elif len(parts[0]) == 8 and parts[0].isdigit():
+                            date_key = parts[0]
                             d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                            def parse_val(v):
-                                if not v: return "--"
-                                try:
-                                    fv = float(v)
-                                    return fv if fv > -50.0 else "--"
-                                except: return "--"
                             res[d_str] = {
-                                "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                "tavg": parse_val(parts[10]),
+                                "tmax": parse_val(parts[11]),
+                                "tmin": parse_val(parts[13]),
+                                "humi": parse_val(parts[18]) if len(parts) > 18 else "--"
                             }
             if res: break
-        except: time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"기상청 ASOS 호출 오류: {e}")
+            time.sleep(0.5)
 
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
@@ -611,7 +630,6 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         cache_key = f"{c_no}_{date_str}"
         day_list = None
         
-        # 🌟 금일 캐시 유효시간을 30분(1800초)으로 유지 (백그라운드가 8분마다 갱신하므로 공백 없음)
         if not is_bypass:
             if date_str < today_str and cache_key in GLOBAL_KEPCO_CACHE:
                 day_list = GLOBAL_KEPCO_CACHE[cache_key]
@@ -1322,16 +1340,29 @@ def export_master_backup():
         if df[date_col].dt.tz is not None: df[date_col] = df[date_col].dt.tz_localize(None)
         xls_dict[main_sheet_name] = df
 
+        # 🌟 '기상청_ASOS' 시트 기존 데이터 보존 + 마지막 날짜 이후~어제까지만 추가 수집
+        load_excel_dataset()
         yesterday_str = yesterday.strftime("%Y-%m-%d")
-        asos_all = fetch_asos_daily("2023-01-01", yesterday_str)
+        
+        last_asos_date = "2023-01-01"
+        if "기상청_ASOS" in xls_dict and not xls_dict["기상청_ASOS"].empty:
+            df_existing_asos = xls_dict["기상청_ASOS"]
+            d_col_asos = 'date' if 'date' in df_existing_asos.columns else '일자'
+            if d_col_asos in df_existing_asos.columns:
+                max_d = pd.to_datetime(df_existing_asos[d_col_asos]).max()
+                if pd.notna(max_d):
+                    last_asos_date = (max_d + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        if last_asos_date <= yesterday_str:
+            fetch_asos_daily(last_asos_date, yesterday_str, is_bypass=True)
+
         asos_rows = []
         for dt_obj in pd.date_range("2023-01-01", yesterday_str):
             d_s = dt_obj.strftime("%Y-%m-%d")
-            v = asos_all.get(d_s, {})
-            tx = v.get("tmax", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tmax", "--"))
-            tn = v.get("tmin", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tmin", "--"))
-            ta = v.get("tavg", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tavg", "--"))
-            hm = v.get("humi", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_humi", "--"))
+            tx = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tmax", "--")
+            tn = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tmin", "--")
+            ta = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tavg", "--")
+            hm = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_humi", "--")
             if tx != "--":
                 asos_rows.append({"date": d_s, "tmax": tx, "tmin": tn, "tavg": ta, "humi": hm})
         
