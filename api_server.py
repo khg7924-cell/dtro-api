@@ -566,7 +566,6 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     today_dt = get_kst_now().replace(tzinfo=None)
     today_str = today_dt.strftime("%Y-%m-%d")
-    # 🌟 환경공단 API는 최근 3개월(약 90일)까지만 제공하므로, 85일 이전 과거 날짜는 강제 갱신 시에도 기존 캐시를 절대 지우지 않고 보호
     retention_cutoff_str = (today_dt - timedelta(days=85)).strftime("%Y-%m-%d")
     diff = (e_dt - s_dt).days + 1
 
@@ -584,11 +583,9 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
             ck = f"AIR_{air_stn}_{d_str}"
             if ck in GLOBAL_AIRKOREA_CACHE:
                 res[d_str] = GLOBAL_AIRKOREA_CACHE[ck]
-                # 강제 갱신(is_bypass)이더라도 최근 85일 이내 날짜만 API 재확인 대상에 포함
                 if is_bypass and d_str >= retention_cutoff_str:
                     missing_past_dates.append(d_str)
             else:
-                # 캐시에 없는 날짜라도 최근 85일 이내(환경공단 조회 가능 기간)일 때만 API 호출
                 if d_str >= retention_cutoff_str:
                     missing_past_dates.append(d_str)
                 else:
@@ -633,14 +630,12 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
                 new_val = fetched_dates.get(d_str)
 
                 if new_val is not None:
-                    # 새로운 유효 숫자가 수신된 경우에만 업데이트
                     res[d_str] = new_val
                     if d_str < today_str and old_val != new_val:
                         GLOBAL_AIRKOREA_CACHE[ck] = new_val
                         newly_updated[ck] = new_val
                         PENDING_AIR_UPDATES[ck] = new_val
                 else:
-                    # 🌟 핵심 보호 로직: API에서 값이 안 왔더라도 기존에 유효 숫자가 저장되어 있으면 절대 "--"로 덮어쓰지 않음!
                     if is_valid_value(old_val):
                         res[d_str] = old_val
                     else:
@@ -841,7 +836,7 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 및 Firebase 누적 병합(PATCH) 캐싱
+# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 + 0.25초 간격 조절 + Firebase 누적 병합(PATCH)
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     global KMA_AWS_COOLDOWN_UNTIL
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -867,63 +862,87 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
 
         if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
             newly_aws_updated = {}
+            consecutive_failures = 0
             quota_failed = False
 
             def fetch_all_stations_element(d_str, tm2, obs, key):
-                nonlocal quota_failed
+                nonlocal consecutive_failures, quota_failed
                 if quota_failed:
                     return
                 url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn=0&authKey={KMA_API_HUB_KEY}"
-                try:
-                    r = http_session.get(url, headers=headers, timeout=5.0)
-                    r.encoding = 'utf-8'
-                    lines = r.text.split('\n')
-                    valid_line_count = 0
-                    found_vals = {}
-                    for line in lines:
-                        s_line = line.strip()
-                        if s_line and not s_line.startswith('#'):
-                            parts = s_line.split()
-                            if len(parts) >= 6 and parts[0].isdigit() and len(parts[0]) == 8:
-                                valid_line_count += 1
-                                s_id = parts[1]
-                                if s_id in TARGET_AWS_STNS:
-                                    try:
-                                        fv = float(parts[5])
-                                        if fv > -50.0:
-                                            found_vals[s_id] = fv
-                                    except:
-                                        pass
-                    if valid_line_count >= 10:
-                        if d_str < today_str:
-                            for s_id in TARGET_AWS_STNS:
-                                ck = f"AWS_{s_id}_{d_str}_{key}"
-                                old_val = GLOBAL_WEATHER_CACHE.get(ck)
-                                new_val = found_vals.get(s_id)
-                                if new_val is not None:
-                                    GLOBAL_WEATHER_CACHE[ck] = new_val
-                                    newly_aws_updated[ck] = new_val
-                                elif not is_valid_value(old_val):
-                                    # 🌟 기존에 유효한 실측 숫자가 있으면 절대 "--"로 덮어쓰지 않음
-                                    GLOBAL_WEATHER_CACHE[ck] = "--"
-                                    newly_aws_updated[ck] = "--"
-                    else:
+                success_on_try = False
+
+                # 🌟 일시적인 통신 지연을 대비해 최대 2회 시도
+                for attempt in range(2):
+                    try:
+                        r = http_session.get(url, headers=headers, timeout=6.0)
+                        r.encoding = 'utf-8'
+                        lines = r.text.split('\n')
+                        valid_line_count = 0
+                        found_vals = {}
+                        for line in lines:
+                            s_line = line.strip()
+                            if s_line and not s_line.startswith('#'):
+                                parts = s_line.split()
+                                if len(parts) >= 6 and parts[0].isdigit() and len(parts[0]) == 8:
+                                    valid_line_count += 1
+                                    s_id = parts[1]
+                                    if s_id in TARGET_AWS_STNS:
+                                        try:
+                                            fv = float(parts[5])
+                                            if fv > -50.0:
+                                                found_vals[s_id] = fv
+                                        except:
+                                            pass
+                        if valid_line_count >= 10:
+                            success_on_try = True
+                            consecutive_failures = 0
+                            if d_str < today_str:
+                                for s_id in TARGET_AWS_STNS:
+                                    ck = f"AWS_{s_id}_{d_str}_{key}"
+                                    old_val = GLOBAL_WEATHER_CACHE.get(ck)
+                                    new_val = found_vals.get(s_id)
+                                    if new_val is not None:
+                                        GLOBAL_WEATHER_CACHE[ck] = new_val
+                                        newly_aws_updated[ck] = new_val
+                                    elif not is_valid_value(old_val):
+                                        GLOBAL_WEATHER_CACHE[ck] = "--"
+                                        newly_aws_updated[ck] = "--"
+                            break
+                    except Exception:
+                        pass
+                    if attempt == 0:
+                        time.sleep(0.5)
+
+                if not success_on_try:
+                    consecutive_failures += 1
+                    # 🌟 연속 3회 이상 실패할 때만 일일 한도 초과로 판단하여 쿨다운 진입
+                    if consecutive_failures >= 3:
                         quota_failed = True
-                except Exception:
-                    pass
 
             first_task = missing_tasks[0]
             fetch_all_stations_element(*first_task)
 
-            if quota_failed:
-                KMA_AWS_COOLDOWN_UNTIL = time.time() + 600
-                logger.warning("⚠️ 기상청 AWS 응답 없음(일일 한도 초과 등) - 10분간 추가 AWS 호출을 일시 중단하고 ASOS/Open-Meteo로 대체합니다.")
-            elif len(missing_tasks) > 1:
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    list(executor.map(lambda t: fetch_all_stations_element(*t), missing_tasks[1:]))
+            if consecutive_failures >= 1 and len(missing_tasks) == 1:
+                quota_failed = True
+
+            if not quota_failed and len(missing_tasks) > 1:
+                # 🌟 기상청 허브가 동시 과다 접속으로 차단하지 않도록 0.25초 간격 조절 및 워커 2개로 제한
+                def throttled_fetch(t):
+                    if quota_failed:
+                        return
+                    time.sleep(0.25)
+                    fetch_all_stations_element(*t)
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    list(executor.map(throttled_fetch, missing_tasks[1:]))
 
             if newly_aws_updated:
                 save_aws_cache_to_firebase(newly_aws_updated)
+
+            if quota_failed:
+                KMA_AWS_COOLDOWN_UNTIL = time.time() + 600
+                logger.warning("⚠️ 기상청 AWS 연속 응답 없음(일일 한도 초과 등) - 10분간 추가 AWS 호출을 일시 중단하고 ASOS/Open-Meteo로 대체합니다.")
 
     res = {}
     for i in range(diff):
