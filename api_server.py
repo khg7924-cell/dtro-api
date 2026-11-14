@@ -386,7 +386,6 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     req_start = min(target_fetch_dates).replace("-", "")
     req_end = max(target_fetch_dates).replace("-", "")
     
-    # 🌟 서울 중계 서버 URL 호출
     url = f"{KMA_PROXY_URL}?type=asos&tm1={req_start}&tm2={req_end}&stn=143&authKey={KMA_API_HUB_KEY}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
     
@@ -557,7 +556,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
         for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
             cache_key = f"AWS_{stn_id}_{d_str}_{key}"
             
-            # 🌟 정상 수치(--가 아닌 값)가 캐시되어 있을 때만 캐시 사용
             if not is_bypass and cache_key in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[cache_key] != "--":
                 res[d_str][key] = GLOBAL_WEATHER_CACHE[cache_key]
             else:
@@ -1385,9 +1383,18 @@ def export_master_backup():
             
         excel_bytes = output.getvalue()
 
+        # 1. 서버 로컬 엑셀 파일 즉시 덮어쓰기 (자동 업로드 효과)
         with open(file_path, "wb") as f:
             f.write(excel_bytes)
+            
+        # 2. Firebase 영구 저장소에 최신 백업본 자동 저장
         backup_dataset_to_firebase(excel_bytes)
+        
+        # 🌟 3. 연도별 비교 및 AI 예측 결과 캐시 초기화 (백업 직후 재조회 시 최신 데이터 즉시 반영)
+        GLOBAL_API_CACHE["compare"].clear()
+        GLOBAL_API_CACHE["predict"].clear()
+        
+        # 4. 서버 메모리에 최신 엑셀 데이터셋 다시 로드
         load_excel_dataset()
 
         output.seek(0)
