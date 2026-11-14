@@ -44,12 +44,31 @@ KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
 
 # =========================================================================
-# 🚨 영구 저장소 (Firebase Realtime Database) 연동 설정
+# 🚨 영구 저장소 (Firebase Realtime Database) 연동 및 데이터 검증 함수
 # =========================================================================
 FIREBASE_DB_URL = "https://datacenter-app-7a69a-default-rtdb.firebaseio.com"
 
 def is_valid_value(val):
     return val is not None and val not in ["--", "-", "", "None", "null"]
+
+def is_valid_temp(val):
+    if not is_valid_value(val):
+        return False
+    try:
+        fv = float(val)
+        return -45.0 < fv < 60.0
+    except Exception:
+        return False
+
+def is_valid_humi(val):
+    if not is_valid_value(val):
+        return False
+    try:
+        fv = float(val)
+        # 🌟 상대습도는 0% 초과 ~ 100% 이하일 때만 유효값으로 인정 (기상청 결측 코드 -9.0 원천 차단)
+        return 0.0 < fv <= 100.0
+    except Exception:
+        return False
 
 def backup_dataset_to_firebase(file_bytes):
     if "여기에_파이어베이스" in FIREBASE_DB_URL:
@@ -87,28 +106,50 @@ def restore_thresholds_from_firebase():
     except Exception:
         pass
 
-# 🌟 1. 기상청 동네 AWS 과거 데이터 Firebase 병합 저장(PATCH) 및 복구 (과거 데이터 삭제 원천 방지)
+# 🌟 1. 기상청 동네 AWS 과거 데이터 Firebase 병합 저장(PATCH) 및 오류 캐시 자동 정화 복구
 def save_aws_cache_to_firebase(new_items: dict = None):
     if "여기에_파이어베이스" in FIREBASE_DB_URL: return
     try:
         aws_all = {k: v for k, v in GLOBAL_WEATHER_CACHE.items() if k.startswith("AWS_")}
-        if not aws_all: return
+        if not aws_all and not new_items: return
         with open("aws_cache.json", "w", encoding="utf-8") as f:
             json.dump(aws_all, f, ensure_ascii=False)
         payload = new_items if new_items else aws_all
-        # 🌟 PUT 대신 PATCH를 사용하여 Firebase의 기존 과거 데이터를 지우지 않고 새 데이터만 누적 병합
         requests.patch(f"{FIREBASE_DB_URL}/aws_weather_cache.json", json=payload, timeout=10)
         logger.info(f"✅ 기상청 AWS 캐시 Firebase 누적 병합(PATCH) 완료 (신규/갱신 {len(payload)}건, 총 {len(aws_all)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase AWS 캐시 저장 실패: {e}")
 
 def restore_aws_cache_from_firebase():
+    recent_cutoff = (get_kst_now().replace(tzinfo=None) - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    def split_clean_and_bad_aws(raw_dict):
+        cleaned = {}
+        bad_keys = {}
+        for k, v in raw_dict.items():
+            parts = k.split("_")
+            # 1) 습도(humi)가 0 이하(-9 등) 또는 100 초과로 잘못 저장된 항목 제거
+            if k.endswith("_humi") and is_valid_value(v) and not is_valid_humi(v):
+                bad_keys[k] = None
+                continue
+            # 2) 기온이 유효 범위를 벗어난 항목 제거
+            if (k.endswith("_tmax") or k.endswith("_tmin")) and is_valid_value(v) and not is_valid_temp(v):
+                bad_keys[k] = None
+                continue
+            # 3) 최근 3일 이내 날짜가 "--"로 저장된 경우 자동 재수집을 위해 제거
+            if len(parts) >= 4 and parts[2] >= recent_cutoff and not is_valid_value(v):
+                bad_keys[k] = None
+                continue
+            cleaned[k] = v
+        return cleaned, bad_keys
+
     if os.path.exists("aws_cache.json"):
         try:
             with open("aws_cache.json", "r", encoding="utf-8") as f:
                 local_aws = json.load(f)
                 if isinstance(local_aws, dict):
-                    GLOBAL_WEATHER_CACHE.update(local_aws)
+                    cleaned_local, _ = split_clean_and_bad_aws(local_aws)
+                    GLOBAL_WEATHER_CACHE.update(cleaned_local)
         except Exception:
             pass
     if "여기에_파이어베이스" in FIREBASE_DB_URL: return
@@ -117,34 +158,52 @@ def restore_aws_cache_from_firebase():
         if res.status_code == 200 and res.json():
             fb_aws = res.json()
             if isinstance(fb_aws, dict):
-                GLOBAL_WEATHER_CACHE.update(fb_aws)
+                cleaned_fb, bad_fb_keys = split_clean_and_bad_aws(fb_aws)
+                GLOBAL_WEATHER_CACHE.update(cleaned_fb)
                 with open("aws_cache.json", "w", encoding="utf-8") as f:
-                    json.dump(fb_aws, f, ensure_ascii=False)
-                logger.info(f"✅ 서버 시작됨 - Firebase에서 기상청 AWS 캐시 복구 완료 ({len(fb_aws)}건)")
+                    json.dump(cleaned_fb, f, ensure_ascii=False)
+                if bad_fb_keys:
+                    requests.patch(f"{FIREBASE_DB_URL}/aws_weather_cache.json", json=bad_fb_keys, timeout=10)
+                    logger.info(f"🧹 Firebase AWS 오류 캐시({len(bad_fb_keys)}건: -9% 습도 및 최근 결측) 자동 삭제 완료")
+                logger.info(f"✅ 서버 시작됨 - Firebase에서 기상청 AWS 캐시 복구 완료 ({len(cleaned_fb)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase AWS 캐시 복구 실패: {e}")
 
-# 🌟 2. 환경공단(에어코리아) 과거 일평균 초미세먼지 Firebase 병합 저장(PATCH) 및 복구 (3개월 이후에도 영구 보존)
+# 🌟 2. 환경공단(에어코리아) 과거 일평균 초미세먼지 Firebase 병합 저장(PATCH) 및 오류 캐시 자동 정화 복구
 def save_airkorea_cache_to_firebase(new_items: dict = None):
     if "여기에_파이어베이스" in FIREBASE_DB_URL: return
     try:
-        if not GLOBAL_AIRKOREA_CACHE: return
+        if not GLOBAL_AIRKOREA_CACHE and not new_items: return
         with open("airkorea_cache.json", "w", encoding="utf-8") as f:
             json.dump(GLOBAL_AIRKOREA_CACHE, f, ensure_ascii=False)
         payload = new_items if new_items else GLOBAL_AIRKOREA_CACHE
-        # 🌟 PUT 대신 PATCH를 사용하여 3개월이 지난 과거 데이터도 절대 지워지지 않고 영구 보존됨
         requests.patch(f"{FIREBASE_DB_URL}/airkorea_cache.json", json=payload, timeout=10)
         logger.info(f"✅ 환경공단 초미세먼지 캐시 Firebase 누적 병합(PATCH) 완료 (신규/갱신 {len(payload)}건, 총 {len(GLOBAL_AIRKOREA_CACHE)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase 환경공단 캐시 저장 실패: {e}")
 
 def restore_airkorea_cache_from_firebase():
+    recent_cutoff = (get_kst_now().replace(tzinfo=None) - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    def split_clean_and_bad_air(raw_dict):
+        cleaned = {}
+        bad_keys = {}
+        for k, v in raw_dict.items():
+            parts = k.split("_")
+            # 🌟 자정 직후 미집계로 인해 최근 3일 이내 날짜가 "--"로 저장된 항목은 제거하여 자동 재수집 유도
+            if len(parts) >= 3 and parts[2] >= recent_cutoff and not is_valid_value(v):
+                bad_keys[k] = None
+                continue
+            cleaned[k] = v
+        return cleaned, bad_keys
+
     if os.path.exists("airkorea_cache.json"):
         try:
             with open("airkorea_cache.json", "r", encoding="utf-8") as f:
                 local_air = json.load(f)
                 if isinstance(local_air, dict):
-                    GLOBAL_AIRKOREA_CACHE.update(local_air)
+                    cleaned_local, _ = split_clean_and_bad_air(local_air)
+                    GLOBAL_AIRKOREA_CACHE.update(cleaned_local)
         except Exception:
             pass
     if "여기에_파이어베이스" in FIREBASE_DB_URL: return
@@ -153,10 +212,14 @@ def restore_airkorea_cache_from_firebase():
         if res.status_code == 200 and res.json():
             fb_air = res.json()
             if isinstance(fb_air, dict):
-                GLOBAL_AIRKOREA_CACHE.update(fb_air)
+                cleaned_air, bad_air_keys = split_clean_and_bad_air(fb_air)
+                GLOBAL_AIRKOREA_CACHE.update(cleaned_air)
                 with open("airkorea_cache.json", "w", encoding="utf-8") as f:
-                    json.dump(fb_air, f, ensure_ascii=False)
-                logger.info(f"✅ 서버 시작됨 - Firebase에서 환경공단 초미세먼지 캐시 복구 완료 ({len(fb_air)}건)")
+                    json.dump(cleaned_air, f, ensure_ascii=False)
+                if bad_air_keys:
+                    requests.patch(f"{FIREBASE_DB_URL}/airkorea_cache.json", json=bad_air_keys, timeout=10)
+                    logger.info(f"🧹 Firebase 환경공단 최근 3일 미집계('--') 캐시({len(bad_air_keys)}건) 자동 삭제 완료 (재수집 대기)")
+                logger.info(f"✅ 서버 시작됨 - Firebase에서 환경공단 초미세먼지 캐시 복구 완료 ({len(cleaned_air)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase 환경공단 캐시 복구 실패: {e}")
 
@@ -358,8 +421,8 @@ async def auto_cache_warmer():
 async def startup_event():
     restore_dataset_from_firebase()     
     restore_thresholds_from_firebase()  
-    restore_aws_cache_from_firebase()      # 🌟 서버 시작 시 Firebase에서 과거 AWS 기상 캐시 복구
-    restore_airkorea_cache_from_firebase() # 🌟 서버 시작 시 Firebase에서 과거 환경공단 미세먼지 캐시 복구
+    restore_aws_cache_from_firebase()      # 🌟 서버 시작 시 Firebase에서 과거 AWS 기상 캐시 복구 및 오류값 정화
+    restore_airkorea_cache_from_firebase() # 🌟 서버 시작 시 Firebase에서 과거 환경공단 미세먼지 캐시 복구 및 미집계 정화
     
     load_excel_dataset()
     load_thresholds()
@@ -503,14 +566,17 @@ def load_excel_dataset():
                         d_val = r_row.get('date') or r_row.get('일자')
                         if pd.notna(d_val):
                             d_str = pd.to_datetime(d_val).strftime('%Y-%m-%d')
-                            if pd.notna(r_row.get('tmax')) and str(r_row.get('tmax')) != '--':
+                            if pd.notna(r_row.get('tmax')) and is_valid_temp(r_row.get('tmax')):
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = float(r_row['tmax'])
-                            if pd.notna(r_row.get('tmin')) and str(r_row.get('tmin')) != '--':
+                            if pd.notna(r_row.get('tmin')) and is_valid_temp(r_row.get('tmin')):
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = float(r_row['tmin'])
-                            if pd.notna(r_row.get('tavg')) and str(r_row.get('tavg')) != '--':
+                            if pd.notna(r_row.get('tavg')) and is_valid_temp(r_row.get('tavg')):
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = float(r_row['tavg'])
-                            if pd.notna(r_row.get('humi')) and str(r_row.get('humi')) != '--':
+                            # 🌟 엑셀 시트에 혹시 -9.0 등 음수 습도가 저장되어 있어도 걸러냄
+                            if pd.notna(r_row.get('humi')) and is_valid_humi(r_row.get('humi')):
                                 GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = float(r_row['humi'])
+                            else:
+                                GLOBAL_WEATHER_CACHE.pop(f"ASOS_{d_str}_humi", None)
                     logger.info("✅ 엑셀 '기상청_ASOS' 시트에서 과거 기상 데이터 캐시 로드 완료")
                 except Exception as e:
                     logger.warning(f"기상청_ASOS 시트 로드 중 오류: {e}")
@@ -546,8 +612,9 @@ def fetch_airkorea_sido_realtime(is_bypass: bool = False):
                 if st_name and val_raw and val_raw not in ["-", "--", "None", "null"]:
                     try:
                         iv = int(round(float(val_raw)))
-                        rt_map[st_name] = iv
-                        valid_vals.append(iv)
+                        if iv >= 0:
+                            rt_map[st_name] = iv
+                            valid_vals.append(iv)
                     except:
                         pass
             if valid_vals:
@@ -560,13 +627,15 @@ def fetch_airkorea_sido_realtime(is_bypass: bool = False):
 
     return GLOBAL_AIRKOREA_REALTIME_CACHE["data"]
 
-# 🌟 [환경공단 2] 측정소별 공식 일평균 초미세먼지 조회 (3개월 지난 과거 데이터 영구 보호 적용)
+# 🌟 [환경공단 2] 측정소별 공식 일평균 초미세먼지 조회 (3개월 지난 데이터 보호 + 최근 3일 '--' 자동 재수집)
 def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, is_bypass: bool = False, save_immediately: bool = True):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
     today_dt = get_kst_now().replace(tzinfo=None)
     today_str = today_dt.strftime("%Y-%m-%d")
     retention_cutoff_str = (today_dt - timedelta(days=85)).strftime("%Y-%m-%d")
+    # 🌟 자정 직후 미집계 대응: 최근 3일 이내 날짜는 유효한 숫자가 아니면 캐시를 건너뛰고 매번 재확인
+    recent_3d_str = (today_dt - timedelta(days=3)).strftime("%Y-%m-%d")
     diff = (e_dt - s_dt).days + 1
 
     res = {}
@@ -581,8 +650,10 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
             res[d_str] = v if v is not None else "--"
         else:
             ck = f"AIR_{air_stn}_{d_str}"
-            if ck in GLOBAL_AIRKOREA_CACHE:
-                res[d_str] = GLOBAL_AIRKOREA_CACHE[ck]
+            cached_v = GLOBAL_AIRKOREA_CACHE.get(ck)
+            # 유효한 숫자가 들어있거나, 3일이 지난 과거 날짜만 캐시된 값을 그대로 인정
+            if ck in GLOBAL_AIRKOREA_CACHE and (is_valid_value(cached_v) or d_str < recent_3d_str):
+                res[d_str] = cached_v
                 if is_bypass and d_str >= retention_cutoff_str:
                     missing_past_dates.append(d_str)
             else:
@@ -615,7 +686,9 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
                     val_raw = str(item.get("pm25Value", "")).strip()
                     if len(d_key) == 10 and val_raw and val_raw not in ["-", "--", "None", "null"]:
                         try:
-                            fetched_dates[d_key] = int(round(float(val_raw)))
+                            iv = int(round(float(val_raw)))
+                            if iv >= 0:
+                                fetched_dates[d_key] = iv
                         except:
                             pass
     except Exception as e:
@@ -640,7 +713,8 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
                         res[d_str] = old_val
                     else:
                         res[d_str] = "--"
-                        if d_str < today_str and ck not in GLOBAL_AIRKOREA_CACHE:
+                        # 🌟 최근 3일 이내 날짜는 자정 직후 미집계일 수 있으므로 "--"를 영구 캐시에 저장하지 않음
+                        if d_str < recent_3d_str and ck not in GLOBAL_AIRKOREA_CACHE:
                             GLOBAL_AIRKOREA_CACHE[ck] = "--"
                             newly_updated[ck] = "--"
                             PENDING_AIR_UPDATES[ck] = "--"
@@ -655,29 +729,37 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
 
     return res
 
-# 🌟 기상청 대표 관측소 (ASOS) - Vercel 서울(icn1) 중계 서버 경유
+# 🌟 기상청 대표 관측소 (ASOS) - Vercel 서울(icn1) 중계 서버 경유 (습도 -9.0 결측 코드 필터링 적용)
 def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    yesterday = get_kst_now() - timedelta(days=1)
-    if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
+    now_kst = get_kst_now().replace(tzinfo=None)
+    yesterday = now_kst - timedelta(days=1)
+    if e_dt > yesterday: e_dt = yesterday
     if s_dt > e_dt: return {}
 
     diff = (e_dt - s_dt).days + 1
-    today_str = get_kst_now().strftime("%Y-%m-%d")
+    today_str = now_kst.strftime("%Y-%m-%d")
+    recent_3d_str = (now_kst - timedelta(days=3)).strftime("%Y-%m-%d")
     
     missing_dates = []
     cached_res = {}
     for i in range(diff):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_tmax = f"ASOS_{d_str}_tmax"
+        ck_humi = f"ASOS_{d_str}_humi"
         
-        if not is_bypass and ck_tmax in GLOBAL_WEATHER_CACHE and GLOBAL_WEATHER_CACHE[ck_tmax] != "--":
+        tmax_v = GLOBAL_WEATHER_CACHE.get(ck_tmax, "--")
+        humi_v = GLOBAL_WEATHER_CACHE.get(ck_humi, "--")
+        
+        # 🌟 최근 3일 이내 날짜는 기온뿐만 아니라 습도(humi)가 아직 미집계('--')이거나 잘못된 값이면 재수집
+        is_fully_valid = is_valid_temp(tmax_v) and (is_valid_humi(humi_v) or d_str < recent_3d_str)
+        if not is_bypass and is_fully_valid:
             cached_res[d_str] = {
-                "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
+                "tmax": tmax_v,
                 "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
                 "tavg": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", "--"),
-                "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
+                "humi": humi_v if is_valid_humi(humi_v) else "--"
             }
         else:
             missing_dates.append(d_str)
@@ -707,47 +789,46 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
                 elif line.strip() and not line.startswith('#'):
                     parts = line.split()
                     if len(parts) >= 15:
-                        def parse_val(v):
-                            if not v: return "--"
-                            try:
-                                fv = float(v)
-                                return fv if fv > -50.0 else "--"
-                            except: return "--"
-                        if len(parts[0]) == 8 and parts[0].isdigit():
-                            date_key = parts[0]
-                            d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-                            res[d_str] = {
-                                "tavg": parse_val(parts[10]),
-                                "tmax": parse_val(parts[11]),
-                                "tmin": parse_val(parts[13]),
-                                "humi": parse_val(parts[18]) if len(parts) > 18 else "--"
-                            }
-                        elif headers_list and len(parts) >= len(headers_list) - 5:
+                        def parse_temp(v):
+                            return float(v) if is_valid_temp(v) else "--"
+                        def parse_humi(v):
+                            return float(v) if is_valid_humi(v) else "--"
+
+                        if headers_list and len(parts) >= len(headers_list) - 5:
                             row_dict = dict(zip(headers_list, parts))
                             date_key = row_dict.get('TM')
                             if date_key and len(date_key) >= 8:
                                 d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
                                 res[d_str] = {
-                                    "tmax": parse_val(row_dict.get('TA_MAX') or row_dict.get('TX')),
-                                    "tmin": parse_val(row_dict.get('TA_MIN') or row_dict.get('TN')),
-                                    "tavg": parse_val(row_dict.get('TA_AVG') or row_dict.get('TA')),
-                                    "humi": parse_val(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                    "tmax": parse_temp(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                    "tmin": parse_temp(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                    "tavg": parse_temp(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                    "humi": parse_humi(row_dict.get('HM_AVG') or row_dict.get('HM'))
                                 }
+                        elif len(parts[0]) == 8 and parts[0].isdigit():
+                            date_key = parts[0]
+                            d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                            res[d_str] = {
+                                "tavg": parse_temp(parts[10]),
+                                "tmax": parse_temp(parts[11]),
+                                "tmin": parse_temp(parts[13]),
+                                "humi": parse_humi(parts[18]) if len(parts) > 18 else "--"
+                            }
             if res: break
         except: time.sleep(0.5)
 
     for d_str in missing_dates:
         v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
-        if d_str < today_str and v["tmax"] != "--":
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
-            GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v["humi"]
+        if d_str < today_str:
+            if is_valid_temp(v["tmax"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
+            if is_valid_temp(v["tmin"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
+            if is_valid_temp(v["tavg"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
+            if is_valid_humi(v["humi"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v["humi"]
         cached_res[d_str] = {
             "tmax": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", v["tmax"]),
             "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", v["tmin"]),
             "tavg": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", v["tavg"]),
-            "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", v["humi"])
+            "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", v["humi"] if is_valid_humi(v["humi"]) else "--")
         }
             
     return cached_res
@@ -764,13 +845,17 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         ck_pm25 = f"OM_{lat}_{lon}_{d_str}_pm25"
         ck_tmax = f"OM_{lat}_{lon}_{d_str}_tmax"
+        ck_humi = f"OM_{lat}_{lon}_{d_str}_humi"
         
-        if not is_bypass and ck_pm25 in GLOBAL_WEATHER_CACHE and ck_tmax in GLOBAL_WEATHER_CACHE:
+        if (not is_bypass and 
+            is_valid_value(GLOBAL_WEATHER_CACHE.get(ck_pm25)) and 
+            is_valid_temp(GLOBAL_WEATHER_CACHE.get(ck_tmax)) and 
+            is_valid_humi(GLOBAL_WEATHER_CACHE.get(ck_humi))):
             cached_res[d_str] = {
                 "pm25": GLOBAL_WEATHER_CACHE[ck_pm25],
                 "tmax": GLOBAL_WEATHER_CACHE[ck_tmax],
                 "tmin": GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_tmin", "--"),
-                "humi": GLOBAL_WEATHER_CACHE.get(f"OM_{lat}_{lon}_{d_str}_humi", "--")
+                "humi": GLOBAL_WEATHER_CACHE[ck_humi]
             }
         else:
             missing_dates.append(d_str)
@@ -828,26 +913,32 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             "pm25": v.get("pm25", "--"), "tmax": v.get("tmax", "--"), 
             "tmin": v.get("tmin", "--"), "humi": v.get("humi", "--")
         }
-        if d_str < today_str and cached_res[d_str]["tmax"] != "--":
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
-            GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_humi"] = cached_res[d_str]["humi"]
+        if d_str < today_str:
+            if is_valid_value(cached_res[d_str]["pm25"]):
+                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_pm25"] = cached_res[d_str]["pm25"]
+            if is_valid_temp(cached_res[d_str]["tmax"]):
+                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmax"] = cached_res[d_str]["tmax"]
+            if is_valid_temp(cached_res[d_str]["tmin"]):
+                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_tmin"] = cached_res[d_str]["tmin"]
+            if is_valid_humi(cached_res[d_str]["humi"]):
+                GLOBAL_WEATHER_CACHE[f"OM_{lat}_{lon}_{d_str}_humi"] = cached_res[d_str]["humi"]
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 + 0.25초 간격 조절 + Firebase 누적 병합(PATCH)
+# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 + 0.25초 간격 조절 + 습도 -9% 필터링 + 최근 3일 '--' 자동 재수집
 def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
     global KMA_AWS_COOLDOWN_UNTIL
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    yesterday = get_kst_now() - timedelta(days=1)
-    if e_dt > yesterday.replace(tzinfo=None): e_dt = yesterday.replace(tzinfo=None)
+    now_kst = get_kst_now().replace(tzinfo=None)
+    yesterday = now_kst - timedelta(days=1)
+    if e_dt > yesterday: e_dt = yesterday
     if s_dt > e_dt: return {} 
 
     diff = (e_dt - s_dt).days + 1
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
-    today_str = get_kst_now().strftime("%Y-%m-%d")
+    today_str = now_kst.strftime("%Y-%m-%d")
+    recent_3d_str = (now_kst - timedelta(days=3)).strftime("%Y-%m-%d")
 
     with AWS_FETCH_LOCK:
         missing_tasks = []
@@ -857,7 +948,9 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
             tm2 = curr.strftime("%Y%m%d")
             for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
                 cache_key = f"AWS_{stn_id}_{d_str}_{key}"
-                if is_bypass or cache_key not in GLOBAL_WEATHER_CACHE:
+                cached_v = GLOBAL_WEATHER_CACHE.get(cache_key)
+                # 🌟 최근 3일 이내 날짜가 '--'이거나 캐시에 없으면 재수집 대상에 추가
+                if is_bypass or cache_key not in GLOBAL_WEATHER_CACHE or (d_str >= recent_3d_str and not is_valid_value(cached_v)):
                     missing_tasks.append((d_str, tm2, obs, key))
 
         if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
@@ -872,7 +965,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                 url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn=0&authKey={KMA_API_HUB_KEY}"
                 success_on_try = False
 
-                # 🌟 일시적인 통신 지연을 대비해 최대 2회 시도
                 for attempt in range(2):
                     try:
                         r = http_session.get(url, headers=headers, timeout=6.0)
@@ -890,8 +982,13 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                                     if s_id in TARGET_AWS_STNS:
                                         try:
                                             fv = float(parts[5])
-                                            if fv > -50.0:
-                                                found_vals[s_id] = fv
+                                            # 🌟 습도(humi)는 0 < fv <= 100, 기온은 -45 < fv < 60 일 때만 유효값으로 저장 (-9.0 차단)
+                                            if key == "humi":
+                                                if is_valid_humi(fv):
+                                                    found_vals[s_id] = fv
+                                            else:
+                                                if is_valid_temp(fv):
+                                                    found_vals[s_id] = fv
                                         except:
                                             pass
                         if valid_line_count >= 10:
@@ -905,7 +1002,8 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                                     if new_val is not None:
                                         GLOBAL_WEATHER_CACHE[ck] = new_val
                                         newly_aws_updated[ck] = new_val
-                                    elif not is_valid_value(old_val):
+                                    elif not is_valid_value(old_val) and d_str < recent_3d_str:
+                                        # 🌟 최근 3일 이내 날짜는 미집계일 수 있으므로 "--"를 영구 캐시에 박제하지 않음
                                         GLOBAL_WEATHER_CACHE[ck] = "--"
                                         newly_aws_updated[ck] = "--"
                             break
@@ -916,7 +1014,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
 
                 if not success_on_try:
                     consecutive_failures += 1
-                    # 🌟 연속 3회 이상 실패할 때만 일일 한도 초과로 판단하여 쿨다운 진입
                     if consecutive_failures >= 3:
                         quota_failed = True
 
@@ -927,7 +1024,6 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                 quota_failed = True
 
             if not quota_failed and len(missing_tasks) > 1:
-                # 🌟 기상청 허브가 동시 과다 접속으로 차단하지 않도록 0.25초 간격 조절 및 워커 2개로 제한
                 def throttled_fetch(t):
                     if quota_failed:
                         return
@@ -948,10 +1044,11 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     for i in range(diff):
         curr = s_dt + timedelta(days=i)
         d_str = curr.strftime("%Y-%m-%d")
+        h_val = GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_humi", "--")
         res[d_str] = {
             "tmax": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmax", "--"),
             "tmin": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmin", "--"),
-            "humi": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_humi", "--")
+            "humi": h_val if is_valid_humi(h_val) else "--"
         }
     return res
 
@@ -1058,7 +1155,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     if is_bypass:
         GLOBAL_API_CACHE["dashboard"].pop(master_key, None)
 
-    # 1. 정확히 일치하는 기간 캐시가 있으면 즉시 반환
     if not is_bypass and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
         if end < today_str or (time.time() - c_time < 600):
@@ -1070,7 +1166,6 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     end_dt = datetime.strptime(end, "%Y-%m-%d")
     api_start_date = datetime.strptime("2026-09-05", "%Y-%m-%d")
 
-    # 🌟 2. 상시 캐싱된 전체 기간(2026-09-05~오늘) 데이터가 있으면 외부 호출 없이 즉시 잘라내어(Slicing) 반환
     if not is_bypass and master_key in GLOBAL_API_CACHE["dashboard"] and end <= today_str:
         m_time, m_res = GLOBAL_API_CACHE["dashboard"][master_key]
         if time.time() - m_time < 600:
@@ -1142,19 +1237,20 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
         tmin = aws_data.get(d_str, {}).get("tmin", "--")
         humi = aws_data.get(d_str, {}).get("humi", "--")
         
-        if tmax == "--": tmax = asos_data.get(d_str, {}).get("tmax", "--")
-        if tmin == "--": tmin = asos_data.get(d_str, {}).get("tmin", "--")
-        if humi == "--": humi = asos_data.get(d_str, {}).get("humi", "--")
+        if not is_valid_temp(tmax): tmax = asos_data.get(d_str, {}).get("tmax", "--")
+        if not is_valid_temp(tmin): tmin = asos_data.get(d_str, {}).get("tmin", "--")
+        if not is_valid_humi(humi): humi = asos_data.get(d_str, {}).get("humi", "--")
         
-        if d_str >= today_str or (tmax == "--" and tmin == "--"):
-            if tmax == "--": tmax = om_data.get(d_str, {}).get("tmax", "--")
-            if tmin == "--": tmin = om_data.get(d_str, {}).get("tmin", "--")
-            if humi == "--": humi = om_data.get(d_str, {}).get("humi", "--")
+        # 🌟 기온은 나왔지만 습도만 아직 미집계('--')인 날에도 Open-Meteo 습도로 즉시 보완
+        if not is_valid_temp(tmax): tmax = om_data.get(d_str, {}).get("tmax", "--")
+        if not is_valid_temp(tmin): tmin = om_data.get(d_str, {}).get("tmin", "--")
+        if not is_valid_humi(humi): humi = om_data.get(d_str, {}).get("humi", "--")
             
+        # 🌟 초미세먼지: 1순위 환경공단 해당 측정소 -> 2순위 환경공단 대구 대표(수창동) -> 3순위 Open-Meteo
         pm25 = airkorea_data.get(d_str, "--")
-        if pm25 == "--":
+        if not is_valid_value(pm25):
             pm25 = GLOBAL_AIRKOREA_CACHE.get(f"AIR_수창동_{d_str}", "--")
-        if pm25 == "--":
+        if not is_valid_value(pm25):
             pm25 = om_data.get(d_str, {}).get("pm25", "--")
 
         co2 = usage * 0.466 / 1000
@@ -1285,14 +1381,14 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                         continue
                     tmax = v.get("tmax", "--")
                     tmin = v.get("tmin", "--")
-                    if tmax != "--":
+                    if is_valid_temp(tmax):
                         try:
                             tmax_f = float(tmax)
                             if tmax_f >= 33.0: hw += 1
                             if m in [6, 7, 8]:
                                 summer_tmax_sum += tmax_f; summer_tmax_cnt += 1
                         except: pass
-                    if tmin != "--":
+                    if is_valid_temp(tmin):
                         try:
                             tmin_f = float(tmin)
                             if tmin_f <= -10.0: cw += 1
@@ -1428,10 +1524,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
-        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if asos_data.get(x, {}).get('tmax') != "--" else np.nan)
-        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if asos_data.get(x, {}).get('tmin') != "--" else np.nan)
-        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if asos_data.get(x, {}).get('tavg') != "--" else np.nan)
-        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if asos_data.get(x, {}).get('humi') != "--" else np.nan)
+        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if is_valid_temp(asos_data.get(x, {}).get('tmax')) else np.nan)
+        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if is_valid_temp(asos_data.get(x, {}).get('tmin')) else np.nan)
+        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if is_valid_temp(asos_data.get(x, {}).get('tavg')) else np.nan)
+        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if is_valid_humi(asos_data.get(x, {}).get('humi')) else np.nan)
         df['passengers'] = df[pass_col]
 
         if 'pm25_val' in df.columns:
@@ -1724,8 +1820,14 @@ def export_master_backup():
             tn = v.get("tmin", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tmin", "--"))
             ta = v.get("tavg", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tavg", "--"))
             hm = v.get("humi", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_humi", "--"))
-            if tx != "--":
-                asos_rows.append({"date": d_s, "tmax": tx, "tmin": tn, "tavg": ta, "humi": hm})
+            if is_valid_temp(tx):
+                asos_rows.append({
+                    "date": d_s,
+                    "tmax": tx,
+                    "tmin": tn if is_valid_temp(tn) else "--",
+                    "tavg": ta if is_valid_temp(ta) else "--",
+                    "humi": hm if is_valid_humi(hm) else "--"
+                })
         
         if asos_rows:
             xls_dict["기상청_ASOS"] = pd.DataFrame(asos_rows)
