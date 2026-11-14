@@ -375,10 +375,9 @@ async def auto_cache_warmer():
                 # 🌟 0단계: 금일 대구 전체 실시간 초미세먼지 단 1회 호출로 갱신
                 fetch_airkorea_sido_realtime(is_bypass=True)
 
-                # 🌟 1단계: 프론트엔드 기본 접속 구간(최근 14일)을 먼저 빠르게 캐싱
+                # 🌟 1단계: 최근 14일 구간 캐싱 (기상청 동일 인증키 동시 호출 충돌 방지를 위해 ASOS -> AWS 순차 실행)
+                fetch_asos_daily(default_14d, today_str)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
-                    weather_exec.submit(fetch_asos_daily, default_14d, today_str)
-                    weather_exec.submit(fetch_aws_daily_for_dashboard, '143', default_14d, today_str)
                     for air_stn in TARGET_AIR_STNS:
                         weather_exec.submit(fetch_airkorea_station_daily, air_stn, default_14d, today_str, False, False)
                     for lat, lon in set(STATION_COORD_MAP.values()):
@@ -389,13 +388,15 @@ async def auto_cache_warmer():
                         save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
                         PENDING_AIR_UPDATES.clear()
 
+                # 기상청 AWS 최근 14일 단일 스레드 순차 수집
+                fetch_aws_daily_for_dashboard('143', default_14d, today_str, is_bypass=False, is_background=True)
+
                 for st in target_stations:
                     get_dashboard_data(st, default_14d, today_str)
 
-                # 🌟 2단계: 9월 5일~오늘 전체 구간 마스터 캐싱 (이후 모든 기간 조회 시 Slicing에 사용됨)
+                # 🌟 2단계: 9월 5일~오늘 전체 구간 마스터 캐싱
+                fetch_asos_daily(api_start, today_str)
                 with ThreadPoolExecutor(max_workers=5) as weather_exec:
-                    weather_exec.submit(fetch_asos_daily, api_start, today_str)
-                    weather_exec.submit(fetch_aws_daily_for_dashboard, '143', api_start, today_str)
                     for air_stn in TARGET_AIR_STNS:
                         weather_exec.submit(fetch_airkorea_station_daily, air_stn, api_start, today_str, False, False)
                     for lat, lon in set(STATION_COORD_MAP.values()):
@@ -406,6 +407,11 @@ async def auto_cache_warmer():
                         save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
                         PENDING_AIR_UPDATES.clear()
 
+                # 기상청 AWS 전체 과거 구간 단일 스레드 순차 수집 (10회마다 Firebase 자동 중간 저장)
+                fetch_aws_daily_for_dashboard('143', api_start, today_str, is_bypass=False, is_background=True)
+
+                # AWS 신규 수집분을 대시보드 마스터 캐시에 즉시 반영하기 위해 기존 대시보드 캐시 갱신
+                GLOBAL_API_CACHE["dashboard"].clear()
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str)
                     
@@ -651,7 +657,6 @@ def fetch_airkorea_station_daily(air_stn: str, start_date: str, end_date: str, i
         else:
             ck = f"AIR_{air_stn}_{d_str}"
             cached_v = GLOBAL_AIRKOREA_CACHE.get(ck)
-            # 유효한 숫자가 들어있거나, 3일이 지난 과거 날짜만 캐시된 값을 그대로 인정
             if ck in GLOBAL_AIRKOREA_CACHE and (is_valid_value(cached_v) or d_str < recent_3d_str):
                 res[d_str] = cached_v
                 if is_bypass and d_str >= retention_cutoff_str:
@@ -925,8 +930,8 @@ def fetch_openmeteo_env(lat, lon, start_date, end_date, is_bypass: bool = False)
             
     return cached_res
 
-# 🌟 기상청 방재 기상 관측장비 (AWS) - stn=0 일괄 조회 + 0.25초 간격 조절 + 습도 -9% 필터링 + 최근 3일 '--' 자동 재수집
-def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False):
+# 🌟 기상청 방재 기상 관측장비 (AWS) - 단일 스레드 0.7초 순차 호출 + 10회마다 Firebase 중간 저장 (습도는 ASOS 전담)
+def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, is_bypass: bool = False, is_background: bool = False):
     global KMA_AWS_COOLDOWN_UNTIL
     s_dt = datetime.strptime(start_date, "%Y-%m-%d")
     e_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -940,115 +945,105 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     today_str = now_kst.strftime("%Y-%m-%d")
     recent_3d_str = (now_kst - timedelta(days=3)).strftime("%Y-%m-%d")
 
-    with AWS_FETCH_LOCK:
-        missing_tasks = []
-        for i in range(diff):
-            curr = s_dt + timedelta(days=i)
-            d_str = curr.strftime("%Y-%m-%d")
-            tm2 = curr.strftime("%Y%m%d")
-            for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin"), ("hm_avg", "humi")]:
-                cache_key = f"AWS_{stn_id}_{d_str}_{key}"
-                cached_v = GLOBAL_WEATHER_CACHE.get(cache_key)
-                # 🌟 최근 3일 이내 날짜가 '--'이거나 캐시에 없으면 재수집 대상에 추가
-                if is_bypass or cache_key not in GLOBAL_WEATHER_CACHE or (d_str >= recent_3d_str and not is_valid_value(cached_v)):
-                    missing_tasks.append((d_str, tm2, obs, key))
+    # 🌟 일반 웹 조회(is_background=False, is_bypass=False)는 기상청 호출을 기다리지 않고 즉시 메모리 캐시를 반환하여 화면 멈춤 방지
+    if (is_background or is_bypass) and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
+        with AWS_FETCH_LOCK:
+            missing_tasks = []
+            for i in range(diff):
+                curr = s_dt + timedelta(days=i)
+                d_str = curr.strftime("%Y-%m-%d")
+                tm2 = curr.strftime("%Y%m%d")
+                # 🌟 습도(humi)는 대표 ASOS(143번)에서 가져오므로 AWS는 최고/최저기온 2개만 호출 (호출량 1/3 절감)
+                for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin")]:
+                    cache_key = f"AWS_{stn_id}_{d_str}_{key}"
+                    cached_v = GLOBAL_WEATHER_CACHE.get(cache_key)
+                    if is_bypass or cache_key not in GLOBAL_WEATHER_CACHE or (d_str >= recent_3d_str and not is_valid_value(cached_v)):
+                        missing_tasks.append((d_str, tm2, obs, key))
 
-        if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
-            newly_aws_updated = {}
-            consecutive_failures = 0
-            quota_failed = False
+            if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
+                newly_aws_updated = {}
+                consecutive_failures = 0
+                quota_failed = False
 
-            def fetch_all_stations_element(d_str, tm2, obs, key):
-                nonlocal consecutive_failures, quota_failed
-                if quota_failed:
-                    return
-                url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn=0&authKey={KMA_API_HUB_KEY}"
-                success_on_try = False
+                # 🌟 멀티스레드 동시 호출을 제거하고 1개씩 순차 호출(0.7초 간격)하여 기상청 방화벽 차단 원천 방지
+                for idx, (d_str, tm2, obs, key) in enumerate(missing_tasks):
+                    if quota_failed:
+                        break
+                    if idx > 0:
+                        time.sleep(0.7)
 
-                for attempt in range(2):
-                    try:
-                        r = http_session.get(url, headers=headers, timeout=6.0)
-                        r.encoding = 'utf-8'
-                        lines = r.text.split('\n')
-                        valid_line_count = 0
-                        found_vals = {}
-                        for line in lines:
-                            s_line = line.strip()
-                            if s_line and not s_line.startswith('#'):
-                                parts = s_line.split()
-                                if len(parts) >= 6 and parts[0].isdigit() and len(parts[0]) == 8:
-                                    valid_line_count += 1
-                                    s_id = parts[1]
-                                    if s_id in TARGET_AWS_STNS:
-                                        try:
-                                            fv = float(parts[5])
-                                            # 🌟 습도(humi)는 0 < fv <= 100, 기온은 -45 < fv < 60 일 때만 유효값으로 저장 (-9.0 차단)
-                                            if key == "humi":
-                                                if is_valid_humi(fv):
-                                                    found_vals[s_id] = fv
-                                            else:
+                    url = f"{KMA_PROXY_URL}?type=aws&tm2={tm2}&obs={obs}&stn=0&authKey={KMA_API_HUB_KEY}"
+                    success_on_try = False
+                    last_err_preview = ""
+
+                    for attempt in range(2):
+                        try:
+                            r = http_session.get(url, headers=headers, timeout=8.0)
+                            r.encoding = 'utf-8'
+                            last_err_preview = r.text[:120].replace('\n', ' ')
+                            lines = r.text.split('\n')
+                            valid_line_count = 0
+                            found_vals = {}
+                            for line in lines:
+                                s_line = line.strip()
+                                if s_line and not s_line.startswith('#'):
+                                    parts = s_line.split()
+                                    if len(parts) >= 6 and parts[0].isdigit() and len(parts[0]) == 8:
+                                        valid_line_count += 1
+                                        s_id = parts[1]
+                                        if s_id in TARGET_AWS_STNS:
+                                            try:
+                                                fv = float(parts[5])
                                                 if is_valid_temp(fv):
                                                     found_vals[s_id] = fv
-                                        except:
-                                            pass
-                        if valid_line_count >= 10:
-                            success_on_try = True
-                            consecutive_failures = 0
-                            if d_str < today_str:
-                                for s_id in TARGET_AWS_STNS:
-                                    ck = f"AWS_{s_id}_{d_str}_{key}"
-                                    old_val = GLOBAL_WEATHER_CACHE.get(ck)
-                                    new_val = found_vals.get(s_id)
-                                    if new_val is not None:
-                                        GLOBAL_WEATHER_CACHE[ck] = new_val
-                                        newly_aws_updated[ck] = new_val
-                                    elif not is_valid_value(old_val) and d_str < recent_3d_str:
-                                        # 🌟 최근 3일 이내 날짜는 미집계일 수 있으므로 "--"를 영구 캐시에 박제하지 않음
-                                        GLOBAL_WEATHER_CACHE[ck] = "--"
-                                        newly_aws_updated[ck] = "--"
-                            break
-                    except Exception:
-                        pass
-                    if attempt == 0:
-                        time.sleep(0.5)
+                                            except:
+                                                pass
+                            if valid_line_count >= 10:
+                                success_on_try = True
+                                consecutive_failures = 0
+                                if d_str < today_str:
+                                    for s_id in TARGET_AWS_STNS:
+                                        ck = f"AWS_{s_id}_{d_str}_{key}"
+                                        old_val = GLOBAL_WEATHER_CACHE.get(ck)
+                                        new_val = found_vals.get(s_id)
+                                        if new_val is not None:
+                                            GLOBAL_WEATHER_CACHE[ck] = new_val
+                                            newly_aws_updated[ck] = new_val
+                                        elif not is_valid_value(old_val) and d_str < recent_3d_str:
+                                            GLOBAL_WEATHER_CACHE[ck] = "--"
+                                            newly_aws_updated[ck] = "--"
+                                break
+                        except Exception as e:
+                            last_err_preview = str(e)
+                        if attempt == 0:
+                            time.sleep(1.2)
 
-                if not success_on_try:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 3:
-                        quota_failed = True
+                    # 🌟 10회 호출(80건)마다 Firebase에 중간 병합 저장
+                    if len(newly_aws_updated) >= 80:
+                        save_aws_cache_to_firebase(dict(newly_aws_updated))
+                        newly_aws_updated.clear()
 
-            first_task = missing_tasks[0]
-            fetch_all_stations_element(*first_task)
+                    if not success_on_try:
+                        consecutive_failures += 1
+                        logger.warning(f"⚠️ 기상청 AWS 응답 지연 ({d_str} {obs}, 연속 {consecutive_failures}회): {last_err_preview}")
+                        if consecutive_failures >= 3:
+                            quota_failed = True
 
-            if consecutive_failures >= 1 and len(missing_tasks) == 1:
-                quota_failed = True
+                if newly_aws_updated:
+                    save_aws_cache_to_firebase(dict(newly_aws_updated))
 
-            if not quota_failed and len(missing_tasks) > 1:
-                def throttled_fetch(t):
-                    if quota_failed:
-                        return
-                    time.sleep(0.25)
-                    fetch_all_stations_element(*t)
-
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    list(executor.map(throttled_fetch, missing_tasks[1:]))
-
-            if newly_aws_updated:
-                save_aws_cache_to_firebase(newly_aws_updated)
-
-            if quota_failed:
-                KMA_AWS_COOLDOWN_UNTIL = time.time() + 600
-                logger.warning("⚠️ 기상청 AWS 연속 응답 없음(일일 한도 초과 등) - 10분간 추가 AWS 호출을 일시 중단하고 ASOS/Open-Meteo로 대체합니다.")
+                if quota_failed:
+                    KMA_AWS_COOLDOWN_UNTIL = time.time() + 600
+                    logger.warning("⚠️ 기상청 AWS 연속 3회 응답 없음 - 10분간 추가 AWS 호출을 일시 중단하고 ASOS/Open-Meteo로 대체합니다.")
 
     res = {}
     for i in range(diff):
         curr = s_dt + timedelta(days=i)
         d_str = curr.strftime("%Y-%m-%d")
-        h_val = GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_humi", "--")
         res[d_str] = {
             "tmax": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmax", "--"),
             "tmin": GLOBAL_WEATHER_CACHE.get(f"AWS_{stn_id}_{d_str}_tmin", "--"),
-            "humi": h_val if is_valid_humi(h_val) else "--"
+            "humi": "--"  # 습도는 대구 대표 ASOS(143번)에서 자동 보완됨
         }
     return res
 
@@ -1208,7 +1203,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
 
     with ThreadPoolExecutor(max_workers=4) as weather_exec:
         f_as = weather_exec.submit(fetch_asos_daily, s_str, e_str, is_bypass)
-        f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, s_str, e_str, is_bypass)
+        f_aw = weather_exec.submit(fetch_aws_daily_for_dashboard, aws_stn, s_str, e_str, is_bypass, False)
         f_ak = weather_exec.submit(fetch_airkorea_station_daily, air_stn, s_str, e_str, is_bypass, True)
         f_om = weather_exec.submit(fetch_openmeteo_env, lat, lon, s_str, e_str, is_bypass)
         
