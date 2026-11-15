@@ -49,7 +49,14 @@ KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
 FIREBASE_DB_URL = "https://datacenter-app-7a69a-default-rtdb.firebaseio.com"
 
 def is_valid_value(val):
-    return val is not None and val not in ["--", "-", "", "None", "null"]
+    if val is None or val in ["--", "-", "", "None", "null"]:
+        return False
+    try:
+        if pd.isna(val):
+            return False
+    except Exception:
+        pass
+    return True
 
 def is_valid_temp(val):
     if not is_valid_value(val):
@@ -65,10 +72,61 @@ def is_valid_humi(val):
         return False
     try:
         fv = float(val)
-        # 🌟 상대습도는 0% 초과 ~ 100% 이하일 때만 유효값으로 인정 (기상청 결측 코드 -9.0 원천 차단)
         return 0.0 < fv <= 100.0
     except Exception:
         return False
+
+# 🌟 [신규 추가] 초미세먼지 시트에서 'Unnamed:'를 제거하고 측정소명을 1행 헤더로 정규화
+def normalize_pm25_df(df_raw):
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(columns=['일자']), '일자', []
+    df = df_raw.copy()
+
+    pm_date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), df.columns[0])
+
+    date_start_idx = 0
+    header_row_idx = None
+    for r_idx in range(min(3, len(df))):
+        val = df.iloc[r_idx][pm_date_col]
+        parsed_dt = pd.to_datetime(val, errors='coerce')
+        if pd.notna(parsed_dt) and 2000 <= parsed_dt.year <= 2100:
+            date_start_idx = r_idx
+            break
+        else:
+            header_row_idx = r_idx
+
+    if header_row_idx is not None:
+        # 1행이 Unnamed이고 아래 행에 측정소명이 있는 경우 -> 측정소명을 컬럼명으로 올리고 Unnamed 삭제
+        new_cols = []
+        keep_indices = []
+        for idx, col in enumerate(df.columns):
+            if col == pm_date_col:
+                new_cols.append('일자')
+                keep_indices.append(idx)
+            else:
+                cell_val = df.iloc[header_row_idx, idx]
+                if pd.notna(cell_val) and str(cell_val).strip() != '' and not str(cell_val).startswith('Unnamed'):
+                    new_cols.append(str(cell_val).strip())
+                    keep_indices.append(idx)
+                elif not str(col).startswith('Unnamed'):
+                    new_cols.append(str(col).strip())
+                    keep_indices.append(idx)
+        df = df.iloc[date_start_idx:, keep_indices].copy()
+        df.columns = new_cols
+    else:
+        # 이미 Unnamed 행을 지워서 1행이 측정소명인 경우 -> 빈 Unnamed 열만 제거
+        keep_cols = [col for col in df.columns if col == pm_date_col or not str(col).startswith('Unnamed')]
+        df = df[keep_cols].copy()
+        if pm_date_col != '일자':
+            df.rename(columns={pm_date_col: '일자'}, inplace=True)
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    df['일자'] = pd.to_datetime(df['일자'], errors='coerce').dt.normalize()
+    df = df.dropna(subset=['일자']).copy()
+    stn_cols = [c for c in df.columns if c not in ['일자', 'date'] and not str(c).startswith('Unnamed')]
+    for c in stn_cols:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df, '일자', stn_cols
 
 def backup_dataset_to_firebase(file_bytes):
     if "여기에_파이어베이스" in FIREBASE_DB_URL:
@@ -542,20 +600,19 @@ def load_excel_dataset():
     try:
         xls = pd.ExcelFile(file_path)
         df_main = pd.read_excel(xls, sheet_name=0)
+        df_main = df_main.loc[:, ~df_main.columns.astype(str).str.startswith('Unnamed')].copy()
         date_col = next((c for c in df_main.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df_main['date'] = pd.to_datetime(df_main[date_col]).dt.normalize()
         
         all_pm25 = []
         for sheet in xls.sheet_names:
+            # 🌟 통합된 '초미세먼지' 시트든 기존 연도별 시트든 자동 정규화하여 비교·예측용 평균치 산출
             if '초미세먼지' in sheet or '미세먼지' in sheet:
-                df_pm = pd.read_excel(xls, sheet_name=sheet)
-                df_pm = df_pm.iloc[1:].copy() 
-                pm_date_col = next((c for c in df_pm.columns if 'date' in str(c).lower() or '일자' in str(c)), None)
-                if pm_date_col:
-                    df_pm['date'] = pd.to_datetime(df_pm[pm_date_col]).dt.normalize()
-                    num_cols = [c for c in df_pm.columns if 'Unnamed' in str(c)]
-                    for c in num_cols: df_pm[c] = pd.to_numeric(df_pm[c], errors='coerce')
-                    df_pm['pm25_merged'] = df_pm[num_cols].mean(axis=1)
+                raw_pm = pd.read_excel(xls, sheet_name=sheet)
+                df_pm, _, stn_cols = normalize_pm25_df(raw_pm)
+                if not df_pm.empty and stn_cols:
+                    df_pm['date'] = df_pm['일자']
+                    df_pm['pm25_merged'] = df_pm[stn_cols].mean(axis=1)
                     all_pm25.append(df_pm[['date', 'pm25_merged']])
             
             elif '기상청_ASOS' in sheet or 'ASOS' in sheet:
@@ -1687,12 +1744,14 @@ def export_master_backup():
         sheet_names = list(xls_dict.keys())
         main_sheet_name = sheet_names[0] 
         df = xls_dict[main_sheet_name]
+        df = df.loc[:, ~df.columns.astype(str).str.startswith('Unnamed')].copy()
 
         date_col = next((c for c in df.columns if 'date' in str(c).lower() or '일자' in str(c)), 'date')
         df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
         df = df.dropna(subset=[date_col])
 
         yesterday = (get_kst_now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_str = yesterday.strftime("%Y-%m-%d")
         
         start_check_date = pd.to_datetime("2026-09-05")
         existing_dates = set(df[date_col].tolist())
@@ -1764,8 +1823,52 @@ def export_master_backup():
         if df[date_col].dt.tz is not None: df[date_col] = df[date_col].dt.tz_localize(None)
         xls_dict[main_sheet_name] = df
 
+        # 🌟 [초미세먼지 통합 및 누적] 연도별 탭들을 '초미세먼지' 단일 시트 1개로 합치고 어제 날짜까지 자동 누적
+        pm_dfs = []
+        pm_stn_order = []
+        for s_name in list(xls_dict.keys()):
+            if '초미세먼지' in s_name or '미세먼지' in s_name:
+                df_c, _, s_cols = normalize_pm25_df(xls_dict[s_name])
+                if not df_c.empty:
+                    pm_dfs.append(df_c)
+                    for sc in s_cols:
+                        if sc not in pm_stn_order:
+                            pm_stn_order.append(sc)
+                del xls_dict[s_name]  # 기존 연도별 미세먼지 탭 삭제
+
+        for stn in TARGET_AIR_STNS:
+            if stn not in pm_stn_order:
+                pm_stn_order.append(stn)
+
+        if pm_dfs:
+            df_pm_old = pd.concat(pm_dfs, ignore_index=True)
+            df_pm_old.sort_values(by='일자', inplace=True)
+            df_pm_old.drop_duplicates(subset=['일자'], keep='last', inplace=True)
+        else:
+            df_pm_old = pd.DataFrame(columns=['일자'] + pm_stn_order)
+
+        pm_cache_rows = []
+        for i in range(total_days):
+            t_dt = start_check_date + timedelta(days=i)
+            d_str = t_dt.strftime("%Y-%m-%d")
+            r_dict = {'일자': t_dt}
+            for stn in pm_stn_order:
+                c_val = GLOBAL_AIRKOREA_CACHE.get(f"AIR_{stn}_{d_str}")
+                r_dict[stn] = int(round(float(c_val))) if is_valid_value(c_val) else np.nan
+            pm_cache_rows.append(r_dict)
+
+        df_pm_cache = pd.DataFrame(pm_cache_rows)
+        if not df_pm_old.empty:
+            df_pm_merged = df_pm_cache.set_index('일자').combine_first(df_pm_old.set_index('일자')).reset_index()
+        else:
+            df_pm_merged = df_pm_cache
+
+        final_pm_cols = ['일자'] + [c for c in pm_stn_order if c in df_pm_merged.columns]
+        df_pm_merged = df_pm_merged[final_pm_cols].sort_values(by='일자').reset_index(drop=True)
+        xls_dict["초미세먼지"] = df_pm_merged
+
+        # 🌟 [기상청 ASOS 백업] 2023-01-01 ~ 어제까지 누적
         load_excel_dataset()
-        yesterday_str = yesterday.strftime("%Y-%m-%d")
         asos_all = fetch_asos_daily("2023-01-01", yesterday_str)
         asos_rows = []
         for dt_obj in pd.date_range("2023-01-01", yesterday_str):
@@ -1791,15 +1894,14 @@ def export_master_backup():
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             for sheet_name, sheet_df in xls_dict.items():
                 temp_df = sheet_df.copy()
-                if date_col in temp_df.columns:
-                    temp_df = temp_df.dropna(subset=[date_col])
-                    if pd.api.types.is_datetime64_any_dtype(temp_df[date_col]):
-                        temp_df[date_col] = temp_df[date_col].dt.strftime('%Y-%m-%d')
-                        
-                if '일자' in temp_df.columns:
-                    temp_df = temp_df.dropna(subset=['일자'])
-                    if pd.api.types.is_datetime64_any_dtype(temp_df['일자']):
-                        temp_df['일자'] = temp_df['일자'].dt.strftime('%Y-%m-%d')
+                # 모든 시트에서 Unnamed 컬럼 원천 제거
+                temp_df = temp_df.loc[:, ~temp_df.columns.astype(str).str.startswith('Unnamed')].copy()
+
+                for d_c in [date_col, 'date', '일자']:
+                    if d_c in temp_df.columns:
+                        temp_df = temp_df.dropna(subset=[d_c])
+                        if pd.api.types.is_datetime64_any_dtype(temp_df[d_c]):
+                            temp_df[d_c] = temp_df[d_c].dt.strftime('%Y-%m-%d')
                 
                 temp_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
