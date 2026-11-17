@@ -1897,6 +1897,16 @@ def export_master_backup():
             df_pm_old.drop_duplicates(subset=['일자'], keep='last', inplace=True)
         else:
             df_pm_old = pd.DataFrame(columns=['일자'] + pm_stn_order)
+# 🌟 1) 마스터 백업 실행 시 최근 7일 구간은 환경공단 API를 강제 재조회(is_bypass=True)하여 가집계/오류값을 최신 확정값으로 갱신
+        recent_7d_str = max("2026-09-05", (yesterday - timedelta(days=7)).strftime("%Y-%m-%d"))
+        with ThreadPoolExecutor(max_workers=5) as air_exec:
+            for stn in TARGET_AIR_STNS:
+                air_exec.submit(fetch_airkorea_station_daily, stn, recent_7d_str, yesterday_str, True, False)
+
+        with AIR_FETCH_LOCK:
+            if PENDING_AIR_UPDATES:
+                save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
+                PENDING_AIR_UPDATES.clear()
 
         pm_cache_rows = []
         for i in range(total_days):
@@ -1905,13 +1915,25 @@ def export_master_backup():
             r_dict = {'일자': t_dt}
             for stn in pm_stn_order:
                 c_val = GLOBAL_AIRKOREA_CACHE.get(f"AIR_{stn}_{d_str}")
-                r_dict[stn] = int(round(float(c_val))) if is_valid_value(c_val) else np.nan
+                # 0 이하의 비정상 값은 제외하고 유효한 양수만 반영
+                r_dict[stn] = int(round(float(c_val))) if (is_valid_value(c_val) and float(c_val) > 0) else np.nan
             pm_cache_rows.append(r_dict)
 
         df_pm_cache = pd.DataFrame(pm_cache_rows)
         if not df_pm_old.empty:
-            # 🌟 기존 엑셀의 확정 데이터를 최우선으로 유지하고, 비어있는 날짜/측정소만 캐시 데이터로 채움
-            df_pm_merged = df_pm_old.set_index('일자').combine_first(df_pm_cache.set_index('일자')).reset_index()
+            # 기존 엑셀에 혹시 0 이하로 잘못 들어간 값이 있으면 NaN으로 비워 복구 유도
+            for c in pm_stn_order:
+                if c in df_pm_old.columns:
+                    df_pm_old.loc[df_pm_old[c] <= 0, c] = np.nan
+
+            # 🌟 2) 14일 이전 과거 확정 데이터는 기존 엑셀(df_pm_old)을 보호하고, 최근 14일 이내는 새로 갱신된 캐시(df_pm_cache)로 덮어써서 오류값 자동 복구
+            recent_14d_dt = yesterday - timedelta(days=14)
+            old_idx = df_pm_old.set_index('일자')
+            cache_idx = df_pm_cache.set_index('일자')
+
+            merged_past = old_idx[old_idx.index < recent_14d_dt].combine_first(cache_idx[cache_idx.index < recent_14d_dt])
+            merged_recent = cache_idx[cache_idx.index >= recent_14d_dt].combine_first(old_idx[old_idx.index >= recent_14d_dt])
+            df_pm_merged = pd.concat([merged_past, merged_recent]).reset_index()
         else:
             df_pm_merged = df_pm_cache
 
