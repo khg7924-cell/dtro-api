@@ -1776,9 +1776,10 @@ def export_master_backup():
 
         total_days = (yesterday - start_check_date).days + 1
         all_stations = [s for s in STATION_CUST_MAP.keys() if s != '전체']
+        recent_recheck_dt = yesterday - timedelta(days=2)  # 최근 3일(어제·그제·사흘전)은 지연 집계 반영을 위해 재확인
 
-        # 🌟 '설화명곡' 1개 역만 보지 않고, 모든 날짜의 24개 전 개소를 검사하여 0 이하 또는 빈칸(NaN)인 개소만 골라냄
-        missing_targets = {}  # {날짜: [0이거나 비어있는 개소 리스트]}
+        # 🌟 1) 0 이하/빈칸인 경우, 2) 최근 3일 이내인 경우, 3) 부분 집계 의심(사용량 < 피크*6)인 경우를 모두 찾아냄
+        missing_targets = {}
         for i in range(total_days):
             target_dt = start_check_date + timedelta(days=i)
             if target_dt not in existing_dates:
@@ -1790,14 +1791,28 @@ def export_master_backup():
                     kwh_col = col_map.get(st, {}).get('kwh')
                     peak_col = col_map.get(st, {}).get('peak')
                     need_fetch = False
+                    cur_k, cur_p = 0.0, 0.0
+
                     if kwh_col:
                         v_k = row_df[kwh_col].values
                         if len(v_k) == 0 or pd.isna(v_k[0]) or float(v_k[0]) <= 0:
                             need_fetch = True
+                        else:
+                            cur_k = float(v_k[0])
                     if peak_col:
                         v_p = row_df[peak_col].values
                         if len(v_p) == 0 or pd.isna(v_p[0]) or float(v_p[0]) <= 0:
                             need_fetch = True
+                        else:
+                            cur_p = float(v_p[0])
+
+                    # 🌟 0은 아니지만 하루 96개 구간 중 일부만 들어온 의심 값(사용량이 피크의 6배 미만)이거나 최근 3일 데이터면 재확인
+                    if not need_fetch:
+                        if target_dt >= recent_recheck_dt:
+                            need_fetch = True
+                        elif cur_p > 0 and (cur_k / cur_p) < 6.0:
+                            need_fetch = True
+
                     if need_fetch:
                         stns_to_fetch.append(st)
                 if stns_to_fetch:
@@ -1812,7 +1827,6 @@ def export_master_backup():
             stns_needed = missing_targets[target_dt]
             row = {date_col: target_dt}
             
-            # 🌟 캐시에 혹시 잘못 남아있을 수 있는 빈값을 무시(is_bypass=True)하고 누락된 개소만 재호출
             def fetch_st(st):
                 usage, peak, _ = get_kepco_data_for_station(st, d_str, is_bypass=True)
                 return st, usage, peak
@@ -1824,15 +1838,18 @@ def export_master_backup():
                 row_idx = df[df[date_col] == target_dt].index[0]
                 for st, usage, peak in results:
                     if st in col_map:
-                        # 🌟 새로 받아온 값이 0보다 클 때만 기록하여, 정상 데이터를 0으로 덮어쓰는 현상 차단
                         if 'kwh' in col_map[st] and usage > 0:
-                            df.loc[row_idx, col_map[st]['kwh']] = usage
+                            old_k = df.loc[row_idx, col_map[st]['kwh']]
+                            # 🌟 기존 값이 비어있거나 0이거나, 새로 받아온 완전 집계량이 기존 부분 집계량보다 클 때만 덮어씀
+                            if pd.isna(old_k) or float(old_k) <= 0 or usage > float(old_k):
+                                df.loc[row_idx, col_map[st]['kwh']] = usage
                         if 'peak' in col_map[st] and peak > 0:
-                            df.loc[row_idx, col_map[st]['peak']] = peak
+                            old_p = df.loc[row_idx, col_map[st]['peak']]
+                            if pd.isna(old_p) or float(old_p) <= 0 or peak > float(old_p):
+                                df.loc[row_idx, col_map[st]['peak']] = peak
             else:
                 for st, usage, peak in results:
                     if st in col_map:
-                        # 🌟 아직 집계가 안 되어 0이 온 경우 0.0 대신 빈칸(np.nan)으로 두어 다음 백업 때 재시도 보장
                         if 'kwh' in col_map[st]:
                             row[col_map[st]['kwh']] = usage if usage > 0 else np.nan
                         if 'peak' in col_map[st]:
@@ -1893,7 +1910,8 @@ def export_master_backup():
 
         df_pm_cache = pd.DataFrame(pm_cache_rows)
         if not df_pm_old.empty:
-            df_pm_merged = df_pm_cache.set_index('일자').combine_first(df_pm_old.set_index('일자')).reset_index()
+            # 🌟 기존 엑셀의 확정 데이터를 최우선으로 유지하고, 비어있는 날짜/측정소만 캐시 데이터로 채움
+            df_pm_merged = df_pm_old.set_index('일자').combine_first(df_pm_cache.set_index('일자')).reset_index()
         else:
             df_pm_merged = df_pm_cache
 
