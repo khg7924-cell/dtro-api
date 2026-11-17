@@ -799,19 +799,24 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
     cached_res = {}
     for i in range(diff):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
-        ck_tmax = f"ASOS_{d_str}_tmax"
-        ck_humi = f"ASOS_{d_str}_humi"
+        tmax_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", "--")
+        tmin_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--")
+        tavg_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", "--")
+        humi_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
         
-        tmax_v = GLOBAL_WEATHER_CACHE.get(ck_tmax, "--")
-        humi_v = GLOBAL_WEATHER_CACHE.get(ck_humi, "--")
-        
-        is_fully_valid = is_valid_temp(tmax_v) and (is_valid_humi(humi_v) or d_str < recent_3d_str)
+        # 🌟 4개 지표(최고·최저·평균기온, 습도)가 모두 유효한 숫자일 때만 캐시 인정 (하나라도 '--'면 재수집)
+        is_fully_valid = (
+            is_valid_temp(tmax_v) and 
+            is_valid_temp(tmin_v) and 
+            is_valid_temp(tavg_v) and 
+            is_valid_humi(humi_v)
+        )
         if not is_bypass and is_fully_valid:
             cached_res[d_str] = {
                 "tmax": tmax_v,
-                "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", "--"),
-                "tavg": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", "--"),
-                "humi": humi_v if is_valid_humi(humi_v) else "--"
+                "tmin": tmin_v,
+                "tavg": tavg_v,
+                "humi": humi_v
             }
         else:
             missing_dates.append(d_str)
@@ -1941,8 +1946,11 @@ def export_master_backup():
         df_pm_merged = df_pm_merged[final_pm_cols].sort_values(by='일자').reset_index(drop=True)
         xls_dict["초미세먼지"] = df_pm_merged
 
-        # 🌟 [기상청 ASOS 백업] 2023-01-01 ~ 어제까지 누적
+        # 🌟 [기상청 ASOS 백업] 최근 7일은 강제 재조회(is_bypass=True)하여 가집계/오류값을 기상청 최신 확정값으로 자동 갱신
         load_excel_dataset()
+        recent_7d_str = max("2026-09-05", (yesterday - timedelta(days=7)).strftime("%Y-%m-%d"))
+        fetch_asos_daily(recent_7d_str, yesterday_str, is_bypass=True)
+
         asos_all = fetch_asos_daily("2023-01-01", yesterday_str)
         asos_rows = []
         for dt_obj in pd.date_range("2023-01-01", yesterday_str):
