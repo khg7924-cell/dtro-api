@@ -1107,25 +1107,36 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                 if time.time() - c_time < 600:
                     day_list = c_data
 
+        m_target = target_meter_no if c_no == '0526314773' else "전체"
+
         if day_list is None:
             url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
             params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
             day_list = []
             req_ok = False
-            try:
-                res = http_session.get(url, params=params, timeout=3)
-                if res.status_code == 200:
-                    req_ok = True
-                    data = res.json()
-                    if "dayLpDataInfoList" in data: day_list = data["dayLpDataInfoList"]
-            except: pass
+            # 🌟 일시적 통신 지연으로 0이 들어가는 현상을 막기 위해 최대 3회 재시도 (타임아웃 5초)
+            for attempt in range(3):
+                try:
+                    res = http_session.get(url, params=params, timeout=5)
+                    if res.status_code == 200:
+                        req_ok = True
+                        data = res.json()
+                        if "dayLpDataInfoList" in data and data["dayLpDataInfoList"]:
+                            day_list = data["dayLpDataInfoList"]
+                            break
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(0.4)
             
-            if date_str < today_str and day_list:
+            parsed_intervals = process_kepco_day_data(day_list, m_target)
+            # 🌟 과거 날짜는 실제 전력량 합계가 0보다 클 때만 캐시에 저장 (0값 박제 원천 차단)
+            if date_str < today_str and day_list and sum(parsed_intervals) > 0:
                 GLOBAL_KEPCO_CACHE[cache_key] = day_list
             elif date_str == today_str and req_ok:
                 GLOBAL_KEPCO_TODAY_CACHE[cache_key] = (time.time(), day_list)
+            return parsed_intervals
         
-        m_target = target_meter_no if c_no == '0526314773' else "전체"
         return process_kepco_day_data(day_list, m_target)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -1764,45 +1775,68 @@ def export_master_backup():
                     if 'peak_kw' in str(c): col_map.setdefault(st, {})['peak'] = c
 
         total_days = (yesterday - start_check_date).days + 1
-        missing_dates = []
+        all_stations = [s for s in STATION_CUST_MAP.keys() if s != '전체']
+
+        # 🌟 '설화명곡' 1개 역만 보지 않고, 모든 날짜의 24개 전 개소를 검사하여 0 이하 또는 빈칸(NaN)인 개소만 골라냄
+        missing_targets = {}  # {날짜: [0이거나 비어있는 개소 리스트]}
         for i in range(total_days):
             target_dt = start_check_date + timedelta(days=i)
             if target_dt not in existing_dates:
-                missing_dates.append(target_dt)
+                missing_targets[target_dt] = list(all_stations)
             else:
-                sample_col = col_map.get('설화명곡', {}).get('kwh')
-                if sample_col:
-                    val = df.loc[df[date_col] == target_dt, sample_col].values
-                    if len(val) == 0 or pd.isna(val[0]) or val[0] == 0:
-                        missing_dates.append(target_dt)
+                row_df = df.loc[df[date_col] == target_dt]
+                stns_to_fetch = []
+                for st in all_stations:
+                    kwh_col = col_map.get(st, {}).get('kwh')
+                    peak_col = col_map.get(st, {}).get('peak')
+                    need_fetch = False
+                    if kwh_col:
+                        v_k = row_df[kwh_col].values
+                        if len(v_k) == 0 or pd.isna(v_k[0]) or float(v_k[0]) <= 0:
+                            need_fetch = True
+                    if peak_col:
+                        v_p = row_df[peak_col].values
+                        if len(v_p) == 0 or pd.isna(v_p[0]) or float(v_p[0]) <= 0:
+                            need_fetch = True
+                    if need_fetch:
+                        stns_to_fetch.append(st)
+                if stns_to_fetch:
+                    missing_targets[target_dt] = stns_to_fetch
 
-        if len(missing_dates) > 120:
-            missing_dates = missing_dates[:120]
+        target_dt_list = sorted(missing_targets.keys())[:120]
 
         new_rows = []
-        for target_dt in missing_dates:
+        for target_dt in target_dt_list:
             d_str = target_dt.strftime("%Y-%m-%d")
             is_existing_row = target_dt in existing_dates
+            stns_needed = missing_targets[target_dt]
             row = {date_col: target_dt}
             
+            # 🌟 캐시에 혹시 잘못 남아있을 수 있는 빈값을 무시(is_bypass=True)하고 누락된 개소만 재호출
             def fetch_st(st):
-                usage, peak, _ = get_kepco_data_for_station(st, d_str)
+                usage, peak, _ = get_kepco_data_for_station(st, d_str, is_bypass=True)
                 return st, usage, peak
                 
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                results = list(executor.map(fetch_st, [s for s in STATION_CUST_MAP.keys() if s != '전체']))
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                results = list(executor.map(fetch_st, stns_needed))
                 
             if is_existing_row:
                 row_idx = df[df[date_col] == target_dt].index[0]
                 for st, usage, peak in results:
                     if st in col_map:
-                        if 'kwh' in col_map[st]: df.loc[row_idx, col_map[st]['kwh']] = usage
-                        if 'peak' in col_map[st]: df.loc[row_idx, col_map[st]['peak']] = peak
+                        # 🌟 새로 받아온 값이 0보다 클 때만 기록하여, 정상 데이터를 0으로 덮어쓰는 현상 차단
+                        if 'kwh' in col_map[st] and usage > 0:
+                            df.loc[row_idx, col_map[st]['kwh']] = usage
+                        if 'peak' in col_map[st] and peak > 0:
+                            df.loc[row_idx, col_map[st]['peak']] = peak
             else:
                 for st, usage, peak in results:
                     if st in col_map:
-                        if 'kwh' in col_map[st]: row[col_map[st]['kwh']] = usage
-                        if 'peak' in col_map[st]: row[col_map[st]['peak']] = peak
+                        # 🌟 아직 집계가 안 되어 0이 온 경우 0.0 대신 빈칸(np.nan)으로 두어 다음 백업 때 재시도 보장
+                        if 'kwh' in col_map[st]:
+                            row[col_map[st]['kwh']] = usage if usage > 0 else np.nan
+                        if 'peak' in col_map[st]:
+                            row[col_map[st]['peak']] = peak if peak > 0 else np.nan
                 new_rows.append(row)
                 
         if new_rows:
