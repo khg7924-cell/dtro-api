@@ -969,14 +969,33 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
     if (is_background or is_bypass) and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
         with AWS_FETCH_LOCK:
             missing_tasks = []
+            # 🌟 백그라운드 점검 시에는 143번 하나만 보지 않고 대구 8개 동네 관측소 전체의 누락 여부를 검사
+            check_stns = list(TARGET_AWS_STNS) if is_background else [stn_id]
+
             for i in range(diff):
                 curr = s_dt + timedelta(days=i)
                 d_str = curr.strftime("%Y-%m-%d")
                 tm2 = curr.strftime("%Y%m%d")
+
+                # 최고기온 < 최저기온 역전 오류가 있는 관측소가 있는지 확인
+                has_inversion = False
+                for s_chk in check_stns:
+                    tx_v = GLOBAL_WEATHER_CACHE.get(f"AWS_{s_chk}_{d_str}_tmax")
+                    tn_v = GLOBAL_WEATHER_CACHE.get(f"AWS_{s_chk}_{d_str}_tmin")
+                    if is_valid_temp(tx_v) and is_valid_temp(tn_v) and float(tx_v) < float(tn_v):
+                        has_inversion = True
+                        break
+
                 for obs, key in [("ta_max", "tmax"), ("ta_min", "tmin")]:
-                    cache_key = f"AWS_{stn_id}_{d_str}_{key}"
-                    cached_v = GLOBAL_WEATHER_CACHE.get(cache_key)
-                    if is_bypass or cache_key not in GLOBAL_WEATHER_CACHE or (d_str >= recent_3d_str and not is_valid_value(cached_v)):
+                    need_call = is_bypass or has_inversion
+                    if not need_call:
+                        for s_chk in check_stns:
+                            ck_chk = f"AWS_{s_chk}_{d_str}_{key}"
+                            cv = GLOBAL_WEATHER_CACHE.get(ck_chk)
+                            if ck_chk not in GLOBAL_WEATHER_CACHE or (d_str >= recent_3d_str and not is_valid_temp(cv)):
+                                need_call = True
+                                break
+                    if need_call:
                         missing_tasks.append((d_str, tm2, obs, key))
 
             if missing_tasks and time.time() >= KMA_AWS_COOLDOWN_UNTIL:
@@ -1024,10 +1043,12 @@ def fetch_aws_daily_for_dashboard(stn_id: str, start_date: str, end_date: str, i
                                         ck = f"AWS_{s_id}_{d_str}_{key}"
                                         old_val = GLOBAL_WEATHER_CACHE.get(ck)
                                         new_val = found_vals.get(s_id)
+                                        # 🌟 새로 받은 기온이 기존 캐시 값과 다르면 최신 확정값으로 즉시 덮어쓰기
                                         if new_val is not None:
-                                            GLOBAL_WEATHER_CACHE[ck] = new_val
-                                            newly_aws_updated[ck] = new_val
-                                        elif not is_valid_value(old_val) and d_str < recent_3d_str:
+                                            if old_val != new_val:
+                                                GLOBAL_WEATHER_CACHE[ck] = new_val
+                                                newly_aws_updated[ck] = new_val
+                                        elif not is_valid_temp(old_val) and d_str < recent_3d_str and ck not in GLOBAL_WEATHER_CACHE:
                                             GLOBAL_WEATHER_CACHE[ck] = "--"
                                             newly_aws_updated[ck] = "--"
                                 break
@@ -1946,10 +1967,12 @@ def export_master_backup():
         df_pm_merged = df_pm_merged[final_pm_cols].sort_values(by='일자').reset_index(drop=True)
         xls_dict["초미세먼지"] = df_pm_merged
 
-        # 🌟 [기상청 ASOS 백업] 최근 7일은 강제 재조회(is_bypass=True)하여 가집계/오류값을 기상청 최신 확정값으로 자동 갱신
+        # 🌟 [기상청 ASOS & 동네 AWS 백업] 최근 구간 강제 재조회(is_bypass=True)로 가집계/오류값을 최신 확정값으로 자동 갱신
         load_excel_dataset()
         recent_7d_str = max("2026-09-05", (yesterday - timedelta(days=7)).strftime("%Y-%m-%d"))
+        recent_3d_aws_str = max("2026-09-05", (yesterday - timedelta(days=2)).strftime("%Y-%m-%d"))
         fetch_asos_daily(recent_7d_str, yesterday_str, is_bypass=True)
+        fetch_aws_daily_for_dashboard('143', recent_3d_aws_str, yesterday_str, is_bypass=True, is_background=True)
 
         asos_all = fetch_asos_daily("2023-01-01", yesterday_str)
         asos_rows = []
