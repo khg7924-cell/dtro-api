@@ -1843,7 +1843,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['month'] = df['date'].dt.month
         df['dayofweek'] = df['date'].dt.dayofweek
         df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
-        df['is_holiday'] = df['date'].map(lambda x: 1 if (x.dayofweek >= 5 or x in kr_holidays) else 0)
+        df['is_holiday'] = df['date'].map(lambda x: 1 if (x in kr_holidays and x.dayofweek < 5) else 0)
 
         # 직전 연도 실제 실적(전력량 kWh 및 최대수요 Peak kW) 산출용 원시 합계
         df['raw_power'] = df[kwh_cols].sum(axis=1, min_count=1) if len(kwh_cols) > 1 else pd.to_numeric(df[kwh_cols[0]], errors='coerce')
@@ -1942,11 +1942,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['humidity'] = df['humidity'].bfill().ffill()
         df['pm25'] = df['pm25'].bfill().ffill()
 
-        # 도시철도 특화 파생 피처(냉방도일 CDD, 난방도일 HDD, 불쾌지수 THI, 열대야 축열지수, 초미세먼지 35↑ 공조 강제가동) 생성
+        # 🌟 기온과 99.6% 중복되어 중요도를 왜곡시키는 불쾌지수(thi)를 제외하고 순수 물리 변수만 구성
         def add_transit_features(d_frame):
             d_frame['cdd'] = (d_frame['temp_avg'] - 24.0).clip(lower=0)
             d_frame['hdd'] = (12.0 - d_frame['temp_avg']).clip(lower=0)
-            d_frame['thi'] = 0.81 * d_frame['temp_avg'] + 0.01 * d_frame['humidity'] * (0.99 * d_frame['temp_avg'] - 14.3) + 46.3
             d_frame['trop_night_deg'] = (d_frame['temp_min'] - 25.0).clip(lower=0)
             d_frame['is_pm25_bad'] = (d_frame['pm25'] >= 35.0).astype(int)
             return d_frame
@@ -1955,11 +1954,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
 
         features = [
             'month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers',
-            'temp_max', 'temp_min', 'temp_avg', 'humidity',
-            'cdd', 'hdd', 'thi', 'trop_night_deg', 'pm25', 'is_pm25_bad'
+            'temp_max', 'temp_min', 'temp_avg', 'cdd', 'hdd', 'trop_night_deg',
+            'humidity', 'pm25', 'is_pm25_bad'
         ]
-        # 물리적 단조 제약: 휴일/주말 다이아(-1), 승객수(+1), 냉난방도일·불쾌지수·열대야 축열·초미세먼지(+1)
-        mono_constraints = (0, 0, -1, -1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1)
+        mono_constraints = (0, 0, -1, -1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1)
 
         train_df = df[(df['date'].dt.year <= (target_y - 1)) & (df['raw_power'] > 0)].copy()
         train_df = train_df.dropna(subset=['target_power', 'target_peak'] + features)
@@ -2117,23 +2115,32 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         last_peak_val = float(train_last_year_df['raw_peak'].max()) if not train_last_year_df.empty else 0.0
         peak_future_val = float(test_df['pred_peak'].max())
         
-        importances = [float(v) for v in (model_kwh.feature_importances_ * 100).round(1)]
-        feat_df = pd.DataFrame({'name': features, 'value': importances})
-        
-        name_map = {
-            'month': '계절(월)',
-            'temp_max': '기온', 'temp_min': '기온', 'temp_avg': '기온',
-            'cdd': '기온', 'hdd': '기온', 'trop_night_deg': '기온',
-            'humidity': '습도', 'thi': '습도',
-            'passengers': '승객수',
-            'pm25': '초미세먼지(PM2.5)', 'is_pm25_bad': '초미세먼지(PM2.5)',
-            'is_holiday': '공휴일', 'is_weekend': '주말', 'dayofweek': '주말'
+        # 🌟 [예측 변수 중요도 정밀 산출] 단순 분기 평균(Average Gain) 왜곡을 배제하고,
+        # 각 변수 그룹이 실제 예측 전력량(kWh)을 변동시키는 실질 기여도(Group Permutation Impact)로 산출
+        groups_map = {
+            '기온': ['temp_max', 'temp_min', 'temp_avg', 'cdd', 'hdd', 'trop_night_deg'],
+            '계절(월)': ['month'],
+            '승객수': ['passengers'],
+            '주말': ['is_weekend', 'dayofweek'],
+            '공휴일': ['is_holiday'],
+            '습도': ['humidity'],
+            '초미세먼지(PM2.5)': ['pm25', 'is_pm25_bad']
         }
-        feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
-        feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
-        feat_df['value'] = feat_df['value'].round(1)
-        
-        top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
+        rng = np.random.RandomState(42)
+        group_impacts = {}
+        for g_name, g_cols in groups_map.items():
+            X_perm = X_train.copy()
+            perm_idx = rng.permutation(len(X_perm))
+            for col_c in g_cols:
+                X_perm[col_c] = X_train[col_c].values[perm_idx]
+            perm_pred = model_kwh.predict(X_perm)
+            group_impacts[g_name] = float(np.mean(np.abs(train_pred - perm_pred)))
+
+        total_impact = sum(group_impacts.values()) or 1.0
+        top_feats = [
+            {"name": g_name, "value": round((val / total_impact) * 100.0, 1)}
+            for g_name, val in sorted(group_impacts.items(), key=lambda x: x[1], reverse=True)
+        ]
         
         records = []
         for m in range(1, 13):
