@@ -1781,7 +1781,24 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
 
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
-    rep_hash = hashlib.md5(reports_data.encode()).hexdigest() if reports_data else "none"
+    # 🌟 프론트엔드에서 reports_data를 넘기지 않아도 백엔드가 직접 Firebase 부하증감 신고 내역을 자동 조회
+    local_reports = []
+    if reports_data:
+        try:
+            local_reports = json.loads(reports_data)
+        except Exception:
+            local_reports = []
+    elif "여기에_파이어베이스" not in FIREBASE_DB_URL:
+        try:
+            r_fb = requests.get(f"{FIREBASE_DB_URL}/load_reports.json", timeout=3)
+            if r_fb.status_code == 200 and r_fb.json():
+                fb_data = r_fb.json()
+                if isinstance(fb_data, dict):
+                    local_reports = list(fb_data.values())
+        except Exception:
+            local_reports = []
+
+    rep_hash = hashlib.md5(json.dumps(local_reports, sort_keys=True, ensure_ascii=False).encode()).hexdigest() if local_reports else "none"
     cache_key = f"{station}_{target_year}_{pass_rate}_{temp_adj}_{winter_temp_adj}_{pm25_adj}_{rep_hash}"
     if cache_key in GLOBAL_API_CACHE["predict"]:
         return GLOBAL_API_CACHE["predict"][cache_key]
@@ -1795,14 +1812,17 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
-            df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
+            peak_cols = [c for c in df.columns if 'peak_kw' in c and '종합청사' not in c]
         elif station in LINE_STATIONS:
             line_stations = LINE_STATIONS[station]
             kwh_cols = [c for c in df.columns if any(s in c for s in line_stations) and 'total_kwh' in c]
-            df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
+            peak_cols = [c for c in df.columns if any(s in c for s in line_stations) and 'peak_kw' in c]
         else:
             kwh_cols = [c for c in df.columns if station in c and 'total_kwh' in c]
-            df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
+            peak_cols = [c for c in df.columns if station in c and 'peak_kw' in c]
+
+        if not kwh_cols:
+            return {"error": f"[{station}]의 전력량 컬럼을 데이터셋에서 찾을 수 없습니다."}
         
         target_y = int(target_year)
         
@@ -1822,90 +1842,251 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         kr_holidays = holidays.KR()
         df['month'] = df['date'].dt.month
         df['dayofweek'] = df['date'].dt.dayofweek
-        df['is_weekend'] = df['dayofweek'].isin([5,6]).astype(int)
-        df['is_holiday'] = df['date'].map(lambda x: 1 if x in kr_holidays else 0)
+        df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+        df['is_holiday'] = df['date'].map(lambda x: 1 if (x.dayofweek >= 5 or x in kr_holidays) else 0)
+
+        # 직전 연도 실제 실적(전력량 kWh 및 최대수요 Peak kW) 산출용 원시 합계
+        df['raw_power'] = df[kwh_cols].sum(axis=1, min_count=1) if len(kwh_cols) > 1 else pd.to_numeric(df[kwh_cols[0]], errors='coerce')
+        df['raw_peak'] = df[peak_cols].sum(axis=1, min_count=1) if len(peak_cols) > 1 else (pd.to_numeric(df[peak_cols[0]], errors='coerce') if peak_cols else df['raw_power'] / 14.0)
+
+        # 🌟 신규 연장 개통 역사(예: 1호선 숙천·금락) 포함 시 미개통 연도(23~24년) 스케일을 현재 운영 기준으로 보정하여 과소 예측 방지
+        df_train_adj = df.copy()
+        if len(kwh_cols) > 1:
+            for col in kwh_cols:
+                s_num = pd.to_numeric(df_train_adj[col], errors='coerce')
+                active_mask = s_num > 0
+                if active_mask.any():
+                    first_open_dt = df_train_adj.loc[active_mask, 'date'].min()
+                    if first_open_dt > pd.to_datetime("2023-06-01"):
+                        active_sub = df_train_adj.loc[active_mask]
+                        grp_mean = active_sub.groupby(['month', 'is_holiday'])[col].mean().to_dict()
+                        overall_mean = float(active_sub[col].mean())
+                        pre_mask = df_train_adj['date'] < first_open_dt
+                        df_train_adj.loc[pre_mask, col] = df_train_adj.loc[pre_mask].apply(
+                            lambda r: grp_mean.get((r['month'], r['is_holiday']), overall_mean), axis=1
+                        )
+            for col in peak_cols:
+                s_num = pd.to_numeric(df_train_adj[col], errors='coerce')
+                active_mask = s_num > 0
+                if active_mask.any():
+                    first_open_dt = df_train_adj.loc[active_mask, 'date'].min()
+                    if first_open_dt > pd.to_datetime("2023-06-01"):
+                        active_sub = df_train_adj.loc[active_mask]
+                        grp_mean = active_sub.groupby(['month', 'is_holiday'])[col].mean().to_dict()
+                        overall_mean = float(active_sub[col].mean())
+                        pre_mask = df_train_adj['date'] < first_open_dt
+                        df_train_adj.loc[pre_mask, col] = df_train_adj.loc[pre_mask].apply(
+                            lambda r: grp_mean.get((r['month'], r['is_holiday']), overall_mean), axis=1
+                        )
+
+        df['target_power'] = df_train_adj[kwh_cols].sum(axis=1, min_count=1) if len(kwh_cols) > 1 else pd.to_numeric(df_train_adj[kwh_cols[0]], errors='coerce')
+        df['target_peak'] = df_train_adj[peak_cols].sum(axis=1, min_count=1) if len(peak_cols) > 1 else (pd.to_numeric(df_train_adj[peak_cols[0]], errors='coerce') if peak_cols else df['target_power'] / 14.0)
         
         asos_data = fetch_asos_daily("2023-01-01", f"{target_y}-12-31")
         
-        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmax') if is_valid_temp(asos_data.get(x, {}).get('tmax')) else np.nan)
-        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tmin') if is_valid_temp(asos_data.get(x, {}).get('tmin')) else np.nan)
-        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('tavg') if is_valid_temp(asos_data.get(x, {}).get('tavg')) else np.nan)
-        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: asos_data.get(x, {}).get('humi') if is_valid_humi(asos_data.get(x, {}).get('humi')) else np.nan)
-        df['passengers'] = df[pass_col]
+        df['temp_max'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: float(asos_data.get(x, {}).get('tmax')) if is_valid_temp(asos_data.get(x, {}).get('tmax')) else np.nan)
+        df['temp_min'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: float(asos_data.get(x, {}).get('tmin')) if is_valid_temp(asos_data.get(x, {}).get('tmin')) else np.nan)
+        df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: float(asos_data.get(x, {}).get('tavg')) if is_valid_temp(asos_data.get(x, {}).get('tavg')) else np.nan)
+        df['temp_avg'] = df['temp_avg'].fillna((df['temp_max'] + df['temp_min']) / 2.0)
+        df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: float(asos_data.get(x, {}).get('humi')) if is_valid_humi(asos_data.get(x, {}).get('humi')) else np.nan)
+        df['passengers'] = pd.to_numeric(df[pass_col], errors='coerce')
 
         if 'pm25_val' in df.columns:
-            df['pm25'] = df['pm25_val']
+            df['pm25'] = pd.to_numeric(df['pm25_val'], errors='coerce')
+        else:
+            df['pm25'] = 18.0
+
+        if df['temp_max'].isna().all():
+            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
+
+        # 🌟 미래 연도(2026년 하반기, 2027년 등) 미집계 구간의 기상·미세먼지·승객수 기준선(Baseline) 정밀 매칭 (평탄화 버그 및 요일 어긋남 차단)
+        df['mm_dd'] = df['date'].dt.strftime('%m-%d')
+        hist_valid_w = df[df['date'].dt.year < target_y].dropna(subset=['temp_max', 'temp_min'])
+        hist_w_by_mmdd = hist_valid_w.sort_values('date', ascending=False).drop_duplicates('mm_dd').set_index('mm_dd')
+        hist_w_by_month = hist_valid_w.groupby('month')[['temp_max', 'temp_min', 'temp_avg', 'humidity']].mean()
+
+        hist_valid_pm = df[df['date'].dt.year < target_y].dropna(subset=['pm25'])
+        hist_pm_by_mmdd = hist_valid_pm.sort_values('date', ascending=False).drop_duplicates('mm_dd').set_index('mm_dd')
+        hist_pm_by_month = hist_valid_pm.groupby('month')['pm25'].mean()
+
+        hist_valid_pass = df.dropna(subset=['passengers']).copy()
+        recent_pass_df = hist_valid_pass.sort_values('date').tail(365)
+        pass_by_m_hol_dow = recent_pass_df.groupby(['month', 'is_holiday', 'dayofweek'])['passengers'].mean().to_dict()
+        pass_by_m_hol = recent_pass_df.groupby(['month', 'is_holiday'])['passengers'].mean().to_dict()
+        pass_overall_mean = float(recent_pass_df['passengers'].mean()) if not recent_pass_df.empty else 350000.0
 
         idx_target = df['date'].dt.year == target_y
         for i in df[idx_target].index:
-            past_date = df.loc[i, 'date'] - pd.DateOffset(years=1)
-            past_val = df[df['date'] == past_date]
-            if not past_val.empty:
-                if pd.isna(df.loc[i, 'temp_max']): df.loc[i, 'temp_max'] = past_val.iloc[0]['temp_max']
-                if pd.isna(df.loc[i, 'temp_min']): df.loc[i, 'temp_min'] = past_val.iloc[0]['temp_min']
-                if pd.isna(df.loc[i, 'temp_avg']): df.loc[i, 'temp_avg'] = past_val.iloc[0]['temp_avg']
-                if pd.isna(df.loc[i, 'humidity']): df.loc[i, 'humidity'] = past_val.iloc[0]['humidity']
-                if pd.isna(df.loc[i, 'passengers']): df.loc[i, 'passengers'] = past_val.iloc[0]['passengers'] * (1 + (pass_rate / 100.0))
-                if 'pm25' in df.columns and pd.isna(df.loc[i, 'pm25']): df.loc[i, 'pm25'] = past_val.iloc[0]['pm25']
-                
-        if df['temp_max'].isna().all():
-            return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
+            mm_dd = df.loc[i, 'mm_dd']
+            m_val = int(df.loc[i, 'month'])
+            hol_val = int(df.loc[i, 'is_holiday'])
+            dow_val = int(df.loc[i, 'dayofweek'])
+
+            if pd.isna(df.loc[i, 'temp_max']):
+                df.loc[i, 'temp_max'] = hist_w_by_mmdd.loc[mm_dd, 'temp_max'] if mm_dd in hist_w_by_mmdd.index else hist_w_by_month.loc[m_val, 'temp_max']
+            if pd.isna(df.loc[i, 'temp_min']):
+                df.loc[i, 'temp_min'] = hist_w_by_mmdd.loc[mm_dd, 'temp_min'] if mm_dd in hist_w_by_mmdd.index else hist_w_by_month.loc[m_val, 'temp_min']
+            if pd.isna(df.loc[i, 'temp_avg']):
+                df.loc[i, 'temp_avg'] = hist_w_by_mmdd.loc[mm_dd, 'temp_avg'] if mm_dd in hist_w_by_mmdd.index else (df.loc[i, 'temp_max'] + df.loc[i, 'temp_min']) / 2.0
+            if pd.isna(df.loc[i, 'humidity']):
+                df.loc[i, 'humidity'] = hist_w_by_mmdd.loc[mm_dd, 'humidity'] if mm_dd in hist_w_by_mmdd.index else hist_w_by_month.loc[m_val, 'humidity']
+            if pd.isna(df.loc[i, 'pm25']):
+                df.loc[i, 'pm25'] = hist_pm_by_mmdd.loc[mm_dd, 'pm25'] if mm_dd in hist_pm_by_mmdd.index else hist_pm_by_month.loc[m_val, 'pm25']
+            if pd.isna(df.loc[i, 'passengers']):
+                df.loc[i, 'passengers'] = pass_by_m_hol_dow.get((m_val, hol_val, dow_val), pass_by_m_hol.get((m_val, hol_val), pass_overall_mean))
         
+        df['passengers'] = df.groupby(['month', 'is_holiday'])['passengers'].transform(lambda s: s.fillna(s.mean())).bfill().ffill()
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
-        df['temp_avg'] = df['temp_avg'].bfill().ffill()
+        df['temp_avg'] = df['temp_avg'].fillna((df['temp_max'] + df['temp_min']) / 2.0).bfill().ffill()
         df['humidity'] = df['humidity'].bfill().ffill()
-        df['passengers'] = df['passengers'].bfill().ffill()
-        if 'pm25' in df.columns:
-            df['pm25'] = df['pm25'].bfill().ffill()
+        df['pm25'] = df['pm25'].bfill().ffill()
 
-        if temp_adj != 0:
-            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_max'] += float(temp_adj)
-            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_avg'] += float(temp_adj)
-            df.loc[idx_target & (df['month'].isin([6, 7, 8])), 'temp_min'] += float(temp_adj)
+        # 도시철도 특화 파생 피처(냉방도일 CDD, 난방도일 HDD, 불쾌지수 THI, 열대야 축열지수, 초미세먼지 35↑ 공조 강제가동) 생성
+        def add_transit_features(d_frame):
+            d_frame['cdd'] = (d_frame['temp_avg'] - 24.0).clip(lower=0)
+            d_frame['hdd'] = (12.0 - d_frame['temp_avg']).clip(lower=0)
+            d_frame['thi'] = 0.81 * d_frame['temp_avg'] + 0.01 * d_frame['humidity'] * (0.99 * d_frame['temp_avg'] - 14.3) + 46.3
+            d_frame['trop_night_deg'] = (d_frame['temp_min'] - 25.0).clip(lower=0)
+            d_frame['is_pm25_bad'] = (d_frame['pm25'] >= 35.0).astype(int)
+            return d_frame
 
-        if winter_temp_adj != 0:
-            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_max'] += float(winter_temp_adj)
-            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_avg'] += float(winter_temp_adj)
-            df.loc[idx_target & (df['month'].isin([12, 1, 2])), 'temp_min'] += float(winter_temp_adj)
-            
-        if 'pm25' in df.columns and pm25_adj != 0:
-            target_indices = df[idx_target].index
-            if pm25_adj > 0:
-                normal_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] <= 35]
-                adjust_idx = normal_days.sort_values('pm25', ascending=False).head(pm25_adj).index
-                df.loc[adjust_idx, 'pm25'] = 45.0
-            elif pm25_adj < 0:
-                bad_days = df.loc[target_indices][df.loc[target_indices, 'pm25'] > 35]
-                adjust_idx = bad_days.sort_values('pm25', ascending=True).head(abs(pm25_adj)).index
-                df.loc[adjust_idx, 'pm25'] = 25.0
+        df = add_transit_features(df)
 
-        features = ['month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers', 'temp_max', 'temp_min', 'temp_avg', 'humidity']
-        if 'pm25' in df.columns: features.append('pm25')
-        
-        train_df = df[df['date'].dt.year <= (target_y - 1)].copy()
-        train_df = train_df.dropna(subset=['target_power'] + features)
+        features = [
+            'month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers',
+            'temp_max', 'temp_min', 'temp_avg', 'humidity',
+            'cdd', 'hdd', 'thi', 'trop_night_deg', 'pm25', 'is_pm25_bad'
+        ]
+        # 물리적 단조 제약: 휴일/주말 다이아(-1), 승객수(+1), 냉난방도일·불쾌지수·열대야 축열·초미세먼지(+1)
+        mono_constraints = (0, 0, -1, -1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1)
+
+        train_df = df[(df['date'].dt.year <= (target_y - 1)) & (df['raw_power'] > 0)].copy()
+        train_df = train_df.dropna(subset=['target_power', 'target_peak'] + features)
         if train_df.empty: return {"error": "학습할 전력량 데이터(과거 실측치)가 존재하지 않습니다."}
              
-        test_df = df[df['date'].dt.year == target_y].copy()
-        test_df = test_df.dropna(subset=features)
-        if test_df.empty: return {"error": f"{target_year}년도 예측을 위한 데이터 포맷이 처리 중 소실되었습니다."}
+        test_base_df = df[df['date'].dt.year == target_y].copy()
+        test_base_df = test_base_df.dropna(subset=features)
+        if test_base_df.empty: return {"error": f"{target_year}년도 예측을 위한 데이터 포맷이 처리 중 소실되었습니다."}
+
+        # 🌟 시뮬레이션 변수(승객수%, 여름기온, 겨울기온, 초미세먼지 나쁨일수)를 타겟 연도 전체에 일관 반영
+        test_df = test_base_df.copy()
+        if pass_rate != 0:
+            test_df['passengers'] = test_df['passengers'] * (1.0 + (float(pass_rate) / 100.0))
+
+        if temp_adj != 0:
+            s_mask = test_df['month'].isin([6, 7, 8])
+            test_df.loc[s_mask, 'temp_max'] += float(temp_adj)
+            test_df.loc[s_mask, 'temp_avg'] += float(temp_adj)
+            test_df.loc[s_mask, 'temp_min'] += float(temp_adj)
+
+        if winter_temp_adj != 0:
+            w_mask = test_df['month'].isin([12, 1, 2])
+            test_df.loc[w_mask, 'temp_max'] += float(winter_temp_adj)
+            test_df.loc[w_mask, 'temp_avg'] += float(winter_temp_adj)
+            test_df.loc[w_mask, 'temp_min'] += float(winter_temp_adj)
+            
+        if pm25_adj != 0:
+            if pm25_adj > 0:
+                normal_days = test_df[test_df['pm25'] < 35.0]
+                adjust_idx = normal_days.sort_values('pm25', ascending=False).head(int(pm25_adj)).index
+                test_df.loc[adjust_idx, 'pm25'] = np.maximum(test_df.loc[adjust_idx, 'pm25'] + 15.0, 42.0)
+            elif pm25_adj < 0:
+                bad_days = test_df[test_df['pm25'] >= 35.0]
+                adjust_idx = bad_days.sort_values('pm25', ascending=True).head(abs(int(pm25_adj))).index
+                test_df.loc[adjust_idx, 'pm25'] = 20.0
+
+        test_df = add_transit_features(test_df)
         
-        X_train, y_train = train_df[features].copy(), train_df['target_power'].copy()
-        X_test = test_df[features].copy()
+        X_train = train_df[features].bfill().ffill()
+        y_train_kwh = train_df['target_power'].copy()
+        y_train_peak = train_df['target_peak'].copy()
+        X_test_base = test_base_df[features].bfill().ffill()
+        X_test = test_df[features].bfill().ffill()
         
-        X_train = X_train.bfill().ffill()
-        X_test = X_test.bfill().ffill()
+        # 🌟 1) 일일 전력량(kWh) 전용 XGBoost 모델 & 2) 일일 최대수요(kW) 전용 XGBoost 모델 분리 학습
+        model_kwh = xgb.XGBRegressor(
+            n_estimators=120, learning_rate=0.05, max_depth=5,
+            monotone_constraints=mono_constraints, random_state=42
+        )
+        model_kwh.fit(X_train, y_train_kwh)
+
+        model_peak = xgb.XGBRegressor(
+            n_estimators=120, learning_rate=0.05, max_depth=5,
+            monotone_constraints=mono_constraints, random_state=42
+        )
+        model_peak.fit(X_train, y_train_peak)
+
+        base_pred_kwh = model_kwh.predict(X_test_base)
+        raw_pred_kwh = model_kwh.predict(X_test)
+        base_pred_peak = model_peak.predict(X_test_base)
+        raw_pred_peak = model_peak.predict(X_test)
+
+        # 피크 모델의 평균 회귀(스무딩) 현상 보정을 위한 직전 연도 첨두 부하율(Crest Factor) 산출
+        train_last_year_df = train_df[train_df['date'].dt.year == (target_y - 1)].copy()
+        ref_df = train_last_year_df if not train_last_year_df.empty else train_df
+        ref_pred_peak = model_peak.predict(ref_df[features].bfill().ffill())
+        actual_ref_peak = float(ref_df['target_peak'].max())
+        pred_ref_peak_max = float(np.max(ref_pred_peak)) if len(ref_pred_peak) > 0 else 1.0
+        crest_factor = float(np.clip(actual_ref_peak / pred_ref_peak_max, 1.0, 1.35)) if pred_ref_peak_max > 0 else 1.0
+
+        # 트리 모델의 극단치 리프 포화(Extrapolation 한계)를 보완하는 개소별 물리 민감도 산출
+        warm_tr = train_df[train_df['temp_avg'] >= 22.0]
+        cold_tr = train_df[train_df['temp_avg'] <= 12.0]
+        cool_slope_kwh = max(0.0, float(np.polyfit(warm_tr['temp_avg'], warm_tr['target_power'], 1)[0])) if len(warm_tr) >= 10 else 0.0
+        heat_slope_kwh = max(0.0, float(-np.polyfit(cold_tr['temp_avg'], cold_tr['target_power'], 1)[0])) if len(cold_tr) >= 10 else 0.0
+        cool_slope_kw = max(0.0, float(np.polyfit(warm_tr['temp_avg'], warm_tr['target_peak'], 1)[0])) if len(warm_tr) >= 10 else 0.0
+        heat_slope_kw = max(0.0, float(-np.polyfit(cold_tr['temp_avg'], cold_tr['target_peak'], 1)[0])) if len(cold_tr) >= 10 else 0.0
+
+        wk_mean_kwh = float(train_df[train_df['is_holiday'] == 0]['target_power'].mean())
+        off_mean_kwh = float(train_df[train_df['is_holiday'] == 1]['target_power'].mean())
+        var_load_kwh = max(wk_mean_kwh - off_mean_kwh, wk_mean_kwh * 0.05)
+        wk_mean_kw = float(train_df[train_df['is_holiday'] == 0]['target_peak'].mean())
+        off_mean_kw = float(train_df[train_df['is_holiday'] == 1]['target_peak'].mean())
+        var_load_kw = max(wk_mean_kw - off_mean_kw, wk_mean_kw * 0.05)
+
+        final_pred_kwh = raw_pred_kwh.copy()
+        final_pred_peak = (raw_pred_peak * crest_factor).copy()
+        base_scaled_peak = (base_pred_peak * crest_factor).copy()
+
+        for idx_pos, (_, row_t) in enumerate(test_df.iterrows()):
+            m_v = int(row_t['month'])
+            if m_v in [6, 7, 8] and temp_adj != 0:
+                tree_dk = raw_pred_kwh[idx_pos] - base_pred_kwh[idx_pos]
+                phys_dk = float(temp_adj) * cool_slope_kwh
+                if (temp_adj > 0 and tree_dk < phys_dk * 0.5) or (temp_adj < 0 and tree_dk > phys_dk * 0.5):
+                    final_pred_kwh[idx_pos] = base_pred_kwh[idx_pos] + 0.5 * tree_dk + 0.5 * phys_dk
+
+                tree_dp = final_pred_peak[idx_pos] - base_scaled_peak[idx_pos]
+                phys_dp = float(temp_adj) * cool_slope_kw * crest_factor
+                if (temp_adj > 0 and tree_dp < phys_dp * 0.5) or (temp_adj < 0 and tree_dp > phys_dp * 0.5):
+                    final_pred_peak[idx_pos] = base_scaled_peak[idx_pos] + 0.5 * tree_dp + 0.5 * phys_dp
+
+            if m_v in [12, 1, 2] and winter_temp_adj != 0:
+                tree_dk = raw_pred_kwh[idx_pos] - base_pred_kwh[idx_pos]
+                phys_dk = -float(winter_temp_adj) * heat_slope_kwh
+                if (winter_temp_adj < 0 and tree_dk < phys_dk * 0.5) or (winter_temp_adj > 0 and tree_dk > phys_dk * 0.5):
+                    final_pred_kwh[idx_pos] = base_pred_kwh[idx_pos] + 0.5 * tree_dk + 0.5 * phys_dk
+
+                tree_dp = final_pred_peak[idx_pos] - base_scaled_peak[idx_pos]
+                phys_dp = -float(winter_temp_adj) * heat_slope_kw * crest_factor
+                if (winter_temp_adj < 0 and tree_dp < phys_dp * 0.5) or (winter_temp_adj > 0 and tree_dp > phys_dp * 0.5):
+                    final_pred_peak[idx_pos] = base_scaled_peak[idx_pos] + 0.5 * tree_dp + 0.5 * phys_dp
+
+            if pass_rate != 0:
+                phys_pk = (float(pass_rate) / 100.0) * var_load_kwh * 0.35
+                phys_pp = (float(pass_rate) / 100.0) * var_load_kw * 0.35
+                final_pred_kwh[idx_pos] += phys_pk * 0.5
+                final_pred_peak[idx_pos] += phys_pp * 0.5
+
+        test_df['pred_power'] = np.maximum(final_pred_kwh, 0.0)
+        test_df['pred_peak'] = np.maximum(final_pred_peak, 0.0)
         
-        model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
-        model.fit(X_train, y_train)
-        test_df['pred_power'] = model.predict(X_test)
-        
-        if reports_data:
+        # 🌟 부하증감 신고(Firebase load_reports) 자동 반영 (전력량 kWh 및 최대수요 Peak kW 동시 가감)
+        if local_reports:
             try:
-                local_reports = json.loads(reports_data)
                 for r_info in local_reports:
-                    if r_info.get('status') == '확인':
+                    if isinstance(r_info, dict) and r_info.get('status') == '확인':
                         r_sub = r_info.get('substation', '')
                         is_match = False
                         if station == '전체' and r_sub != '종합청사': is_match = True
@@ -1917,38 +2098,46 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                             kw_val = float(r_info.get('kw', 0))
                             hours_val = float(r_info.get('hours', 0))
                             daily_kwh = kw_val * hours_val
-                            if '철거' in str(r_info.get('type', '')): daily_kwh = -daily_kwh
+                            peak_delta = kw_val
+                            if '철거' in str(r_info.get('type', '')) or '-' in str(r_info.get('type', '')):
+                                daily_kwh = -daily_kwh
+                                peak_delta = -peak_delta
                             mask_after = (test_df['date'] >= app_date)
-                            test_df.loc[mask_after, 'pred_power'] += daily_kwh
+                            test_df.loc[mask_after, 'pred_power'] = np.maximum(test_df.loc[mask_after, 'pred_power'] + daily_kwh, 0.0)
+                            test_df.loc[mask_after, 'pred_peak'] = np.maximum(test_df.loc[mask_after, 'pred_peak'] + peak_delta, 0.0)
             except Exception as parse_err:
-                print(f"로컬 부하증감 데이터 파싱 중 오류: {parse_err}")
+                logger.warning(f"부하증감 신고 데이터 반영 중 오류: {parse_err}")
 
-        train_pred = model.predict(X_train)
-        r2_acc = float(round(r2_score(y_train, train_pred) * 100, 1))
+        train_pred = model_kwh.predict(X_train)
+        r2_acc = float(round(r2_score(y_train_kwh, train_pred) * 100, 1))
         
-        train_last_year_df = train_df[train_df['date'].dt.year == (target_y - 1)]
-        lt = float(train_last_year_df['target_power'].sum()) if not train_last_year_df.empty else 0.0
+        lt = float(train_last_year_df['raw_power'].sum()) if not train_last_year_df.empty else 0.0
         ft = float(test_df['pred_power'].sum())
         
-        last_peak_val = float(train_last_year_df['target_power'].max()) if not train_last_year_df.empty else 0.0
-        peak_future_val = float(test_df['pred_power'].max())
+        last_peak_val = float(train_last_year_df['raw_peak'].max()) if not train_last_year_df.empty else 0.0
+        peak_future_val = float(test_df['pred_peak'].max())
         
-        importances = [float(v) for v in (model.feature_importances_ * 100).round(1)]
+        importances = [float(v) for v in (model_kwh.feature_importances_ * 100).round(1)]
         feat_df = pd.DataFrame({'name': features, 'value': importances})
         
         name_map = {
-            'month': '계절(월)', 'temp_max': '기온', 'temp_min': '기온', 
-            'temp_avg': '기온', 'humidity': '습도', 'passengers': '승객수', 
-            'pm25': '초미세먼지(PM2.5)', 'is_holiday': '공휴일', 'is_weekend': '주말'
+            'month': '계절(월)',
+            'temp_max': '기온', 'temp_min': '기온', 'temp_avg': '기온',
+            'cdd': '기온', 'hdd': '기온', 'trop_night_deg': '기온',
+            'humidity': '습도', 'thi': '습도',
+            'passengers': '승객수',
+            'pm25': '초미세먼지(PM2.5)', 'is_pm25_bad': '초미세먼지(PM2.5)',
+            'is_holiday': '공휴일', 'is_weekend': '주말', 'dayofweek': '주말'
         }
         feat_df['name'] = feat_df['name'].map(lambda x: name_map.get(x, x))
         feat_df = feat_df.groupby('name', as_index=False)['value'].sum()
+        feat_df['value'] = feat_df['value'].round(1)
         
         top_feats = feat_df[feat_df['name'].isin(set(name_map.values()))].sort_values('value', ascending=False).to_dict(orient='records')
         
         records = []
         for m in range(1, 13):
-            m_past = float(train_last_year_df[train_last_year_df['date'].dt.month == m]['target_power'].sum()) if not train_last_year_df.empty else 0.0
+            m_past = float(train_last_year_df[train_last_year_df['date'].dt.month == m]['raw_power'].sum()) if not train_last_year_df.empty else 0.0
             m_pred = float(test_df[test_df['date'].dt.month == m]['pred_power'].sum())
             records.append({ "month": f"{m}월", "past_kwh": m_past, "pred_kwh": m_pred })
             
