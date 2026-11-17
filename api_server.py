@@ -793,10 +793,11 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
 
     diff = (e_dt - s_dt).days + 1
     today_str = now_kst.strftime("%Y-%m-%d")
-    recent_3d_str = (now_kst - timedelta(days=3)).strftime("%Y-%m-%d")
     
     missing_dates = []
     cached_res = {}
+    recent_14d_str = (now_kst - timedelta(days=14)).strftime("%Y-%m-%d")
+
     for i in range(diff):
         d_str = (s_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         tmax_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", "--")
@@ -804,25 +805,109 @@ def fetch_asos_daily(start_date: str, end_date: str, is_bypass: bool = False):
         tavg_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", "--")
         humi_v = GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", "--")
         
-        # 🌟 4개 지표(최고·최저·평균기온, 습도)가 모두 유효한 숫자일 때만 캐시 인정 (하나라도 '--'면 재수집)
-        is_fully_valid = (
-            is_valid_temp(tmax_v) and 
-            is_valid_temp(tmin_v) and 
-            is_valid_temp(tavg_v) and 
-            is_valid_humi(humi_v)
-        )
+        # 🌟 최근 14일 이내는 기온·습도 4개 중 하나라도 '--'면 재조회하고,
+        # 14일 이전 과거(예: 2023-03-26 습도 영구결측)는 기온이 정상 존재하면 반복 재호출하지 않고 '--' 유지
+        if d_str >= recent_14d_str:
+            is_fully_valid = is_valid_temp(tmax_v) and is_valid_temp(tmin_v) and is_valid_temp(tavg_v) and is_valid_humi(humi_v)
+        else:
+            is_fully_valid = is_valid_temp(tmax_v) and is_valid_temp(tmin_v)
+
         if not is_bypass and is_fully_valid:
             cached_res[d_str] = {
                 "tmax": tmax_v,
                 "tmin": tmin_v,
                 "tavg": tavg_v,
-                "humi": humi_v
+                "humi": humi_v if is_valid_humi(humi_v) else "--"
             }
         else:
             missing_dates.append(d_str)
             
     if not missing_dates: 
         return cached_res
+
+    # 🌟 누락일이 여러 연도에 떨어져 있을 때(예: 2023-03-26, 2024-02-21, 2026-11-16) 30일 단위 구간으로 나누어 호출
+    sorted_dts = sorted(datetime.strptime(d, "%Y-%m-%d") for d in missing_dates)
+    chunks = []
+    c_start = sorted_dts[0]
+    c_end = sorted_dts[0]
+    for dt in sorted_dts[1:]:
+        if (dt - c_start).days <= 30:
+            c_end = dt
+        else:
+            chunks.append((c_start.strftime("%Y%m%d"), c_end.strftime("%Y%m%d")))
+            c_start = dt
+            c_end = dt
+    chunks.append((c_start.strftime("%Y%m%d"), c_end.strftime("%Y%m%d")))
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+    res = {}
+
+    for req_start, req_end in chunks:
+        url = f"{KMA_PROXY_URL}?type=asos&tm1={req_start}&tm2={req_end}&stn=143&authKey={KMA_API_HUB_KEY}"
+        for _ in range(2):
+            try:
+                r = http_session.get(url, headers=headers, timeout=15)
+                r.encoding = 'utf-8'
+                lines = r.text.split('\n')
+                headers_list = []
+                chunk_parsed = False
+                for line in lines:
+                    if line.startswith('#') and ':' in line and '.' in line:
+                        left_side = line.split(':')[0].strip()
+                        cleaned = left_side.replace('#', '').strip()
+                        if cleaned and cleaned[0].isdigit():
+                            col_name = left_side.split('.')[1].strip().split()[0]
+                            if col_name not in headers_list: headers_list.append(col_name)
+                    elif line.strip() and not line.startswith('#'):
+                        parts = line.split()
+                        if len(parts) >= 15:
+                            def parse_temp(v):
+                                return float(v) if is_valid_temp(v) else "--"
+                            def parse_humi(v):
+                                return float(v) if is_valid_humi(v) else "--"
+
+                            if headers_list and len(parts) >= len(headers_list) - 5:
+                                row_dict = dict(zip(headers_list, parts))
+                                date_key = row_dict.get('TM')
+                                if date_key and len(date_key) >= 8:
+                                    d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                                    res[d_str] = {
+                                        "tmax": parse_temp(row_dict.get('TA_MAX') or row_dict.get('TX')),
+                                        "tmin": parse_temp(row_dict.get('TA_MIN') or row_dict.get('TN')),
+                                        "tavg": parse_temp(row_dict.get('TA_AVG') or row_dict.get('TA')),
+                                        "humi": parse_humi(row_dict.get('HM_AVG') or row_dict.get('HM'))
+                                    }
+                                    chunk_parsed = True
+                            elif len(parts[0]) == 8 and parts[0].isdigit():
+                                date_key = parts[0]
+                                d_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                                res[d_str] = {
+                                    "tavg": parse_temp(parts[10]),
+                                    "tmax": parse_temp(parts[11]),
+                                    "tmin": parse_temp(parts[13]),
+                                    "humi": parse_humi(parts[18]) if len(parts) > 18 else "--"
+                                }
+                                chunk_parsed = True
+                if chunk_parsed:
+                    break
+            except Exception:
+                time.sleep(0.5)
+
+    for d_str in missing_dates:
+        v = res.get(d_str, {"tmax": "--", "tmin": "--", "tavg": "--", "humi": "--"})
+        if d_str < today_str:
+            if is_valid_temp(v["tmax"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmax"] = v["tmax"]
+            if is_valid_temp(v["tmin"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tmin"] = v["tmin"]
+            if is_valid_temp(v["tavg"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_tavg"] = v["tavg"]
+            if is_valid_humi(v["humi"]): GLOBAL_WEATHER_CACHE[f"ASOS_{d_str}_humi"] = v["humi"]
+        cached_res[d_str] = {
+            "tmax": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmax", v["tmax"]),
+            "tmin": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tmin", v["tmin"]),
+            "tavg": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_tavg", v["tavg"]),
+            "humi": GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_str}_humi", v["humi"] if is_valid_humi(v["humi"]) else "--")
+        }
+            
+    return cached_res
 
     req_start = min(missing_dates).replace("-", "")
     req_end = max(missing_dates).replace("-", "")
@@ -1967,7 +2052,7 @@ def export_master_backup():
         df_pm_merged = df_pm_merged[final_pm_cols].sort_values(by='일자').reset_index(drop=True)
         xls_dict["초미세먼지"] = df_pm_merged
 
-        # 🌟 [기상청 ASOS & 동네 AWS 백업] 최근 구간 강제 재조회(is_bypass=True)로 가집계/오류값을 최신 확정값으로 자동 갱신
+        # 🌟 [기상청 ASOS & 동네 AWS 백업] 선형 보간 없이 실측값만 저장하고 결측치는 '--'로 그대로 유지
         load_excel_dataset()
         recent_7d_str = max("2026-09-05", (yesterday - timedelta(days=7)).strftime("%Y-%m-%d"))
         recent_3d_aws_str = max("2026-09-05", (yesterday - timedelta(days=2)).strftime("%Y-%m-%d"))
@@ -1983,14 +2068,13 @@ def export_master_backup():
             tn = v.get("tmin", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tmin", "--"))
             ta = v.get("tavg", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_tavg", "--"))
             hm = v.get("humi", GLOBAL_WEATHER_CACHE.get(f"ASOS_{d_s}_humi", "--"))
-            if is_valid_temp(tx):
-                asos_rows.append({
-                    "date": d_s,
-                    "tmax": tx,
-                    "tmin": tn if is_valid_temp(tn) else "--",
-                    "tavg": ta if is_valid_temp(ta) else "--",
-                    "humi": hm if is_valid_humi(hm) else "--"
-                })
+            asos_rows.append({
+                "date": d_s,
+                "tmax": float(tx) if is_valid_temp(tx) else "--",
+                "tmin": float(tn) if is_valid_temp(tn) else "--",
+                "tavg": float(ta) if is_valid_temp(ta) else "--",
+                "humi": float(hm) if is_valid_humi(hm) else "--"
+            })
         
         if asos_rows:
             xls_dict["기상청_ASOS"] = pd.DataFrame(asos_rows)
