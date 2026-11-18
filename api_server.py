@@ -2220,6 +2220,97 @@ def get_bill_data(station: str, year: str):
     GLOBAL_API_CACHE["bill"][cache_key] = res
     return res
 
+@app.get("/api/overview")
+def get_overview_data(bypass: str = "false"):
+    is_bypass = bypass.lower() == "true"
+    overview_cache = GLOBAL_API_CACHE.setdefault("overview", {})
+    if not is_bypass and "all" in overview_cache:
+        c_time, c_res = overview_cache["all"]
+        if time.time() - c_time < 300:
+            return c_res
+
+    now_kst = get_kst_now()
+    today_str = now_kst.strftime("%Y-%m-%d")
+    yesterday_str = (now_kst - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 🌟 1) 16개 고유 한전 고객번호 캐시를 먼저 일괄 적재하여 24개 개소 개별 조회 시 중복 호출 방지
+    get_kepco_data_for_station("전체", today_str, is_bypass)
+    get_kepco_data_for_station("종합청사", today_str, is_bypass)
+    get_kepco_data_for_station("전체", yesterday_str, False)
+    get_kepco_data_for_station("종합청사", yesterday_str, False)
+
+    all_stations = (
+        [("1호선", s) for s in LINE_STATIONS["1호선"]] +
+        [("2호선", s) for s in LINE_STATIONS["2호선"]] +
+        [("3호선", s) for s in LINE_STATIONS["3호선"]] +
+        [("종합청사", "종합청사")]
+    )
+
+    items = []
+    counts = {"danger": 0, "warning": 0, "normal": 0}
+
+    for line_name, st in all_stations:
+        t_usage, t_peak, t_details = get_kepco_data_for_station(st, today_str, False)
+        y_usage, y_peak, y_details = get_kepco_data_for_station(st, yesterday_str, False)
+
+        # 금일 실제 집계가 들어온 마지막 15분 구간 인덱스 확인 (전일 동시간대 비교용)
+        valid_indices = [idx for idx, d in enumerate(t_details) if d.get("usage_kwh", 0) > 0]
+        if valid_indices:
+            last_idx = max(valid_indices)
+            last_time = t_details[last_idx]["time"]
+            peak_item = max(t_details[:last_idx + 1], key=lambda x: x.get("peak_kw", 0))
+            peak_time = peak_item["time"] if peak_item.get("peak_kw", 0) > 0 else "--:--"
+            y_same_kwh = sum(d.get("usage_kwh", 0.0) for d in y_details[:last_idx + 1]) if y_details else 0.0
+        else:
+            last_idx = -1
+            last_time = "집계대기"
+            peak_time = "--:--"
+            y_same_kwh = 0.0
+
+        dod_pct = round(((t_usage - y_same_kwh) / y_same_kwh) * 100, 1) if y_same_kwh > 0 else 0.0
+
+        # 임계치 설정 시 설정값 사용, 미설정 시 전일 최대피크의 110%를 임시 기준선으로 적용
+        custom_limit = float(THRESHOLDS.get(st, 0.0))
+        ref_limit = custom_limit if custom_limit > 0 else round(y_peak * 1.1, 1)
+        is_custom_limit = custom_limit > 0
+
+        peak_ratio = round((t_peak / ref_limit) * 100, 1) if ref_limit > 0 else 0.0
+
+        # 신호등 판정: 🔴위험(피크 95% 이상) / 🟡주의(피크 80% 이상 또는 전일 동시간 대비 +10% 이상 급증) / 🟢정상
+        if ref_limit > 0 and peak_ratio >= 95.0:
+            status = "danger"
+            counts["danger"] += 1
+        elif (ref_limit > 0 and peak_ratio >= 80.0) or dod_pct >= 10.0:
+            status = "warning"
+            counts["warning"] += 1
+        else:
+            status = "normal"
+            counts["normal"] += 1
+
+        items.append({
+            "line": line_name,
+            "station": st,
+            "status": status,
+            "today_kwh": round(t_usage, 1),
+            "yest_same_kwh": round(y_same_kwh, 1),
+            "dod_pct": dod_pct,
+            "today_peak": round(t_peak, 1),
+            "yest_peak": round(y_peak, 1),
+            "peak_time": peak_time,
+            "last_time": last_time,
+            "limit_kw": round(ref_limit, 1),
+            "is_custom_limit": is_custom_limit,
+            "peak_ratio": peak_ratio
+        })
+
+    res = {
+        "updated_at": now_kst.strftime("%Y-%m-%d %H:%M:%S"),
+        "counts": counts,
+        "items": items
+    }
+    overview_cache["all"] = (time.time(), res)
+    return res
+
 @app.get("/api/backup")
 def export_master_backup():
     file_path = "uploaded_dataset.xlsx"
