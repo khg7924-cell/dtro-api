@@ -465,7 +465,8 @@ async def auto_cache_warmer():
                 GLOBAL_API_CACHE["dashboard"].clear()
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str)
-                    
+
+                get_overview_data("true")    
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
             logger.info("✅ [상시 캐싱 완료] 데이터 100% 적재 완료. 임계치 감시 대기중.")
@@ -490,6 +491,7 @@ async def startup_event():
 def set_threshold(station: str, limit: float):
     THRESHOLDS[station] = limit
     save_thresholds()
+    GLOBAL_API_CACHE.get("overview", {}).clear()  # 🌟 [1줄 추가] 임계치 변경 시 종합 관제 신호등 즉시 갱신
     return {"status": "success", "station": station, "limit": limit}
 
 @app.get("/api/threshold/{station}")
