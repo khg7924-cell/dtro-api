@@ -1456,7 +1456,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
     try:
         df = load_excel_dataset()
         if df is None: return {"error": "과거 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
-        
+
+        # 🌟 종합청사 여부 판별 (열차 운행·승객수·열차 다이아와 무관한 업무시설 단독 부하 분기용)
+        is_hq = (station == '종합청사')
+
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
             df['target_power'] = df[kwh_cols].sum(axis=1) if kwh_cols else pd.Series(0, index=df.index)
@@ -1469,13 +1472,13 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             df['target_power'] = df[kwh_cols[0]] if kwh_cols else pd.Series(0, index=df.index)
             
         pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
-        df['passengers'] = pd.to_numeric(df[pass_col], errors='coerce') if pass_col else np.nan
+        df['passengers'] = pd.to_numeric(df[pass_col], errors='coerce') if (pass_col and not is_hq) else np.nan
 
         if 'pm25_val' in df.columns:
             df['pm25_val'] = pd.to_numeric(df['pm25_val'], errors='coerce')
         else:
             df['pm25_val'] = np.nan
-        # 🌟 초미세먼지 '나쁨(35㎍/㎥ 이상)' 시 역사 공조설비 추가 가동 기준 적용
+        # 🌟 초미세먼지 '나쁨(35㎍/㎥ 이상)' 시 공조설비 추가 가동 기준 적용
         df['is_pm25_bad'] = (df['pm25_val'] >= 35.0).astype(int)
 
         df['target_power'] = pd.to_numeric(df['target_power'], errors='coerce').fillna(0)
@@ -1524,10 +1527,10 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         diff_total = tc - tb
         diff_pct_total = round((diff_total / tb) * 100, 1) if tb > 0 else 0
 
-        # 🌟 신규 개통/연장 역사(예: 1호선 숙천·금락 등 기준연도 미운영 개소) 부하 자동 분리
+        # 🌟 신규 개통/연장 역사(예: 1호선 숙천·금락 등 기준연도 미운영 개소) 부하 자동 분리 (종합청사 제외)
         new_ext_kwh = 0.0
         new_ext_info = []
-        if len(kwh_cols) > 1:
+        if not is_hq and len(kwh_cols) > 1:
             for col in kwh_cols:
                 b_s = float(df_base[col].fillna(0).sum())
                 c_s = float(df_comp[col].fillna(0).sum())
@@ -1545,7 +1548,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             common_cols = kwh_cols
         df['common_power'] = df[common_cols].sum(axis=1) if len(common_cols) > 1 else (df[common_cols[0]] if common_cols else df['target_power'])
         df_base['common_power'] = df_base[common_cols].sum(axis=1) if len(common_cols) > 1 else (df_base[common_cols[0]] if common_cols else df_base['target_power'])
-        df_comp['common_power'] = df_comp[common_cols].sum(axis=1) if len(common_cols) > 1 else (df_comp[common_cols[0]] if common_cols else df_base['target_power'])
+        df_comp['common_power'] = df_comp[common_cols].sum(axis=1) if len(common_cols) > 1 else (df_comp[common_cols[0]] if common_cols else df_comp['target_power'])
 
         common_tb = float(df_base['common_power'].sum())
         common_tc = float(df_comp['common_power'].sum())
@@ -1594,28 +1597,30 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         st_b = calc_env_metrics(df_base)
         st_c = calc_env_metrics(df_comp)
 
-        # 승객수 비교 (공통 집계 월 및 일평균 승객수 기준으로 미집계 월 착시 방지)
-        b_pass_valid = df_base['passengers'].dropna()
-        c_pass_valid = df_comp['passengers'].dropna()
-        common_pass_months = sorted(set(df_base.dropna(subset=['passengers'])['month']) & set(df_comp.dropna(subset=['passengers'])['month']))
-        if common_pass_months and (len(b_pass_valid) < len(df_base) * 0.9 or len(c_pass_valid) < len(df_comp) * 0.9):
-            b_p_sub = df_base[df_base['month'].isin(common_pass_months)]['passengers'].dropna()
-            c_p_sub = df_comp[df_comp['month'].isin(common_pass_months)]['passengers'].dropna()
-            base_pass_sum, comp_pass_sum = float(b_p_sub.sum()), float(c_p_sub.sum())
-            b_pass_daily = float(b_p_sub.mean()) if not b_p_sub.empty else 0.0
-            c_pass_daily = float(c_p_sub.mean()) if not c_p_sub.empty else 0.0
-            pass_note = f" (공통 집계 {min(common_pass_months)}~{max(common_pass_months)}월 기준)"
-        else:
-            base_pass_sum, comp_pass_sum = float(b_pass_valid.sum()), float(c_pass_valid.sum())
-            b_pass_daily = float(b_pass_valid.mean()) if not b_pass_valid.empty else 0.0
-            c_pass_daily = float(c_pass_valid.mean()) if not c_pass_valid.empty else 0.0
-            pass_note = ""
+        # 승객수 비교 (종합청사는 산출 제외)
+        base_pass_sum, comp_pass_sum, b_pass_daily, c_pass_daily = 0.0, 0.0, 0.0, 0.0
+        pass_note, p_diff, pass_daily_diff, pass_daily_pct = "", 0.0, 0.0, 0.0
+        if not is_hq:
+            b_pass_valid = df_base['passengers'].dropna()
+            c_pass_valid = df_comp['passengers'].dropna()
+            common_pass_months = sorted(set(df_base.dropna(subset=['passengers'])['month']) & set(df_comp.dropna(subset=['passengers'])['month']))
+            if common_pass_months and (len(b_pass_valid) < len(df_base) * 0.9 or len(c_pass_valid) < len(df_comp) * 0.9):
+                b_p_sub = df_base[df_base['month'].isin(common_pass_months)]['passengers'].dropna()
+                c_p_sub = df_comp[df_comp['month'].isin(common_pass_months)]['passengers'].dropna()
+                base_pass_sum, comp_pass_sum = float(b_p_sub.sum()), float(c_p_sub.sum())
+                b_pass_daily = float(b_p_sub.mean()) if not b_p_sub.empty else 0.0
+                c_pass_daily = float(c_p_sub.mean()) if not c_p_sub.empty else 0.0
+                pass_note = f" (공통 집계 {min(common_pass_months)}~{max(common_pass_months)}월 기준)"
+            else:
+                base_pass_sum, comp_pass_sum = float(b_pass_valid.sum()), float(c_pass_valid.sum())
+                b_pass_daily = float(b_pass_valid.mean()) if not b_pass_valid.empty else 0.0
+                c_pass_daily = float(c_pass_valid.mean()) if not c_pass_valid.empty else 0.0
 
-        p_diff = comp_pass_sum - base_pass_sum
-        pass_daily_diff = c_pass_daily - b_pass_daily
-        pass_daily_pct = round((pass_daily_diff / b_pass_daily) * 100, 1) if b_pass_daily > 0 else 0.0
+            p_diff = comp_pass_sum - base_pass_sum
+            pass_daily_diff = c_pass_daily - b_pass_daily
+            pass_daily_pct = round((pass_daily_diff / b_pass_daily) * 100, 1) if b_pass_daily > 0 else 0.0
 
-        # 열차 다이아(평일 vs 휴일) 실측 전력 격차 및 캘린더 영향도 산출
+        # 평일 vs 휴일(종합청사: 근무일 vs 휴무일 / 노선·역사: 평일 다이아 vs 휴일 다이아) 실측 부하 격차
         wk_avg_b = float(df_base[df_base['is_offday'] == 0]['common_power'].mean()) if not df_base[df_base['is_offday'] == 0].empty else 0.0
         off_avg_b = float(df_base[df_base['is_offday'] == 1]['common_power'].mean()) if not df_base[df_base['is_offday'] == 1].empty else 0.0
         dia_gap_kwh = wk_avg_b - off_avg_b
@@ -1631,9 +1636,13 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         cool_sens = float(np.polyfit(warm_pool['tavg'], warm_pool['common_power'], 1)[0]) if len(warm_pool) >= 6 else 0.0
         heat_sens = float(abs(np.polyfit(cold_pool['tavg'], cold_pool['common_power'], 1)[0])) if len(cold_pool) >= 6 else 0.0
 
-        # 🌟 물리 제약(monotone_constraints)을 적용한 XGBoost 요인별 기여도(kWh) 정량 분해
-        features = ['month', 'dayofweek', 'is_offday', 'passengers', 'tmax', 'tmin', 'tavg', 'humi', 'cdd', 'hdd', 'thi', 'trop_night_deg', 'pm25_val', 'is_pm25_bad']
-        mono_constraints = (0, 0, -1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1)
+        # 🌟 물리 제약(monotone_constraints)을 적용한 XGBoost 요인별 기여도(kWh) 정량 분해 (종합청사는 승객수 피처 완전 배제)
+        if is_hq:
+            features = ['month', 'dayofweek', 'is_offday', 'tmax', 'tmin', 'tavg', 'humi', 'cdd', 'hdd', 'thi', 'trop_night_deg', 'pm25_val', 'is_pm25_bad']
+            mono_constraints = (0, 0, -1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1)
+        else:
+            features = ['month', 'dayofweek', 'is_offday', 'passengers', 'tmax', 'tmin', 'tavg', 'humi', 'cdd', 'hdd', 'thi', 'trop_night_deg', 'pm25_val', 'is_pm25_bad']
+            mono_constraints = (0, 0, -1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1)
 
         for f in features:
             med_v = pool_df[f].median() if pd.notna(pool_df[f].median()) else 0.0
@@ -1661,7 +1670,7 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                         df_c_w.loc[df_c_w['month'] == m, wc] = df_comp.loc[df_comp['month'] == m, wc] - (cm - bm)
             weather_effect_kwh = float(pred_c_full - model.predict(df_c_w[features]).sum())
 
-            # 2) 초미세먼지 나쁨(>=35) 역사 공조설비 추가 가동 순수 기여량
+            # 2) 초미세먼지 나쁨(>=35) 공조·환기 설비 추가 가동 순수 기여량
             df_c_pm = df_comp.copy()
             for m in range(start_month, end_month + 1):
                 bm = df_base[df_base['month'] == m]['pm25_val'].mean()
@@ -1678,13 +1687,14 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
                 clean_sample['pm25_val'] = 15.0
                 pm_unit_bad_kwh = max(0.0, float((model.predict(bad_sample[features]) - model.predict(clean_sample[features])).mean()))
 
-            # 3) 승객수 증감에 따른 여객 동력·환기 부하 순수 기여량
-            df_c_p = df_comp.copy()
-            if pass_daily_pct != 0:
-                df_c_p['passengers'] = df_comp['passengers'] / (1.0 + (pass_daily_pct / 100.0))
-            pass_effect_kwh = float(pred_c_full - model.predict(df_c_p[features]).sum())
+            # 3) 승객수 증감 기여량 (종합청사 제외)
+            if not is_hq:
+                df_c_p = df_comp.copy()
+                if pass_daily_pct != 0:
+                    df_c_p['passengers'] = df_comp['passengers'] / (1.0 + (pass_daily_pct / 100.0))
+                pass_effect_kwh = float(pred_c_full - model.predict(df_c_p[features]).sum())
 
-        expected_env_diff = weather_effect_kwh + pm25_effect_kwh + dia_shift_kwh + pass_effect_kwh
+        expected_env_diff = weather_effect_kwh + pm25_effect_kwh + dia_shift_kwh + (0.0 if is_hq else pass_effect_kwh)
         net_operation_diff = common_diff - expected_env_diff
 
         # 월별 최대 증가월 / 최대 감소월 추출
@@ -1692,9 +1702,6 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         max_inc_m = max(active_records, key=lambda x: x["diff"]) if active_records else None
         max_dec_m = min(active_records, key=lambda x: x["diff"]) if active_records else None
 
-        # =====================================================================
-        # 📝 도시철도 특화 심층 분석 리포트 텍스트 조립
-        # =====================================================================
         s_tmax_diff = st_c['s_tmax'] - st_b['s_tmax']
         s_humi_diff = st_c['s_humi'] - st_b['s_humi']
         s_thi_diff = st_c['s_thi'] - st_b['s_thi']
@@ -1710,58 +1717,101 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
         pm_bad_diff = st_c['pm_bad'] - st_b['pm_bad']
 
         period_label = f"{start_month}월~{end_month}월" if start_month != end_month else f"{start_month}월"
-        ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 ({period_label}) 도시철도 전력 수요 AI 심층 분석 리포트\n\n"
 
-        if not asos_data:
-            ai_report_text += "⚠️ 기상청 API 응답 지연으로 일부 기상 지표가 제한되었습니다.\n\n"
+        # =====================================================================
+        # 📝 [분기] 종합청사 업무시설 전용 리포트 vs 도시철도 노선·역사 리포트
+        # =====================================================================
+        if is_hq:
+            ai_report_text = f"🏢 [{station}] {base_year}년 vs {comp_year}년 ({period_label}) 업무시설(청사) 전력 수요 AI 심층 분석 리포트\n"
+            ai_report_text += " ※ 종합청사는 열차 운행(다이아·승객수)과 무관한 업무용 건물 단독 수전 개소로, 기상·대기질·근무일수 전용 모델이 적용되었습니다.\n\n"
 
-        ai_report_text += f"[1] 기상(냉·난방·축열) 및 대기질(역사 공조) 핵심 지표 변동 ({period_label})\n"
-        ai_report_text += f" • {st_b['s_label']} 평균 최고기온 / 습도 : {st_b['s_tmax']:.1f}℃ ({st_b['s_humi']:.1f}%) ➔ {st_c['s_tmax']:.1f}℃ ({st_c['s_humi']:.1f}%) [기온 {s_tmax_diff:+.1f}℃, 습도 {s_humi_diff:+.1f}%p, 불쾌지수 {s_thi_diff:+.1f}]\n"
-        ai_report_text += f" • 냉방 부하 일수 : 실질 냉방일(28℃↑) {st_b['cool_days']}일 ➔ {st_c['cool_days']}일 ({cool_d_diff:+}일) | 폭염(33℃↑) {st_b['hw_days']}일 ➔ {st_c['hw_days']}일 ({hw_diff:+}일) | 냉방도일(CDD) {st_b['cdd']:.1f} ➔ {st_c['cdd']:.1f} ({cdd_diff:+.1f})\n"
-        ai_report_text += f" • 열대야(최저 25℃↑, 야간 터널·역사 축열) : {st_b['trop_nights']}일 ➔ {st_c['trop_nights']}일 ({tn_diff:+}일)\n"
-        ai_report_text += f" • {st_b['w_label']} 평균 최저기온 : {st_b['w_tmin']:.1f}℃ ➔ {st_c['w_tmin']:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
-        ai_report_text += f" • 난방 부하 일수 : 영하권(0℃↓) {st_b['freeze_days']}일 ➔ {st_c['freeze_days']}일 ({frz_diff:+}일) | 한파(-10℃↓) {st_b['cw_days']}일 ➔ {st_c['cw_days']}일 ({cw_diff:+}일) | 난방도일(HDD) {st_b['hdd']:.1f} ➔ {st_c['hdd']:.1f} ({hdd_diff:+.1f})\n"
-        ai_report_text += f" • 초미세먼지(PM2.5) 및 공조 강제가동('나쁨' 35㎍/㎥↑) : 평균 {st_b['pm_avg']:.1f} ➔ {st_c['pm_avg']:.1f}㎍/㎥ ({pm_avg_diff:+.1f}) | '나쁨' {st_b['pm_bad']}일 ➔ {st_c['pm_bad']}일 ({pm_bad_diff:+}일)\n\n"
+            if not asos_data:
+                ai_report_text += "⚠️ 기상청 API 응답 지연으로 일부 기상 지표가 제한되었습니다.\n\n"
 
-        ai_report_text += f"[2] 도시철도 열차 운행 다이아(평일/휴일) 및 여객 수송 지표 변동 ({period_label})\n"
-        ai_report_text += f" • 집계 일수 및 열차 다이아 : 총 {st_b['days']}일(평일 {st_b['wk_days']}일 / 휴일 {st_b['off_days']}일) ➔ 총 {st_c['days']}일(평일 {st_c['wk_days']}일 / 휴일 {st_c['off_days']}일) [평일 {wk_diff:+}일, 휴일 {off_diff:+}일]\n"
-        ai_report_text += f" • [{station}] 다이아별 실측 부하 : 평일 다이아 일평균 {wk_avg_b:,.0f} kWh vs 휴일 다이아 {off_avg_b:,.0f} kWh (평일 운행 시 일평균 +{dia_gap_kwh:,.0f} kWh 추가 소요)\n"
-        ai_report_text += f" • 여객 수송량{pass_note} : 일평균 {b_pass_daily:,.0f}명 ➔ {c_pass_daily:,.0f}명 ({pass_daily_diff:+,.0f}명/일, {pass_daily_pct:+.1f}%) | 누적 {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
+            ai_report_text += f"[1] 기상(냉·난방·축열) 및 대기질(건물 공조·환기) 핵심 지표 변동 ({period_label})\n"
+            ai_report_text += f" • {st_b['s_label']} 평균 최고기온 / 습도 : {st_b['s_tmax']:.1f}℃ ({st_b['s_humi']:.1f}%) ➔ {st_c['s_tmax']:.1f}℃ ({st_c['s_humi']:.1f}%) [기온 {s_tmax_diff:+.1f}℃, 습도 {s_humi_diff:+.1f}%p, 불쾌지수 {s_thi_diff:+.1f}]\n"
+            ai_report_text += f" • 냉방 부하 일수 : 실질 냉방일(28℃↑) {st_b['cool_days']}일 ➔ {st_c['cool_days']}일 ({cool_d_diff:+}일) | 폭염(33℃↑) {st_b['hw_days']}일 ➔ {st_c['hw_days']}일 ({hw_diff:+}일) | 냉방도일(CDD) {st_b['cdd']:.1f} ➔ {st_c['cdd']:.1f} ({cdd_diff:+.1f})\n"
+            ai_report_text += f" • 열대야(최저 25℃↑, 야간 건물 축열) : {st_b['trop_nights']}일 ➔ {st_c['trop_nights']}일 ({tn_diff:+}일)\n"
+            ai_report_text += f" • {st_b['w_label']} 평균 최저기온 : {st_b['w_tmin']:.1f}℃ ➔ {st_c['w_tmin']:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
+            ai_report_text += f" • 난방 부하 일수 : 영하권(0℃↓) {st_b['freeze_days']}일 ➔ {st_c['freeze_days']}일 ({frz_diff:+}일) | 한파(-10℃↓) {st_b['cw_days']}일 ➔ {st_c['cw_days']}일 ({cw_diff:+}일) | 난방도일(HDD) {st_b['hdd']:.1f} ➔ {st_c['hdd']:.1f} ({hdd_diff:+.1f})\n"
+            ai_report_text += f" • 초미세먼지(PM2.5) 및 건물 환기·공조('나쁨' 35㎍/㎥↑) : 평균 {st_b['pm_avg']:.1f} ➔ {st_c['pm_avg']:.1f}㎍/㎥ ({pm_avg_diff:+.1f}) | '나쁨' {st_b['pm_bad']}일 ➔ {st_c['pm_bad']}일 ({pm_bad_diff:+}일)\n\n"
 
-        ai_report_text += f"🧠 [3] XGBoost 기반 요인별 전력 증감 기여도 정량 분해 (총 증감: {diff_total:+,.0f} kWh / {diff_pct_total:+.1f}%)\n"
-        if new_ext_kwh != 0:
-            ai_report_text += f" 📌 [신규 개통·연장 구간 분리] : {', '.join(new_ext_info)} 신규 편입으로 +{new_ext_kwh:,.0f} kWh 발생\n"
-            ai_report_text += f" 📌 [기존 동일 운영 구간 실질 증감] : {common_tb:,.0f} kWh ➔ {common_tc:,.0f} kWh ({common_diff:+,.0f} kWh, {common_diff_pct:+.1f}%)\n"
-        ai_report_text += f"  ├─ ① 기상(냉·난방도일·습도·열대야 축열) 요인 : {weather_effect_kwh:+,.0f} kWh (기상 민감도: 냉방 +1℃당 +{cool_sens:,.0f} kWh/일, 난방 -1℃당 +{heat_sens:,.0f} kWh/일)\n"
-        ai_report_text += f"  ├─ ② 대기질(초미세먼지 35↑ 공조 추가가동) 요인 : {pm25_effect_kwh:+,.0f} kWh ('나쁨' 발생 시 역사 환기·공조 가동으로 일평균 +{pm_unit_bad_kwh:,.0f} kWh 상승)\n"
-        ai_report_text += f"  ├─ ③ 열차 다이아(평일·휴일 운행일수 변동) 요인 : {dia_shift_kwh:+,.0f} kWh (평일 {wk_diff:+}일 / 휴일 {off_diff:+}일 변동 반영)\n"
-        ai_report_text += f"  ├─ ④ 여객 수요(승객수 변동 동력·환기) 요인 : {pass_effect_kwh:+,.0f} kWh (일평균 승객 {pass_daily_pct:+.1f}% 변동 반영)\n"
-        ai_report_text += f"  └─ ⑤ 외부 여건 보정 후 순수 설비 운영·절전 성과 : {net_operation_diff:+,.0f} kWh ({'전사적 절전 및 운영 최적화 순절감!' if net_operation_diff < 0 else '설비 가동률 및 기저부하 상승'})\n\n"
+            ai_report_text += f"[2] 청사 근무일수(평일/휴무일) 및 업무 부하 변동 ({period_label})\n"
+            ai_report_text += f" • 집계 일수 및 근무일 구성 : 총 {st_b['days']}일(평일 근무 {st_b['wk_days']}일 / 주말·공휴일 휴무 {st_b['off_days']}일) ➔ 총 {st_c['days']}일(평일 근무 {st_c['wk_days']}일 / 주말·공휴일 휴무 {st_c['off_days']}일) [평일 {wk_diff:+}일, 휴무 {off_diff:+}일]\n"
+            ai_report_text += f" • [종합청사] 근무일별 실측 부하 : 평일 근무일 일평균 {wk_avg_b:,.0f} kWh vs 휴무일 {off_avg_b:,.0f} kWh (평일 정상 근무 시 휴무일 대비 일평균 +{dia_gap_kwh:,.0f} kWh 추가 소요)\n\n"
 
-        ai_report_text += f"🔍 [4] 도시철도 계통·설비별 심층 진단\n"
+            ai_report_text += f"🧠 [3] XGBoost 기반 요인별 전력 증감 기여도 정량 분해 (총 증감: {diff_total:+,.0f} kWh / {diff_pct_total:+.1f}%)\n"
+            ai_report_text += f"  ├─ ① 기상(냉·난방도일·습도·열대야 축열) 요인 : {weather_effect_kwh:+,.0f} kWh (기상 민감도: 냉방 +1℃당 +{cool_sens:,.0f} kWh/일, 난방 -1℃당 +{heat_sens:,.0f} kWh/일)\n"
+            ai_report_text += f"  ├─ ② 대기질(초미세먼지 35↑ 공조·환기 추가가동) 요인 : {pm25_effect_kwh:+,.0f} kWh ('나쁨' 발생 시 건물 환기·공조 가동으로 일평균 +{pm_unit_bad_kwh:,.0f} kWh 상승)\n"
+            ai_report_text += f"  ├─ ③ 근무일수(평일 근무일·휴무일 일수 변동) 요인 : {dia_shift_kwh:+,.0f} kWh (평일 근무일 {wk_diff:+}일 / 휴무일 {off_diff:+}일 변동 반영)\n"
+            ai_report_text += f"  └─ ④ 외부 여건 보정 후 순수 청사 운영·절전 성과 : {net_operation_diff:+,.0f} kWh ({'청사 에너지 절감 및 운영 최적화 순절감!' if net_operation_diff < 0 else '사무기기·전산실 및 기저 설비 부하 상승'})\n\n"
 
-        # ① 기상 및 열대야 축열 진단
-        ai_report_text += f"① 기상(온·습도) 및 터널·역사 축열 영향 ({weather_effect_kwh:+,.0f} kWh): \n"
-        ai_report_text += f" • [하절기 냉방 및 제습(잠열) 부하] 냉방도일(CDD)이 {cdd_diff:+.1f}℃·일, 폭염일수가 {hw_diff:+}일 변동했으며 평균 상대습도는 {s_humi_diff:+.1f}%p(불쾌지수 {s_thi_diff:+.1f}) 기록되었습니다. 지하 역사는 외부 습기 유입 시 냉동기 제습(잠열) 부하가 급증하는데, 해당 온·습도 변화가 역사 냉방 전력에 직접 반영되었습니다.\n"
-        ai_report_text += f" • [도시철도 열대야(최저 25℃↑) 초기 예냉 효과] 도시철도 특성상 열차 운행이 종료된 심야·새벽 시간대(01~05시)에는 영업 전력 부하가 없습니다. 다만 열대야 일수가 {st_b['trop_nights']}일 ➔ {st_c['trop_nights']}일({tn_diff:+}일)로 변동함에 따라, 야간 비운행 시간 동안 지하 구조물과 본선 터널 내부의 축열(잔열)이 식지 않아 익일 첫차 운행 및 역사 개방 시점(05:00~오전)부터 초기 냉방(예냉) 및 본선 환기 부하가 {'조기 가중되었습니다.' if tn_diff > 0 else ('완화되었습니다.' if tn_diff < 0 else '전년과 유사하게 유지되었습니다.')}\n"
-        ai_report_text += f" • [동절기 난방 부하] 실질 난방 가동 지표인 영하권(0℃ 이하) 일수가 {st_b['freeze_days']}일 ➔ {st_c['freeze_days']}일({frz_diff:+}일), 난방도일(HDD)이 {hdd_diff:+.1f}℃·일 변동하여 대합실·현업실 난방 및 동파방지 열선 부하가 {'상승' if hdd_diff > 0 or frz_diff > 0 else '감소'}했습니다.\n\n"
+            ai_report_text += f"🔍 [4] 종합청사 업무시설 설비별 심층 진단\n"
+            ai_report_text += f"① 기상(온·습도) 및 청사 건물 축열 영향 ({weather_effect_kwh:+,.0f} kWh): \n"
+            ai_report_text += f" • [하절기 냉방 및 제습 부하] 냉방도일(CDD)이 {cdd_diff:+.1f}℃·일, 폭염일수가 {hw_diff:+}일 변동했으며 평균 상대습도는 {s_humi_diff:+.1f}%p(불쾌지수 {s_thi_diff:+.1f})를 기록했습니다. 업무 공간의 쾌적 온도 유지와 제습을 위한 중앙 냉동기 및 시스템에어컨(EHP) 가동 부하에 직접 반영되었습니다.\n"
+            ai_report_text += f" • [열대야(최저 25℃↑) 야간 축열 및 출근 시간대 예냉 효과] 업무시설 특성상 야간·새벽 비근무 시간대에는 사무 부하가 줄어들지만, 열대야 일수가 {st_b['trop_nights']}일 ➔ {st_c['trop_nights']}일({tn_diff:+}일)로 변동함에 따라 건물 외피와 실내 구조물의 잔열이 식지 않아 익일 출근 및 업무 개시 시점의 초기 냉방(예냉) 부하가 {'조기 가중되었습니다.' if tn_diff > 0 else ('완화되었습니다.' if tn_diff < 0 else '전년과 유사하게 유지되었습니다.')}\n"
+            ai_report_text += f" • [동절기 난방 부하] 영하권(0℃ 이하) 일수가 {st_b['freeze_days']}일 ➔ {st_c['freeze_days']}일({frz_diff:+}일), 난방도일(HDD)이 {hdd_diff:+.1f}℃·일 변동하여 사무실·강당 난방기 및 옥외 배관 동파방지 열선 가동 부하가 {'상승' if hdd_diff > 0 or frz_diff > 0 else '감소'}했습니다.\n\n"
 
-        # ② 초미세먼지 나쁨 시 역사 공조설비 추가 가동 진단
-        ai_report_text += f"② 초미세먼지 '나쁨(35㎍/㎥ 이상)' 역사 공조설비 추가 가동 영향 ({pm25_effect_kwh:+,.0f} kWh): \n"
-        ai_report_text += f" • 도시철도 지하 역사는 초미세먼지 농도가 '나쁨(35㎍/㎥ 이상)' 도달 시 실내 공기질 유지 기준에 따라 외기 도입·배기 팬(공조기 AHU), 전기집진기 및 본선 환기설비를 추가 연장·강제 가동합니다.\n"
-        ai_report_text += f" • 분석 기간 중 35㎍/㎥ 이상 '나쁨' 일수가 {st_b['pm_bad']}일 ➔ {st_c['pm_bad']}일({pm_bad_diff:+}일)로 변동하고 평균 농도가 {pm_avg_diff:+.1f}㎍/㎥ 달라지면서, 공조·환기 동력 설비에서 약 {pm25_effect_kwh:+,.0f} kWh의 전력 변동이 발생한 것으로 AI 모델은 산출했습니다.\n\n"
+            ai_report_text += f"② 초미세먼지 '나쁨(35㎍/㎥ 이상)' 청사 공조·환기 설비 영향 ({pm25_effect_kwh:+,.0f} kWh): \n"
+            ai_report_text += f" • 분석 기간 중 초미세먼지 '나쁨(35㎍/㎥ 이상)' 일수가 {st_b['pm_bad']}일 ➔ {st_c['pm_bad']}일({pm_bad_diff:+}일)로 변동하고 평균 농도가 {pm_avg_diff:+.1f}㎍/㎥ 달라지면서, 청사 내 공조기(AHU)·전열교환기 및 공기청정 설비 가동 변화로 약 {pm25_effect_kwh:+,.0f} kWh의 전력 변동이 산출되었습니다.\n\n"
 
-        # ③ 열차 다이아(평일 vs 휴일) 및 승객수 진단
-        ai_report_text += f"③ 열차 운행 다이아(평일/휴일) 및 여객 이동편의 설비 영향 ({dia_shift_kwh + pass_effect_kwh:+,.0f} kWh): \n"
-        ai_report_text += f" • [열차 다이아 효과 ({dia_shift_kwh:+,.0f} kWh)] [{station}] 기준 열차 운행 횟수(첨두시 배차)가 많은 '평일 다이아'는 '휴일 다이아' 대비 일평균 {dia_gap_kwh:,.0f} kWh의 전력을 더 소비합니다. 비교 기간 중 평일 운행일수가 {wk_diff:+}일, 휴일 운행일수가 {off_diff:+}일(총 집계일수 {days_diff:+}일) 변동하여 변전소 추진 전력 및 연동 설비에서 {dia_shift_kwh:+,.0f} kWh의 구조적 증감이 발생했습니다.\n"
-        ai_report_text += f" • [승객수 변동 효과 ({pass_effect_kwh:+,.0f} kWh)] 일평균 승객수가 {pass_daily_diff:+,.0f}명({pass_daily_pct:+.1f}%) 변동함에 따라 에스컬레이터(E/S)·엘리베이터(E/V)·스크린도어(PSD) 가동 부하와 역사 내 재실 인체 발열·CO₂ 농도 상승에 따른 공조 환기 연동 부하가 {pass_effect_kwh:+,.0f} kWh 변동했습니다.\n\n"
+            ai_report_text += f"③ 평일 근무일수 및 휴무일 변동 영향 ({dia_shift_kwh:+,.0f} kWh): \n"
+            ai_report_text += f" • [종합청사]는 임직원이 출근하는 평일 근무일에 주말·공휴일(휴무일) 대비 일평균 {dia_gap_kwh:,.0f} kWh의 전력을 더 소비합니다. 비교 기간 중 평일 근무일수가 {wk_diff:+}일, 휴무일수가 {off_diff:+}일(총 집계일수 {days_diff:+}일) 변동하여 사무실 조명·OA기기·냉난방·승강기 가동에서 {dia_shift_kwh:+,.0f} kWh의 구조적 증감이 발생했습니다.\n\n"
 
-        # ④ 종합 운영 성과 및 최대 변동월 요약
-        ai_report_text += f"④ 외부 환경 보정 후 실질 절전·운영 성과 종합 평가 ({net_operation_diff:+,.0f} kWh): \n"
-        if net_operation_diff < 0:
-            ai_report_text += f" • 🌟 [핵심 성과] 기상·미세먼지·열차 다이아·승객수 등 외부 환경 변화를 모두 보정한 기대 사용량 대비, 실제 기존 구간 전력 사용량은 오히려 {abs(net_operation_diff):,.0f} kWh (약 {abs(net_operation_diff)*price:,.0f}원 상당) 더 적게 소비되었습니다. 이는 공사가 추진 중인 냉·난방 탄력 운전, 공조기 인버터 제어 및 조명·동력 설비 절전 운영 최적화가 외부 부하 상승 요인을 성공적으로 상쇄한 실질적 절전 성과입니다.\n"
+            ai_report_text += f"④ 외부 환경 보정 후 실질 절전·운영 성과 종합 평가 ({net_operation_diff:+,.0f} kWh): \n"
+            if net_operation_diff < 0:
+                ai_report_text += f" • 🌟 [핵심 성과] 기상·미세먼지·근무일수 변동을 모두 보정한 기대 사용량 대비, 실제 청사 전력 사용량은 {abs(net_operation_diff):,.0f} kWh (약 {abs(net_operation_diff)*price:,.0f}원 상당) 더 적게 소비되었습니다. 이는 실내 적정 냉·난방 온도 준수, 점심·퇴근 시간대 조명 소등 및 대기전력 차단 등 청사 자체 에너지 절감 운영이 실질적인 성과로 이어진 결과입니다.\n"
+            else:
+                ai_report_text += f" • 기상·미세먼지·근무일수 요인 외에 청사 기저 설비 부하에서 {net_operation_diff:+,.0f} kWh의 순증가가 확인됩니다. 전산실·서버 부하 증가, 신규 사무기기·전기차 충전기 증설, 또는 야간·주말 비근무 시간대 대기전력 누수 여부를 점검할 필요가 있습니다.\n"
+
         else:
-            ai_report_text += f" • 외부 환경(기상·미세먼지·다이아·승객) 요인 외에 기저 설비 부하에서 {net_operation_diff:+,.0f} kWh의 순증가가 확인됩니다. 신규 편의시설 증설, 노후 설비 효율 저하 또는 비영업 시간대 대기전력 증가 여부를 점검할 필요가 있습니다.\n"
+            ai_report_text = f"📊 [{station}] {base_year}년 vs {comp_year}년 ({period_label}) 도시철도 전력 수요 AI 심층 분석 리포트\n\n"
+
+            if not asos_data:
+                ai_report_text += "⚠️ 기상청 API 응답 지연으로 일부 기상 지표가 제한되었습니다.\n\n"
+
+            ai_report_text += f"[1] 기상(냉·난방·축열) 및 대기질(역사 공조) 핵심 지표 변동 ({period_label})\n"
+            ai_report_text += f" • {st_b['s_label']} 평균 최고기온 / 습도 : {st_b['s_tmax']:.1f}℃ ({st_b['s_humi']:.1f}%) ➔ {st_c['s_tmax']:.1f}℃ ({st_c['s_humi']:.1f}%) [기온 {s_tmax_diff:+.1f}℃, 습도 {s_humi_diff:+.1f}%p, 불쾌지수 {s_thi_diff:+.1f}]\n"
+            ai_report_text += f" • 냉방 부하 일수 : 실질 냉방일(28℃↑) {st_b['cool_days']}일 ➔ {st_c['cool_days']}일 ({cool_d_diff:+}일) | 폭염(33℃↑) {st_b['hw_days']}일 ➔ {st_c['hw_days']}일 ({hw_diff:+}일) | 냉방도일(CDD) {st_b['cdd']:.1f} ➔ {st_c['cdd']:.1f} ({cdd_diff:+.1f})\n"
+            ai_report_text += f" • 열대야(최저 25℃↑, 야간 터널·역사 축열) : {st_b['trop_nights']}일 ➔ {st_c['trop_nights']}일 ({tn_diff:+}일)\n"
+            ai_report_text += f" • {st_b['w_label']} 평균 최저기온 : {st_b['w_tmin']:.1f}℃ ➔ {st_c['w_tmin']:.1f}℃ ({w_tmin_diff:+.1f}℃)\n"
+            ai_report_text += f" • 난방 부하 일수 : 영하권(0℃↓) {st_b['freeze_days']}일 ➔ {st_c['freeze_days']}일 ({frz_diff:+}일) | 한파(-10℃↓) {st_b['cw_days']}일 ➔ {st_c['cw_days']}일 ({cw_diff:+}일) | 난방도일(HDD) {st_b['hdd']:.1f} ➔ {st_c['hdd']:.1f} ({hdd_diff:+.1f})\n"
+            ai_report_text += f" • 초미세먼지(PM2.5) 및 공조 강제가동('나쁨' 35㎍/㎥↑) : 평균 {st_b['pm_avg']:.1f} ➔ {st_c['pm_avg']:.1f}㎍/㎥ ({pm_avg_diff:+.1f}) | '나쁨' {st_b['pm_bad']}일 ➔ {st_c['pm_bad']}일 ({pm_bad_diff:+}일)\n\n"
+
+            ai_report_text += f"[2] 도시철도 열차 운행 다이아(평일/휴일) 및 여객 수송 지표 변동 ({period_label})\n"
+            ai_report_text += f" • 집계 일수 및 열차 다이아 : 총 {st_b['days']}일(평일 {st_b['wk_days']}일 / 휴일 {st_b['off_days']}일) ➔ 총 {st_c['days']}일(평일 {st_c['wk_days']}일 / 휴일 {st_c['off_days']}일) [평일 {wk_diff:+}일, 휴일 {off_diff:+}일]\n"
+            ai_report_text += f" • [{station}] 다이아별 실측 부하 : 평일 다이아 일평균 {wk_avg_b:,.0f} kWh vs 휴일 다이아 {off_avg_b:,.0f} kWh (평일 운행 시 일평균 +{dia_gap_kwh:,.0f} kWh 추가 소요)\n"
+            ai_report_text += f" • 여객 수송량{pass_note} : 일평균 {b_pass_daily:,.0f}명 ➔ {c_pass_daily:,.0f}명 ({pass_daily_diff:+,.0f}명/일, {pass_daily_pct:+.1f}%) | 누적 {base_pass_sum:,.0f}명 ➔ {comp_pass_sum:,.0f}명 ({p_diff:+,.0f}명)\n\n"
+
+            ai_report_text += f"🧠 [3] XGBoost 기반 요인별 전력 증감 기여도 정량 분해 (총 증감: {diff_total:+,.0f} kWh / {diff_pct_total:+.1f}%)\n"
+            if new_ext_kwh != 0:
+                ai_report_text += f" 📌 [신규 개통·연장 구간 분리] : {', '.join(new_ext_info)} 신규 편입으로 +{new_ext_kwh:,.0f} kWh 발생\n"
+                ai_report_text += f" 📌 [기존 동일 운영 구간 실질 증감] : {common_tb:,.0f} kWh ➔ {common_tc:,.0f} kWh ({common_diff:+,.0f} kWh, {common_diff_pct:+.1f}%)\n"
+            ai_report_text += f"  ├─ ① 기상(냉·난방도일·습도·열대야 축열) 요인 : {weather_effect_kwh:+,.0f} kWh (기상 민감도: 냉방 +1℃당 +{cool_sens:,.0f} kWh/일, 난방 -1℃당 +{heat_sens:,.0f} kWh/일)\n"
+            ai_report_text += f"  ├─ ② 대기질(초미세먼지 35↑ 공조 추가가동) 요인 : {pm25_effect_kwh:+,.0f} kWh ('나쁨' 발생 시 역사 환기·공조 가동으로 일평균 +{pm_unit_bad_kwh:,.0f} kWh 상승)\n"
+            ai_report_text += f"  ├─ ③ 열차 다이아(평일·휴일 운행일수 변동) 요인 : {dia_shift_kwh:+,.0f} kWh (평일 {wk_diff:+}일 / 휴일 {off_diff:+}일 변동 반영)\n"
+            ai_report_text += f"  ├─ ④ 여객 수요(승객수 변동 동력·환기) 요인 : {pass_effect_kwh:+,.0f} kWh (일평균 승객 {pass_daily_pct:+.1f}% 변동 반영)\n"
+            ai_report_text += f"  └─ ⑤ 외부 여건 보정 후 순수 설비 운영·절전 성과 : {net_operation_diff:+,.0f} kWh ({'전사적 절전 및 운영 최적화 순절감!' if net_operation_diff < 0 else '설비 가동률 및 기저부하 상승'})\n\n"
+
+            ai_report_text += f"🔍 [4] 도시철도 계통·설비별 심층 진단\n"
+            ai_report_text += f"① 기상(온·습도) 및 터널·역사 축열 영향 ({weather_effect_kwh:+,.0f} kWh): \n"
+            ai_report_text += f" • [하절기 냉방 및 제습(잠열) 부하] 냉방도일(CDD)이 {cdd_diff:+.1f}℃·일, 폭염일수가 {hw_diff:+}일 변동했으며 평균 상대습도는 {s_humi_diff:+.1f}%p(불쾌지수 {s_thi_diff:+.1f}) 기록되었습니다. 지하 역사는 외부 습기 유입 시 냉동기 제습(잠열) 부하가 급증하는데, 해당 온·습도 변화가 역사 냉방 전력에 직접 반영되었습니다.\n"
+            ai_report_text += f" • [도시철도 열대야(최저 25℃↑) 초기 예냉 효과] 도시철도 특성상 열차 운행이 종료된 심야·새벽 시간대(01~05시)에는 영업 전력 부하가 없습니다. 다만 열대야 일수가 {st_b['trop_nights']}일 ➔ {st_c['trop_nights']}일({tn_diff:+}일)로 변동함에 따라, 야간 비운행 시간 동안 지하 구조물과 본선 터널 내부의 축열(잔열)이 식지 않아 익일 첫차 운행 및 역사 개방 시점(05:00~오전)부터 초기 냉방(예냉) 및 본선 환기 부하가 {'조기 가중되었습니다.' if tn_diff > 0 else ('완화되었습니다.' if tn_diff < 0 else '전년과 유사하게 유지되었습니다.')}\n"
+            ai_report_text += f" • [동절기 난방 부하] 실질 난방 가동 지표인 영하권(0℃ 이하) 일수가 {st_b['freeze_days']}일 ➔ {st_c['freeze_days']}일({frz_diff:+}일), 난방도일(HDD)이 {hdd_diff:+.1f}℃·일 변동하여 대합실·현업실 난방 및 동파방지 열선 부하가 {'상승' if hdd_diff > 0 or frz_diff > 0 else '감소'}했습니다.\n\n"
+
+            ai_report_text += f"② 초미세먼지 '나쁨(35㎍/㎥ 이상)' 역사 공조설비 추가 가동 영향 ({pm25_effect_kwh:+,.0f} kWh): \n"
+            ai_report_text += f" • 도시철도 지하 역사는 초미세먼지 농도가 '나쁨(35㎍/㎥ 이상)' 도달 시 실내 공기질 유지 기준에 따라 외기 도입·배기 팬(공조기 AHU), 전기집진기 및 본선 환기설비를 추가 연장·강제 가동합니다.\n"
+            ai_report_text += f" • 분석 기간 중 35㎍/㎥ 이상 '나쁨' 일수가 {st_b['pm_bad']}일 ➔ {st_c['pm_bad']}일({pm_bad_diff:+}일)로 변동하고 평균 농도가 {pm_avg_diff:+.1f}㎍/㎥ 달라지면서, 공조·환기 동력 설비에서 약 {pm25_effect_kwh:+,.0f} kWh의 전력 변동이 발생한 것으로 AI 모델은 산출했습니다.\n\n"
+
+            ai_report_text += f"③ 열차 운행 다이아(평일/휴일) 및 여객 이동편의 설비 영향 ({dia_shift_kwh + pass_effect_kwh:+,.0f} kWh): \n"
+            ai_report_text += f" • [열차 다이아 효과 ({dia_shift_kwh:+,.0f} kWh)] [{station}] 기준 열차 운행 횟수(첨두시 배차)가 많은 '평일 다이아'는 '휴일 다이아' 대비 일평균 {dia_gap_kwh:,.0f} kWh의 전력을 더 소비합니다. 비교 기간 중 평일 운행일수가 {wk_diff:+}일, 휴일 운행일수가 {off_diff:+}일(총 집계일수 {days_diff:+}일) 변동하여 변전소 추진 전력 및 연동 설비에서 {dia_shift_kwh:+,.0f} kWh의 구조적 증감이 발생했습니다.\n"
+            ai_report_text += f" • [승객수 변동 효과 ({pass_effect_kwh:+,.0f} kWh)] 일평균 승객수가 {pass_daily_diff:+,.0f}명({pass_daily_pct:+.1f}%) 변동함에 따라 에스컬레이터(E/S)·엘리베이터(E/V)·스크린도어(PSD) 가동 부하와 역사 내 재실 인체 발열·CO₂ 농도 상승에 따른 공조 환기 연동 부하가 {pass_effect_kwh:+,.0f} kWh 변동했습니다.\n\n"
+
+            ai_report_text += f"④ 외부 환경 보정 후 실질 절전·운영 성과 종합 평가 ({net_operation_diff:+,.0f} kWh): \n"
+            if net_operation_diff < 0:
+                ai_report_text += f" • 🌟 [핵심 성과] 기상·미세먼지·열차 다이아·승객수 등 외부 환경 변화를 모두 보정한 기대 사용량 대비, 실제 기존 구간 전력 사용량은 오히려 {abs(net_operation_diff):,.0f} kWh (약 {abs(net_operation_diff)*price:,.0f}원 상당) 더 적게 소비되었습니다. 이는 공사가 추진 중인 냉·난방 탄력 운전, 공조기 인버터 제어 및 조명·동력 설비 절전 운영 최적화가 외부 부하 상승 요인을 성공적으로 상쇄한 실질적 절전 성과입니다.\n"
+            else:
+                ai_report_text += f" • 외부 환경(기상·미세먼지·다이아·승객) 요인 외에 기저 설비 부하에서 {net_operation_diff:+,.0f} kWh의 순증가가 확인됩니다. 신규 편의시설 증설, 노후 설비 효율 저하 또는 비영업 시간대 대기전력 증가 여부를 점검할 필요가 있습니다.\n"
 
         if max_inc_m or max_dec_m:
             peak_notes = []
@@ -1783,6 +1833,9 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
 
 @app.get("/api/predict/{station}")
 def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, temp_adj: float = 0.0, winter_temp_adj: float = 0.0, pm25_adj: int = 0, reports_data: str = None):
+    is_hq = (station == '종합청사')
+    eff_pass_rate = 0.0 if is_hq else float(pass_rate)
+
     # 🌟 프론트엔드에서 reports_data를 넘기지 않아도 백엔드가 직접 Firebase 부하증감 신고 내역을 자동 조회
     local_reports = []
     if reports_data:
@@ -1801,7 +1854,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             local_reports = []
 
     rep_hash = hashlib.md5(json.dumps(local_reports, sort_keys=True, ensure_ascii=False).encode()).hexdigest() if local_reports else "none"
-    cache_key = f"{station}_{target_year}_{pass_rate}_{temp_adj}_{winter_temp_adj}_{pm25_adj}_{rep_hash}"
+    cache_key = f"{station}_{target_year}_{eff_pass_rate}_{temp_adj}_{winter_temp_adj}_{pm25_adj}_{rep_hash}"
     if cache_key in GLOBAL_API_CACHE["predict"]:
         return GLOBAL_API_CACHE["predict"][cache_key]
 
@@ -1810,7 +1863,8 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if df is None: return {"error": "과거 다년간의 머신러닝 학습을 위해 데이터셋(Excel) 파일을 수동으로 먼저 업로드해 주세요."}
             
         pass_col = next((c for c in df.columns if '승객수' in str(c) or '수송인원' in str(c)), None)
-        if pass_col is None: return {"error": "엑셀 첫번째 시트에 '승객수' 컬럼이 포함되어 있는지 확인해 주세요."}
+        if not is_hq and pass_col is None:
+            return {"error": "엑셀 첫번째 시트에 '승객수' 컬럼이 포함되어 있는지 확인해 주세요."}
         
         if station == '전체':
             kwh_cols = [c for c in df.columns if 'total_kwh' in c and '종합청사' not in c]
@@ -1891,7 +1945,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         df['temp_avg'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: float(asos_data.get(x, {}).get('tavg')) if is_valid_temp(asos_data.get(x, {}).get('tavg')) else np.nan)
         df['temp_avg'] = df['temp_avg'].fillna((df['temp_max'] + df['temp_min']) / 2.0)
         df['humidity'] = df['date'].dt.strftime("%Y-%m-%d").map(lambda x: float(asos_data.get(x, {}).get('humi')) if is_valid_humi(asos_data.get(x, {}).get('humi')) else np.nan)
-        df['passengers'] = pd.to_numeric(df[pass_col], errors='coerce')
+        df['passengers'] = pd.to_numeric(df[pass_col], errors='coerce') if (pass_col and not is_hq) else 0.0
 
         if 'pm25_val' in df.columns:
             df['pm25'] = pd.to_numeric(df['pm25_val'], errors='coerce')
@@ -1901,7 +1955,7 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         if df['temp_max'].isna().all():
             return {"error": "기상청 API 허브 서버와 통신할 수 없습니다. 잠시 후 [AI 예측 실행]을 다시 눌러주세요."}
 
-        # 🌟 미래 연도(2026년 하반기, 2027년 등) 미집계 구간의 기상·미세먼지·승객수 기준선(Baseline) 정밀 매칭 (평탄화 버그 및 요일 어긋남 차단)
+        # 🌟 미래 연도 미집계 구간의 기상·미세먼지·승객수 기준선(Baseline) 정밀 매칭
         df['mm_dd'] = df['date'].dt.strftime('%m-%d')
         hist_valid_w = df[df['date'].dt.year < target_y].dropna(subset=['temp_max', 'temp_min'])
         hist_w_by_mmdd = hist_valid_w.sort_values('date', ascending=False).drop_duplicates('mm_dd').set_index('mm_dd')
@@ -1911,11 +1965,14 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         hist_pm_by_mmdd = hist_valid_pm.sort_values('date', ascending=False).drop_duplicates('mm_dd').set_index('mm_dd')
         hist_pm_by_month = hist_valid_pm.groupby('month')['pm25'].mean()
 
-        hist_valid_pass = df.dropna(subset=['passengers']).copy()
-        recent_pass_df = hist_valid_pass.sort_values('date').tail(365)
-        pass_by_m_hol_dow = recent_pass_df.groupby(['month', 'is_holiday', 'dayofweek'])['passengers'].mean().to_dict()
-        pass_by_m_hol = recent_pass_df.groupby(['month', 'is_holiday'])['passengers'].mean().to_dict()
-        pass_overall_mean = float(recent_pass_df['passengers'].mean()) if not recent_pass_df.empty else 350000.0
+        if not is_hq:
+            hist_valid_pass = df.dropna(subset=['passengers']).copy()
+            recent_pass_df = hist_valid_pass.sort_values('date').tail(365)
+            pass_by_m_hol_dow = recent_pass_df.groupby(['month', 'is_holiday', 'dayofweek'])['passengers'].mean().to_dict()
+            pass_by_m_hol = recent_pass_df.groupby(['month', 'is_holiday'])['passengers'].mean().to_dict()
+            pass_overall_mean = float(recent_pass_df['passengers'].mean()) if not recent_pass_df.empty else 350000.0
+        else:
+            pass_by_m_hol_dow, pass_by_m_hol, pass_overall_mean = {}, {}, 0.0
 
         idx_target = df['date'].dt.year == target_y
         for i in df[idx_target].index:
@@ -1934,17 +1991,17 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                 df.loc[i, 'humidity'] = hist_w_by_mmdd.loc[mm_dd, 'humidity'] if mm_dd in hist_w_by_mmdd.index else hist_w_by_month.loc[m_val, 'humidity']
             if pd.isna(df.loc[i, 'pm25']):
                 df.loc[i, 'pm25'] = hist_pm_by_mmdd.loc[mm_dd, 'pm25'] if mm_dd in hist_pm_by_mmdd.index else hist_pm_by_month.loc[m_val, 'pm25']
-            if pd.isna(df.loc[i, 'passengers']):
+            if not is_hq and pd.isna(df.loc[i, 'passengers']):
                 df.loc[i, 'passengers'] = pass_by_m_hol_dow.get((m_val, hol_val, dow_val), pass_by_m_hol.get((m_val, hol_val), pass_overall_mean))
         
-        df['passengers'] = df.groupby(['month', 'is_holiday'])['passengers'].transform(lambda s: s.fillna(s.mean())).bfill().ffill()
+        if not is_hq:
+            df['passengers'] = df.groupby(['month', 'is_holiday'])['passengers'].transform(lambda s: s.fillna(s.mean())).bfill().ffill()
         df['temp_max'] = df['temp_max'].bfill().ffill()
         df['temp_min'] = df['temp_min'].bfill().ffill()
         df['temp_avg'] = df['temp_avg'].fillna((df['temp_max'] + df['temp_min']) / 2.0).bfill().ffill()
         df['humidity'] = df['humidity'].bfill().ffill()
         df['pm25'] = df['pm25'].bfill().ffill()
 
-        # 🌟 기온과 99.6% 중복되어 중요도를 왜곡시키는 불쾌지수(thi)를 제외하고 순수 물리 변수만 구성
         def add_transit_features(d_frame):
             d_frame['cdd'] = (d_frame['temp_avg'] - 24.0).clip(lower=0)
             d_frame['hdd'] = (12.0 - d_frame['temp_avg']).clip(lower=0)
@@ -1954,12 +2011,21 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
 
         df = add_transit_features(df)
 
-        features = [
-            'month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers',
-            'temp_max', 'temp_min', 'temp_avg', 'cdd', 'hdd', 'trop_night_deg',
-            'humidity', 'pm25', 'is_pm25_bad'
-        ]
-        mono_constraints = (0, 0, -1, -1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1)
+        # 🌟 종합청사 선택 시 승객수 피처를 학습 및 예측에서 완전 제외
+        if is_hq:
+            features = [
+                'month', 'dayofweek', 'is_weekend', 'is_holiday',
+                'temp_max', 'temp_min', 'temp_avg', 'cdd', 'hdd', 'trop_night_deg',
+                'humidity', 'pm25', 'is_pm25_bad'
+            ]
+            mono_constraints = (0, 0, -1, -1, 0, 0, 0, 1, 1, 1, 0, 1, 1)
+        else:
+            features = [
+                'month', 'dayofweek', 'is_weekend', 'is_holiday', 'passengers',
+                'temp_max', 'temp_min', 'temp_avg', 'cdd', 'hdd', 'trop_night_deg',
+                'humidity', 'pm25', 'is_pm25_bad'
+            ]
+            mono_constraints = (0, 0, -1, -1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1)
 
         train_df = df[(df['date'].dt.year <= (target_y - 1)) & (df['raw_power'] > 0)].copy()
         train_df = train_df.dropna(subset=['target_power', 'target_peak'] + features)
@@ -1969,10 +2035,10 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         test_base_df = test_base_df.dropna(subset=features)
         if test_base_df.empty: return {"error": f"{target_year}년도 예측을 위한 데이터 포맷이 처리 중 소실되었습니다."}
 
-        # 🌟 시뮬레이션 변수(승객수%, 여름기온, 겨울기온, 초미세먼지 나쁨일수)를 타겟 연도 전체에 일관 반영
+        # 🌟 시뮬레이션 변수 반영 (종합청사는 승객수 변동 미적용)
         test_df = test_base_df.copy()
-        if pass_rate != 0:
-            test_df['passengers'] = test_df['passengers'] * (1.0 + (float(pass_rate) / 100.0))
+        if not is_hq and eff_pass_rate != 0:
+            test_df['passengers'] = test_df['passengers'] * (1.0 + (eff_pass_rate / 100.0))
 
         if temp_adj != 0:
             s_mask = test_df['month'].isin([6, 7, 8])
@@ -2004,7 +2070,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         X_test_base = test_base_df[features].bfill().ffill()
         X_test = test_df[features].bfill().ffill()
         
-        # 🌟 1) 일일 전력량(kWh) 전용 XGBoost 모델 & 2) 일일 최대수요(kW) 전용 XGBoost 모델 분리 학습
         model_kwh = xgb.XGBRegressor(
             n_estimators=120, learning_rate=0.05, max_depth=5,
             monotone_constraints=mono_constraints, random_state=42
@@ -2022,7 +2087,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         base_pred_peak = model_peak.predict(X_test_base)
         raw_pred_peak = model_peak.predict(X_test)
 
-        # 피크 모델의 평균 회귀(스무딩) 현상 보정을 위한 직전 연도 첨두 부하율(Crest Factor) 산출
         train_last_year_df = train_df[train_df['date'].dt.year == (target_y - 1)].copy()
         ref_df = train_last_year_df if not train_last_year_df.empty else train_df
         ref_pred_peak = model_peak.predict(ref_df[features].bfill().ffill())
@@ -2030,7 +2094,6 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         pred_ref_peak_max = float(np.max(ref_pred_peak)) if len(ref_pred_peak) > 0 else 1.0
         crest_factor = float(np.clip(actual_ref_peak / pred_ref_peak_max, 1.0, 1.35)) if pred_ref_peak_max > 0 else 1.0
 
-        # 트리 모델의 극단치 리프 포화(Extrapolation 한계)를 보완하는 개소별 물리 민감도 산출
         warm_tr = train_df[train_df['temp_avg'] >= 22.0]
         cold_tr = train_df[train_df['temp_avg'] <= 12.0]
         cool_slope_kwh = max(0.0, float(np.polyfit(warm_tr['temp_avg'], warm_tr['target_power'], 1)[0])) if len(warm_tr) >= 10 else 0.0
@@ -2073,16 +2136,15 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
                 if (winter_temp_adj < 0 and tree_dp < phys_dp * 0.5) or (winter_temp_adj > 0 and tree_dp > phys_dp * 0.5):
                     final_pred_peak[idx_pos] = base_scaled_peak[idx_pos] + 0.5 * tree_dp + 0.5 * phys_dp
 
-            if pass_rate != 0:
-                phys_pk = (float(pass_rate) / 100.0) * var_load_kwh * 0.35
-                phys_pp = (float(pass_rate) / 100.0) * var_load_kw * 0.35
+            if not is_hq and eff_pass_rate != 0:
+                phys_pk = (eff_pass_rate / 100.0) * var_load_kwh * 0.35
+                phys_pp = (eff_pass_rate / 100.0) * var_load_kw * 0.35
                 final_pred_kwh[idx_pos] += phys_pk * 0.5
                 final_pred_peak[idx_pos] += phys_pp * 0.5
 
         test_df['pred_power'] = np.maximum(final_pred_kwh, 0.0)
         test_df['pred_peak'] = np.maximum(final_pred_peak, 0.0)
         
-        # 🌟 부하증감 신고(Firebase load_reports) 자동 반영 (전력량 kWh 및 최대수요 Peak kW 동시 가감)
         if local_reports:
             try:
                 for r_info in local_reports:
@@ -2117,17 +2179,18 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
         last_peak_val = float(train_last_year_df['raw_peak'].max()) if not train_last_year_df.empty else 0.0
         peak_future_val = float(test_df['pred_peak'].max())
         
-        # 🌟 [예측 변수 중요도 정밀 산출] 단순 분기 평균(Average Gain) 왜곡을 배제하고,
-        # 각 변수 그룹이 실제 예측 전력량(kWh)을 변동시키는 실질 기여도(Group Permutation Impact)로 산출
+        # 🌟 예측 변수 중요도 산출 (종합청사는 '승객수' 그룹 제외)
         groups_map = {
             '기온': ['temp_max', 'temp_min', 'temp_avg', 'cdd', 'hdd', 'trop_night_deg'],
             '계절(월)': ['month'],
-            '승객수': ['passengers'],
             '주말': ['is_weekend', 'dayofweek'],
             '공휴일': ['is_holiday'],
             '습도': ['humidity'],
             '초미세먼지(PM2.5)': ['pm25', 'is_pm25_bad']
         }
+        if not is_hq:
+            groups_map['승객수'] = ['passengers']
+
         rng = np.random.RandomState(42)
         group_impacts = {}
         for g_name, g_cols in groups_map.items():
