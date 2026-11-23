@@ -42,6 +42,9 @@ KMA_API_HUB_KEY = "vDWZwqskT6W1mcKrJL-l4w"
 
 # 🌟 Vercel 서울(icn1) 리전 기상청 및 환경공단(에어코리아) 중계 서버 주소
 KMA_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kma"
+# 🌟 Vercel 서울(icn1) 리전 한전(KEPCO) 전용 중계 서버 주소
+KEPCO_PROXY_URL = "https://dtro-web-frontend.vercel.app/api/kepco"
+KEPCO_ZERO_GRACE_DAYS = 7  # 🌟 과거 0값 확정 유예기간 (7일 이내 0은 재확인, 7일 초과 정상응답 0은 'ZERO' 확정)
 
 # =========================================================================
 # 🚨 영구 저장소 (Firebase Realtime Database) 연동 및 데이터 검증 함수
@@ -276,7 +279,142 @@ def restore_airkorea_cache_from_firebase():
                 logger.info(f"✅ 서버 시작됨 - Firebase에서 환경공단 초미세먼지 캐시 복구 완료 ({len(cleaned_air)}건)")
     except Exception as e:
         logger.error(f"❌ Firebase 환경공단 캐시 복구 실패: {e}")
+# 🌟 3. 한전(KEPCO) 과거 15분 LP 데이터 압축 및 Firebase 영구 캐싱 (7일 유예기간 적용)
+def compress_kepco_day_list(day_list):
+    compressed = {}
+    if not day_list or not isinstance(day_list, list):
+        return compressed
+    for item in day_list:
+        if not isinstance(item, dict):
+            continue
+        raw_m = str(item.get("meterNo", "")).strip()
+        m_key = f"m_{raw_m}" if raw_m else "m_ALL"
+        if m_key not in compressed:
+            compressed[m_key] = [0.0] * 96
+        arr = compressed[m_key]
+        for k, v in item.items():
+            if k.startswith("pwr_qty") and k != "pwr_qty":
+                try:
+                    val = float(v)
+                    time_str = k[-4:]
+                    hh = int(time_str[:2])
+                    mm = int(time_str[2:])
+                    idx = 95 if (hh == 24 and mm == 0) else hh * 4 + (mm // 15) - 1
+                    if 0 <= idx < 96:
+                        arr[idx] = round(arr[idx] + val, 2)
+                except Exception:
+                    pass
+    return compressed
 
+def is_valid_kepco_cache_entry(val):
+    if val == "ZERO":
+        return True
+    if isinstance(val, dict) and len(val) > 0:
+        for arr in val.values():
+            if isinstance(arr, list) and len(arr) == 96:
+                return True
+    return False
+
+def get_kepco_entry_total(entry):
+    if not entry or entry == "ZERO" or not isinstance(entry, dict):
+        return 0.0
+    total = 0.0
+    for arr in entry.values():
+        if isinstance(arr, list):
+            for x in arr:
+                try:
+                    total += float(x)
+                except Exception:
+                    pass
+    return total
+
+def extract_intervals_from_kepco_entry(entry, target_meter_no="전체"):
+    interval_usage = [0.0] * 96
+    if not entry or entry == "ZERO":
+        return interval_usage
+    if isinstance(entry, list):
+        entry = compress_kepco_day_list(entry)
+    if not isinstance(entry, dict):
+        return interval_usage
+    target_key = f"m_{target_meter_no}" if target_meter_no not in ["", "전체"] else ""
+    for m_key, arr in entry.items():
+        if not isinstance(arr, list):
+            continue
+        if target_meter_no in ["", "전체"] or m_key == target_key or m_key == target_meter_no:
+            for i in range(min(96, len(arr))):
+                try:
+                    interval_usage[i] += float(arr[i])
+                except Exception:
+                    pass
+    return interval_usage
+
+def save_kepco_cache_to_firebase(new_items: dict = None):
+    if "여기에_파이어베이스" in FIREBASE_DB_URL: return
+    try:
+        if not GLOBAL_KEPCO_CACHE and not new_items: return
+        with open("kepco_cache.json", "w", encoding="utf-8") as f:
+            json.dump(GLOBAL_KEPCO_CACHE, f, ensure_ascii=False)
+        payload = new_items if new_items else GLOBAL_KEPCO_CACHE
+        if not payload: return
+        requests.patch(f"{FIREBASE_DB_URL}/kepco_lp_cache.json", json=payload, timeout=15)
+        logger.info(f"✅ 한전 15분 LP 캐시 Firebase 누적 병합(PATCH) 완료 (신규/갱신 {len(payload)}건, 총 {len(GLOBAL_KEPCO_CACHE)}건)")
+    except Exception as e:
+        logger.error(f"❌ Firebase 한전 캐시 저장 실패: {e}")
+
+def flush_pending_kepco_updates(min_batch: int = 1):
+    with KEPCO_FETCH_LOCK:
+        if len(PENDING_KEPCO_UPDATES) >= min_batch:
+            batch = dict(PENDING_KEPCO_UPDATES)
+            PENDING_KEPCO_UPDATES.clear()
+        else:
+            batch = None
+    if batch:
+        save_kepco_cache_to_firebase(batch)
+
+def restore_kepco_cache_from_firebase():
+    grace_cutoff = (get_kst_now().replace(tzinfo=None) - timedelta(days=KEPCO_ZERO_GRACE_DAYS)).strftime("%Y-%m-%d")
+
+    def split_clean_and_bad_kepco(raw_dict):
+        cleaned = {}
+        bad_keys = {}
+        for k, v in raw_dict.items():
+            if not is_valid_kepco_cache_entry(v):
+                bad_keys[k] = None
+                continue
+            parts = k.split("_")
+            d_part = parts[-1] if len(parts) >= 2 else ""
+            # 최근 7일 유예기간 내 'ZERO'가 남아있으면 정화하여 재수집 허용
+            if v == "ZERO" and len(d_part) == 10 and d_part >= grace_cutoff:
+                bad_keys[k] = None
+                continue
+            cleaned[k] = v
+        return cleaned, bad_keys
+
+    if os.path.exists("kepco_cache.json"):
+        try:
+            with open("kepco_cache.json", "r", encoding="utf-8") as f:
+                local_kepco = json.load(f)
+                if isinstance(local_kepco, dict):
+                    cleaned_local, _ = split_clean_and_bad_kepco(local_kepco)
+                    GLOBAL_KEPCO_CACHE.update(cleaned_local)
+        except Exception:
+            pass
+    if "여기에_파이어베이스" in FIREBASE_DB_URL: return
+    try:
+        res = requests.get(f"{FIREBASE_DB_URL}/kepco_lp_cache.json", timeout=15)
+        if res.status_code == 200 and res.json():
+            fb_kepco = res.json()
+            if isinstance(fb_kepco, dict):
+                cleaned_fb, bad_fb_keys = split_clean_and_bad_kepco(fb_kepco)
+                GLOBAL_KEPCO_CACHE.update(cleaned_fb)
+                with open("kepco_cache.json", "w", encoding="utf-8") as f:
+                    json.dump(cleaned_fb, f, ensure_ascii=False)
+                if bad_fb_keys:
+                    requests.patch(f"{FIREBASE_DB_URL}/kepco_lp_cache.json", json=bad_fb_keys, timeout=10)
+                    logger.info(f"🧹 Firebase 한전 캐시 오류/유예기간 ZERO({len(bad_fb_keys)}건) 자동 정화 완료")
+                logger.info(f"✅ 서버 시작됨 - Firebase에서 한전 15분 LP 캐시 복구 완료 ({len(cleaned_fb)}건)")
+    except Exception as e:
+        logger.error(f"❌ Firebase 한전 캐시 복구 실패: {e}")
 # =========================================================================
 # 🚨 카카오워크 알림 시스템
 # =========================================================================
@@ -335,7 +473,8 @@ AWS_FETCH_LOCK = threading.Lock()
 AIR_FETCH_LOCK = threading.Lock()
 KMA_AWS_COOLDOWN_UNTIL = 0.0
 PENDING_AIR_UPDATES = {}
-
+KEPCO_FETCH_LOCK = threading.Lock()
+PENDING_KEPCO_UPDATES = {}
 GLOBAL_API_CACHE = {
     "dashboard": {},
     "realtime": {},
@@ -466,7 +605,8 @@ async def auto_cache_warmer():
                 for st in target_stations:
                     get_dashboard_data(st, api_start, today_str)
 
-                get_overview_data("true")    
+                get_overview_data("true")
+                flush_pending_kepco_updates(min_batch=1)  
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
             logger.info("✅ [상시 캐싱 완료] 데이터 100% 적재 완료. 임계치 감시 대기중.")
@@ -481,7 +621,7 @@ async def startup_event():
     restore_thresholds_from_firebase()  
     restore_aws_cache_from_firebase()      # 🌟 서버 시작 시 Firebase에서 과거 AWS 기상 캐시 복구 및 오류값 정화
     restore_airkorea_cache_from_firebase() # 🌟 서버 시작 시 Firebase에서 과거 환경공단 미세먼지 캐시 복구 및 미집계 정화
-    
+    restore_kepco_cache_from_firebase()
     load_excel_dataset()
     load_thresholds()
     asyncio.create_task(auto_cache_warmer())
@@ -587,7 +727,61 @@ def test_kma_connection(date: str = None, reset_cooldown: str = "false"):
             "aws_cached_items": aws_cache_cnt,
             "asos_cached_items": asos_cache_cnt,
             "airkorea_cached_items": air_cache_cnt,
+            "kepco_cached_items": len(GLOBAL_KEPCO_CACHE),
+            "kepco_zero_items": sum(1 for v in GLOBAL_KEPCO_CACHE.values() if v == "ZERO"),
             "aws_cooldown_remaining_sec": max(0, int(KMA_AWS_COOLDOWN_UNTIL - time.time()))
+        }
+    }
+
+# 🌟 Vercel 서울(icn1) 한전 중계 수신 상태 및 Firebase 한전 캐시 적재 현황 진단 주소
+@app.get("/api/test_kepco")
+def test_kepco_connection(date: str = None, cust_no: str = "0526066096"):
+    yesterday_dt = get_kst_now() - timedelta(days=1)
+    target_date = date if date else yesterday_dt.strftime("%Y-%m-%d")
+    date_compact = target_date.replace("-", "")
+    lp_status = "확인 전"
+    sample_usage = 0.0
+    sample_peak = 0.0
+    preview = ""
+
+    try:
+        r = http_session.get(
+            KEPCO_PROXY_URL,
+            params={"type": "lp", "custNo": cust_no, "date": date_compact, "serviceKey": KEPCO_API_KEY},
+            timeout=12
+        )
+        preview = r.text[:200]
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict) and not data.get("errCd") and not data.get("error"):
+                d_list = data.get("dayLpDataInfoList") or []
+                comp = compress_kepco_day_list(d_list)
+                arr = extract_intervals_from_kepco_entry(comp, "전체")
+                sample_usage = round(sum(arr), 1)
+                sample_peak = round(max(arr) * 4, 1) if arr else 0.0
+                lp_status = f"정상 수신 (계량기 {len(d_list)}건, 합계 {sample_usage} kWh)"
+            else:
+                lp_status = f"한전 응답 오류: {data}"
+        else:
+            lp_status = f"중계 응답 코드 {r.status_code}"
+    except Exception as e:
+        lp_status = f"호출 에러: {str(e)}"
+
+    valid_cnt = sum(1 for v in GLOBAL_KEPCO_CACHE.values() if v != "ZERO")
+    zero_cnt = sum(1 for v in GLOBAL_KEPCO_CACHE.values() if v == "ZERO")
+    return {
+        "check_date": target_date,
+        "cust_no": cust_no,
+        "proxy_url": KEPCO_PROXY_URL,
+        "kepco_lp_status": lp_status,
+        "sample_usage_kwh": sample_usage,
+        "sample_peak_kw": sample_peak,
+        "response_preview": preview,
+        "cache_summary": {
+            "total_cached_keys": len(GLOBAL_KEPCO_CACHE),
+            "valid_data_keys": valid_cnt,
+            "confirmed_zero_keys": zero_cnt,
+            "grace_days": KEPCO_ZERO_GRACE_DAYS
         }
     }
 
@@ -1190,7 +1384,7 @@ def process_kepco_day_data(day_list, target_meter_no):
                 except: pass
     return interval_usage
 
-def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = False):
+def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = False, save_immediately: bool = True):
     cust_nos = []
     target_meter_no = "전체"
     
@@ -1205,55 +1399,104 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         if station in LINE_STATIONS['1호선']: target_meter_no = STATION_METER_MAP.get(station, "")
             
     total_interval_usage = [0.0] * 96
-    today_str = get_kst_now().strftime("%Y-%m-%d")
+    now_kst = get_kst_now().replace(tzinfo=None)
+    today_str = now_kst.strftime("%Y-%m-%d")
+    grace_cutoff_str = (now_kst - timedelta(days=KEPCO_ZERO_GRACE_DAYS)).strftime("%Y-%m-%d")
     
     def fetch_and_process(c_no):
         if not c_no: return [0.0] * 96
         cache_key = f"{c_no}_{date_str}"
-        day_list = None
+        m_target = target_meter_no if c_no == '0526314773' else "전체"
+        cached_entry = None
         
         if not is_bypass:
             if date_str < today_str and cache_key in GLOBAL_KEPCO_CACHE:
-                day_list = GLOBAL_KEPCO_CACHE[cache_key]
+                entry = GLOBAL_KEPCO_CACHE[cache_key]
+                if entry == "ZERO":
+                    # 🌟 7일 초과 확정 ZERO는 즉시 0 반환, 7일 이내면 재조회
+                    if date_str < grace_cutoff_str:
+                        return [0.0] * 96
+                elif is_valid_kepco_cache_entry(entry):
+                    intervals = extract_intervals_from_kepco_entry(entry, m_target)
+                    # 🌟 해당 개소 값이 있거나 7일 초과 과거 확정 데이터면 캐시 즉시 반환
+                    if sum(intervals) > 0 or date_str < grace_cutoff_str:
+                        return intervals
+                    cached_entry = entry
             elif date_str == today_str and cache_key in GLOBAL_KEPCO_TODAY_CACHE:
                 c_time, c_data = GLOBAL_KEPCO_TODAY_CACHE[cache_key]
                 if time.time() - c_time < 600:
-                    day_list = c_data
+                    return extract_intervals_from_kepco_entry(c_data, m_target)
 
-        m_target = target_meter_no if c_no == '0526314773' else "전체"
-
-        if day_list is None:
-            url = "https://opm.kepco.co.kr:11080/OpenAPI/getDayLpData.do"
-            params = {"custNo": c_no, "date": date_str.replace("-", ""), "serviceKey": KEPCO_API_KEY, "returnType": "02"}
-            day_list = []
-            req_ok = False
-            # 🌟 일시적 통신 지연으로 0이 들어가는 현상을 막기 위해 최대 3회 재시도 (타임아웃 5초)
-            for attempt in range(3):
-                try:
-                    res = http_session.get(url, params=params, timeout=5)
-                    if res.status_code == 200:
+        # 🌟 Vercel 서울(icn1) 한전 전용 중계 서버 경유 호출
+        params = {
+            "type": "lp",
+            "custNo": c_no,
+            "date": date_str.replace("-", ""),
+            "serviceKey": KEPCO_API_KEY
+        }
+        day_list = []
+        req_ok = False
+        for attempt in range(3):
+            try:
+                res = http_session.get(KEPCO_PROXY_URL, params=params, timeout=12)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, dict) and not data.get("errCd") and not data.get("error"):
                         req_ok = True
-                        data = res.json()
-                        if "dayLpDataInfoList" in data and data["dayLpDataInfoList"]:
+                        if isinstance(data.get("dayLpDataInfoList"), list):
                             day_list = data["dayLpDataInfoList"]
+                            if day_list:
+                                break
+                        # 정상 응답인데 빈 리스트면 1회만 추가 재확인 후 종료
+                        if attempt >= 1:
                             break
-                except Exception:
-                    pass
-                if attempt < 2:
-                    time.sleep(0.4)
-            
-            parsed_intervals = process_kepco_day_data(day_list, m_target)
-            # 🌟 과거 날짜는 실제 전력량 합계가 0보다 클 때만 캐시에 저장 (0값 박제 원천 차단)
-            if date_str < today_str and day_list and sum(parsed_intervals) > 0:
-                GLOBAL_KEPCO_CACHE[cache_key] = day_list
-            elif date_str == today_str and req_ok:
-                GLOBAL_KEPCO_TODAY_CACHE[cache_key] = (time.time(), day_list)
-            return parsed_intervals
-        
-        return process_kepco_day_data(day_list, m_target)
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(0.5)
+
+        if not req_ok:
+            # 🌟 통신 실패/장애 시 절대 0을 캐시에 저장하지 않으며, 기존 유효 캐시가 있으면 보호 반환
+            fallback_entry = cached_entry if cached_entry is not None else GLOBAL_KEPCO_CACHE.get(cache_key)
+            if fallback_entry and fallback_entry != "ZERO":
+                return extract_intervals_from_kepco_entry(fallback_entry, m_target)
+            return [0.0] * 96
+
+        compressed = compress_kepco_day_list(day_list)
+        total_cust_sum = get_kepco_entry_total(compressed)
+        parsed_intervals = extract_intervals_from_kepco_entry(compressed, m_target)
+
+        if date_str < today_str:
+            with KEPCO_FETCH_LOCK:
+                old_entry = GLOBAL_KEPCO_CACHE.get(cache_key)
+                old_sum = get_kepco_entry_total(old_entry)
+
+                if total_cust_sum > 0:
+                    # 🌟 유효 전력량이 존재할 때: 신규/기존 ZERO/더 큰 합계(지연 보정)/강제 갱신 시 업데이트
+                    if old_entry is None or old_entry == "ZERO" or total_cust_sum > old_sum or (is_bypass and compressed != old_entry):
+                        GLOBAL_KEPCO_CACHE[cache_key] = compressed
+                        PENDING_KEPCO_UPDATES[cache_key] = compressed
+                else:
+                    # 🌟 한전 정상 응답이나 실제 합계가 0인 경우:
+                    # 7일 초과 과거만 'ZERO' 확정 저장 (기존 유효 데이터가 있을 때는 덮어쓰지 않음)
+                    if date_str < grace_cutoff_str and old_sum == 0:
+                        if old_entry != "ZERO":
+                            GLOBAL_KEPCO_CACHE[cache_key] = "ZERO"
+                            PENDING_KEPCO_UPDATES[cache_key] = "ZERO"
+                    elif old_sum > 0:
+                        return extract_intervals_from_kepco_entry(old_entry, m_target)
+        elif date_str == today_str:
+            GLOBAL_KEPCO_TODAY_CACHE[cache_key] = (time.time(), compressed if total_cust_sum > 0 else {})
+
+        return parsed_intervals
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(fetch_and_process, cust_nos))
+
+    if save_immediately:
+        flush_pending_kepco_updates(min_batch=1)
+    else:
+        flush_pending_kepco_updates(min_batch=25)
         
     for int_u in results:
         for i, val in enumerate(int_u): 
@@ -1360,7 +1603,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     for i in range(diff):
         d_str = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         
-        usage, peak, details = get_kepco_data_for_station(station, d_str, is_bypass)
+        usage, peak, details = get_kepco_data_for_station(station, d_str, is_bypass, save_immediately=False)
         
         if not details: details = safe_empty_details
         
@@ -1397,6 +1640,8 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
         tot_usage += usage
         if peak > max_peak: max_peak = peak
         tot_co2 += co2
+
+    flush_pending_kepco_updates(min_batch=1)
 
     res = {
         "station_name": station, 
@@ -2237,14 +2482,14 @@ def get_bill_data(station: str, year: str):
     if not target_cust:
         return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 없습니다."}
         
-    url = "https://opm.kepco.co.kr:11080/OpenAPI/getCustBillData.do"
+    url = KEPCO_PROXY_URL
     
     def fetch_month_bill(m):
         data_month = f"{year}{m:02d}"
-        params = {"custNo": target_cust, "dataMonth": data_month, "serviceKey": KEPCO_API_KEY, "returnType": "02"}
+        params = {"type": "bill", "custNo": target_cust, "dataMonth": data_month, "serviceKey": KEPCO_API_KEY}
         for _ in range(3):
             try:
-                res = http_session.get(url, params=params, timeout=5)
+                res = http_session.get(url, params=params, timeout=12)
                 if res.status_code == 200:
                     data = res.json()
                     if "custBillDataInfoList" in data and data["custBillDataInfoList"]:
@@ -2277,7 +2522,7 @@ def get_bill_data(station: str, year: str):
             except: time.sleep(0.5)
         return None
 
-    with ThreadPoolExecutor(max_workers=12) as exec:
+    with ThreadPoolExecutor(max_workers=6) as exec:
         raw_results = list(exec.map(fetch_month_bill, range(1, 13)))
         
     records = [r for r in raw_results if r is not None]
@@ -2460,7 +2705,7 @@ def export_master_backup():
             row = {date_col: target_dt}
             
             def fetch_st(st):
-                usage, peak, _ = get_kepco_data_for_station(st, d_str, is_bypass=True)
+                usage, peak, _ = get_kepco_data_for_station(st, d_str, is_bypass=True, save_immediately=False)
                 return st, usage, peak
                 
             with ThreadPoolExecutor(max_workers=6) as executor:
@@ -2488,6 +2733,8 @@ def export_master_backup():
                             row[col_map[st]['peak']] = peak if peak > 0 else np.nan
                 new_rows.append(row)
                 
+        flush_pending_kepco_updates(min_batch=1)
+
         if new_rows:
             df_new = pd.DataFrame(new_rows)
             df = pd.concat([df, df_new], ignore_index=True)
