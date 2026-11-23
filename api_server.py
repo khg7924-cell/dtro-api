@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import io
 import json
@@ -457,7 +458,7 @@ def check_and_send_alert(station: str, current_peak: float):
 # =========================================================================
 
 http_session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200)
+adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30)
 http_session.mount('https://', adapter)
 http_session.mount('http://', adapter)
 http_session.verify = False
@@ -482,7 +483,48 @@ GLOBAL_API_CACHE = {
     "predict": {},
     "bill": {}
 }
+KEPCO_COOLDOWN_UNTIL = 0.0
+KEPCO_CONSECUTIVE_FAILS = 0
+KEPCO_COOLDOWN_SECONDS = 300  # 🌟 한전 연속 3회 실패 시 5분(300초)간 추가 요청 자동 차단
 
+API_CACHE_LIMITS = {
+    "dashboard": 12,
+    "realtime": 30,
+    "compare": 12,
+    "predict": 10,
+    "bill": 15,
+}
+
+def reset_kepco_cooldown():
+    global KEPCO_COOLDOWN_UNTIL, KEPCO_CONSECUTIVE_FAILS
+    with KEPCO_FETCH_LOCK:
+        KEPCO_COOLDOWN_UNTIL = 0.0
+        KEPCO_CONSECUTIVE_FAILS = 0
+
+def record_kepco_result(success: bool):
+    global KEPCO_COOLDOWN_UNTIL, KEPCO_CONSECUTIVE_FAILS
+    with KEPCO_FETCH_LOCK:
+        if success:
+            KEPCO_CONSECUTIVE_FAILS = 0
+            KEPCO_COOLDOWN_UNTIL = 0.0
+        else:
+            KEPCO_CONSECUTIVE_FAILS += 1
+            if KEPCO_CONSECUTIVE_FAILS >= 3 and time.time() >= KEPCO_COOLDOWN_UNTIL:
+                KEPCO_COOLDOWN_UNTIL = time.time() + KEPCO_COOLDOWN_SECONDS
+                logger.warning(
+                    f"⚠️ 한전 API 연속 {KEPCO_CONSECUTIVE_FAILS}회 응답 없음 - "
+                    f"{KEPCO_COOLDOWN_SECONDS // 60}분간 추가 호출을 일시 중단하고 캐시로 대체합니다."
+                )
+
+def set_bounded_api_cache(category: str, key: str, value):
+    cache_dict = GLOBAL_API_CACHE.setdefault(category, {})
+    if key in cache_dict:
+        del cache_dict[key]
+    cache_dict[key] = value
+    max_size = API_CACHE_LIMITS.get(category, 20)
+    while len(cache_dict) > max_size:
+        oldest_key = next(iter(cache_dict))
+        del cache_dict[oldest_key]
 def get_kst_now():
     return datetime.utcnow() + timedelta(hours=9)
 
@@ -555,64 +597,63 @@ async def auto_cache_warmer():
     await asyncio.sleep(3)
     while True:
         try:
-            logger.info("🔥 [상시 캐싱] 백그라운드에서 데이터를 미리 준비합니다...")
+            logger.info("🔥 [상시 캐싱] 경량 백그라운드 갱신을 시작합니다...")
             def warm_up():
                 now_kst = get_kst_now()
                 today_str = now_kst.strftime("%Y-%m-%d")
                 api_start = "2026-09-05"
                 default_14d = max((now_kst - timedelta(days=14)).strftime("%Y-%m-%d"), api_start)
-                
-                target_stations = ['전체', '종합청사', '1호선', '2호선', '3호선'] + \
-                                  LINE_STATIONS['1호선'] + LINE_STATIONS['2호선'] + LINE_STATIONS['3호선']
+
+                # 🌟 지난 날짜의 금일 임시 한전 캐시 자동 정리 (메모리 누수 방지)
+                stale_today_keys = [k for k in list(GLOBAL_KEPCO_TODAY_CACHE.keys()) if not k.endswith(f"_{today_str}")]
+                for k in stale_today_keys:
+                    GLOBAL_KEPCO_TODAY_CACHE.pop(k, None)
 
                 # 🌟 0단계: 금일 대구 전체 실시간 초미세먼지 단 1회 호출로 갱신
                 fetch_airkorea_sido_realtime(is_bypass=True)
 
-                # 🌟 1단계: 최근 14일 구간 캐싱 (Open-Meteo는 오직 오늘 날짜만 조회)
-                fetch_asos_daily(default_14d, today_str)
-                with ThreadPoolExecutor(max_workers=5) as weather_exec:
-                    for air_stn in TARGET_AIR_STNS:
-                        weather_exec.submit(fetch_airkorea_station_daily, air_stn, default_14d, today_str, False, False)
-                    for lat, lon in set(STATION_COORD_MAP.values()):
-                        weather_exec.submit(fetch_openmeteo_env, lat, lon, today_str, today_str)
-                
-                with AIR_FETCH_LOCK:
-                    if PENDING_AIR_UPDATES:
-                        save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
-                        PENDING_AIR_UPDATES.clear()
-
-                # 기상청 AWS 최근 14일 단일 스레드 순차 수집
-                fetch_aws_daily_for_dashboard('143', default_14d, today_str, is_bypass=False, is_background=True)
-
-                for st in target_stations:
-                    get_dashboard_data(st, default_14d, today_str)
-
-                # 🌟 2단계: 9월 5일~오늘 전체 구간 마스터 캐싱
+                # 🌟 1단계: 기상(ASOS·AWS·금일 Open-Meteo) 및 환경공단(에어코리아) 경량 수집 (Firebase 영구 누적)
                 fetch_asos_daily(api_start, today_str)
-                with ThreadPoolExecutor(max_workers=5) as weather_exec:
+                with ThreadPoolExecutor(max_workers=4) as weather_exec:
                     for air_stn in TARGET_AIR_STNS:
                         weather_exec.submit(fetch_airkorea_station_daily, air_stn, api_start, today_str, False, False)
-                
+                    for lat, lon in set(STATION_COORD_MAP.values()):
+                        weather_exec.submit(fetch_openmeteo_env, lat, lon, today_str, today_str)
+
                 with AIR_FETCH_LOCK:
                     if PENDING_AIR_UPDATES:
                         save_airkorea_cache_to_firebase(dict(PENDING_AIR_UPDATES))
                         PENDING_AIR_UPDATES.clear()
 
-                # 기상청 AWS 전체 과거 구간 단일 스레드 순차 수집 (10회마다 Firebase 자동 중간 저장)
                 fetch_aws_daily_for_dashboard('143', api_start, today_str, is_bypass=False, is_background=True)
 
-                GLOBAL_API_CACHE["dashboard"].clear()
-                for st in target_stations:
-                    get_dashboard_data(st, api_start, today_str)
+                # 🌟 2단계: 한전 쿨다운이 꺼져 있을 때만 종합 관제(금일·전일) 및 최근 7일 누락 LP만 압축 적재
+                if time.time() >= KEPCO_COOLDOWN_UNTIL:
+                    get_overview_data("true")
 
-                get_overview_data("true")
-                flush_pending_kepco_updates(min_batch=1)  
+                    # 대시보드 전체 딕셔너리 대신 가벼운 96개 숫자 배열(GLOBAL_KEPCO_CACHE)만 최근 7일 보충
+                    for offset in range(1, 8):
+                        if time.time() < KEPCO_COOLDOWN_UNTIL:
+                            break
+                        past_d = (now_kst - timedelta(days=offset)).strftime("%Y-%m-%d")
+                        if past_d < api_start:
+                            break
+                        get_kepco_data_for_station("전체", past_d, is_bypass=False, save_immediately=False)
+                        get_kepco_data_for_station("종합청사", past_d, is_bypass=False, save_immediately=False)
+
+                    flush_pending_kepco_updates(min_batch=1)
+                else:
+                    rem = int(KEPCO_COOLDOWN_UNTIL - time.time())
+                    logger.info(f"⏸️ 한전 쿨다운 중({rem}초 남음) - 한전 백그라운드 호출을 건너뜁니다.")
+
+                gc.collect()
+
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, warm_up)
-            logger.info("✅ [상시 캐싱 완료] 데이터 100% 적재 완료. 임계치 감시 대기중.")
+            logger.info("✅ [상시 캐싱 완료] 경량 적재 및 메모리 정리 완료.")
         except Exception as e:
             logger.error(f"상시 캐싱 중 오류 발생: {e}")
-            
+
         await asyncio.sleep(600)
 
 @app.on_event("startup")
@@ -621,11 +662,13 @@ async def startup_event():
     restore_thresholds_from_firebase()  
     restore_aws_cache_from_firebase()      # 🌟 서버 시작 시 Firebase에서 과거 AWS 기상 캐시 복구 및 오류값 정화
     restore_airkorea_cache_from_firebase() # 🌟 서버 시작 시 Firebase에서 과거 환경공단 미세먼지 캐시 복구 및 미집계 정화
-    restore_kepco_cache_from_firebase()
+    restore_kepco_cache_from_firebase()    # 🌟 서버 시작 시 Firebase에서 과거 한전 15분 LP 캐시 복구 (7일 유예 정화)
+    
     load_excel_dataset()
     load_thresholds()
+    gc.collect()
     asyncio.create_task(auto_cache_warmer())
-    logger.info("✅ 서버 정상 구동 완료. (상시 자동 캐싱 및 카카오워크 감시 엔진 가동 중)")
+    logger.info("✅ 서버 정상 구동 완료. (경량 상시 캐싱 · 한전 쿨다운 · 카카오워크 감시 가동 중)")
 
 @app.post("/api/threshold/{station}")
 def set_threshold(station: str, limit: float):
@@ -735,7 +778,10 @@ def test_kma_connection(date: str = None, reset_cooldown: str = "false"):
 
 # 🌟 Vercel 서울(icn1) 한전 중계 수신 상태 및 Firebase 한전 캐시 적재 현황 진단 주소
 @app.get("/api/test_kepco")
-def test_kepco_connection(date: str = None, cust_no: str = "0526066096"):
+def test_kepco_connection(date: str = None, cust_no: str = "0526066096", reset_cooldown: str = "false"):
+    if reset_cooldown.lower() == "true":
+        reset_kepco_cooldown()
+
     yesterday_dt = get_kst_now() - timedelta(days=1)
     target_date = date if date else yesterday_dt.strftime("%Y-%m-%d")
     date_compact = target_date.replace("-", "")
@@ -748,7 +794,7 @@ def test_kepco_connection(date: str = None, cust_no: str = "0526066096"):
         r = http_session.get(
             KEPCO_PROXY_URL,
             params={"type": "lp", "custNo": cust_no, "date": date_compact, "serviceKey": KEPCO_API_KEY},
-            timeout=12
+            timeout=10
         )
         preview = r.text[:200]
         if r.status_code == 200:
@@ -760,6 +806,7 @@ def test_kepco_connection(date: str = None, cust_no: str = "0526066096"):
                 sample_usage = round(sum(arr), 1)
                 sample_peak = round(max(arr) * 4, 1) if arr else 0.0
                 lp_status = f"정상 수신 (계량기 {len(d_list)}건, 합계 {sample_usage} kWh)"
+                record_kepco_result(True)
             else:
                 lp_status = f"한전 응답 오류: {data}"
         else:
@@ -781,7 +828,8 @@ def test_kepco_connection(date: str = None, cust_no: str = "0526066096"):
             "total_cached_keys": len(GLOBAL_KEPCO_CACHE),
             "valid_data_keys": valid_cnt,
             "confirmed_zero_keys": zero_cnt,
-            "grace_days": KEPCO_ZERO_GRACE_DAYS
+            "grace_days": KEPCO_ZERO_GRACE_DAYS,
+            "kepco_cooldown_remaining_sec": max(0, int(KEPCO_COOLDOWN_UNTIL - time.time()))
         }
     }
 
@@ -1413,12 +1461,10 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
             if date_str < today_str and cache_key in GLOBAL_KEPCO_CACHE:
                 entry = GLOBAL_KEPCO_CACHE[cache_key]
                 if entry == "ZERO":
-                    # 🌟 7일 초과 확정 ZERO는 즉시 0 반환, 7일 이내면 재조회
                     if date_str < grace_cutoff_str:
                         return [0.0] * 96
                 elif is_valid_kepco_cache_entry(entry):
                     intervals = extract_intervals_from_kepco_entry(entry, m_target)
-                    # 🌟 해당 개소 값이 있거나 7일 초과 과거 확정 데이터면 캐시 즉시 반환
                     if sum(intervals) > 0 or date_str < grace_cutoff_str:
                         return intervals
                     cached_entry = entry
@@ -1426,6 +1472,13 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                 c_time, c_data = GLOBAL_KEPCO_TODAY_CACHE[cache_key]
                 if time.time() - c_time < 600:
                     return extract_intervals_from_kepco_entry(c_data, m_target)
+
+        # 🌟 한전 5분 쿨다운(서킷 브레이커) 발동 중이면 네트워크 호출 즉시 생략하고 기존 캐시 반환
+        if time.time() < KEPCO_COOLDOWN_UNTIL:
+            fallback_entry = cached_entry if cached_entry is not None else GLOBAL_KEPCO_CACHE.get(cache_key)
+            if fallback_entry and fallback_entry != "ZERO":
+                return extract_intervals_from_kepco_entry(fallback_entry, m_target)
+            return [0.0] * 96
 
         # 🌟 Vercel 서울(icn1) 한전 전용 중계 서버 경유 호출
         params = {
@@ -1436,9 +1489,11 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
         }
         day_list = []
         req_ok = False
-        for attempt in range(3):
+        for attempt in range(2):
+            if time.time() < KEPCO_COOLDOWN_UNTIL:
+                break
             try:
-                res = http_session.get(KEPCO_PROXY_URL, params=params, timeout=12)
+                res = http_session.get(KEPCO_PROXY_URL, params=params, timeout=10)
                 if res.status_code == 200:
                     data = res.json()
                     if isinstance(data, dict) and not data.get("errCd") and not data.get("error"):
@@ -1447,16 +1502,16 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                             day_list = data["dayLpDataInfoList"]
                             if day_list:
                                 break
-                        # 정상 응답인데 빈 리스트면 1회만 추가 재확인 후 종료
                         if attempt >= 1:
                             break
             except Exception:
                 pass
-            if attempt < 2:
-                time.sleep(0.5)
+            if attempt == 0 and time.time() >= KEPCO_COOLDOWN_UNTIL:
+                time.sleep(0.4)
+
+        record_kepco_result(req_ok)
 
         if not req_ok:
-            # 🌟 통신 실패/장애 시 절대 0을 캐시에 저장하지 않으며, 기존 유효 캐시가 있으면 보호 반환
             fallback_entry = cached_entry if cached_entry is not None else GLOBAL_KEPCO_CACHE.get(cache_key)
             if fallback_entry and fallback_entry != "ZERO":
                 return extract_intervals_from_kepco_entry(fallback_entry, m_target)
@@ -1472,13 +1527,10 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
                 old_sum = get_kepco_entry_total(old_entry)
 
                 if total_cust_sum > 0:
-                    # 🌟 유효 전력량이 존재할 때: 신규/기존 ZERO/더 큰 합계(지연 보정)/강제 갱신 시 업데이트
                     if old_entry is None or old_entry == "ZERO" or total_cust_sum > old_sum or (is_bypass and compressed != old_entry):
                         GLOBAL_KEPCO_CACHE[cache_key] = compressed
                         PENDING_KEPCO_UPDATES[cache_key] = compressed
                 else:
-                    # 🌟 한전 정상 응답이나 실제 합계가 0인 경우:
-                    # 7일 초과 과거만 'ZERO' 확정 저장 (기존 유효 데이터가 있을 때는 덮어쓰지 않음)
                     if date_str < grace_cutoff_str and old_sum == 0:
                         if old_entry != "ZERO":
                             GLOBAL_KEPCO_CACHE[cache_key] = "ZERO"
@@ -1490,7 +1542,7 @@ def get_kepco_data_for_station(station: str, date_str: str, is_bypass: bool = Fa
 
         return parsed_intervals
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         results = list(executor.map(fetch_and_process, cust_nos))
 
     if save_immediately:
@@ -1528,6 +1580,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
     
     if is_bypass:
         GLOBAL_API_CACHE["dashboard"].pop(master_key, None)
+        reset_kepco_cooldown()
 
     if not is_bypass and cache_key in GLOBAL_API_CACHE["dashboard"]:
         c_time, c_res = GLOBAL_API_CACHE["dashboard"][cache_key]
@@ -1557,7 +1610,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
                 "cached_at": m_res.get("cached_at", get_kst_now().strftime("%Y-%m-%d %H:%M:%S")),
                 "is_cached": True
             }
-            GLOBAL_API_CACHE["dashboard"][cache_key] = (m_time, sliced_res)
+            set_bounded_api_cache("dashboard", cache_key, (m_time, sliced_res))
             return sliced_res
     
     if end_dt < api_start_date:
@@ -1569,7 +1622,7 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
             "cached_at": get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
             "is_cached": False
         }
-        GLOBAL_API_CACHE["dashboard"][cache_key] = (time.time(), res)
+        set_bounded_api_cache("dashboard", cache_key, (time.time(), res))
         return res
         
     if start_dt < api_start_date:
@@ -1652,7 +1705,8 @@ def get_dashboard_data(station: str, start: str, end: str, bypass: str = "false"
         "is_cached": False
     }
     
-    GLOBAL_API_CACHE["dashboard"][cache_key] = (time.time(), res)
+    if tot_usage > 0 or time.time() >= KEPCO_COOLDOWN_UNTIL:
+        set_bounded_api_cache("dashboard", cache_key, (time.time(), res))
     return res
 
 @app.get("/api/realtime/{station}")
@@ -1685,7 +1739,8 @@ def get_realtime_data(station: str):
             res_details.append(d.copy())
             
     res = {"station_name": station, "date": today_str, "records": res_details}
-    GLOBAL_API_CACHE["realtime"][cache_key] = (time.time(), res)
+    if usage > 0 or time.time() >= KEPCO_COOLDOWN_UNTIL:
+        set_bounded_api_cache("realtime", cache_key, (time.time(), res))
     return res
 
 @app.get("/api/compare/{station}")
@@ -2071,7 +2126,8 @@ def get_compare_data(station: str, base_year: str, comp_year: str, price: int = 
             "summary": { "total_base": tb, "total_comp": tc, "diff": diff_total, "diff_pct": diff_pct_total, "cost": diff_total*price, "ai_report": ai_report_text, "period_label": period_label }, 
             "records": records
         }
-        GLOBAL_API_CACHE["compare"][cache_key] = res
+        set_bounded_api_cache("compare", cache_key, res)
+        gc.collect()
         return res
     except Exception as e:
         return {"error": f"비교 분석 중 서버 에러가 발생했습니다: {str(e)}\n{traceback.format_exc()}"}
@@ -2462,7 +2518,8 @@ def get_predict_data(station: str, target_year: str, pass_rate: float = 0.0, tem
             "summary": { "last_tot": lt, "tot_future": ft, "last_peak": last_peak_val, "peak_future": peak_future_val, "acc": r2_acc }, 
             "chart_data": records, "feat_data": top_feats
         }
-        GLOBAL_API_CACHE["predict"][cache_key] = res
+        set_bounded_api_cache("predict", cache_key, res)
+        gc.collect()
         return res
     except Exception as e:
         return {"error": f"서버 내부 오류로 예측에 실패했습니다: {str(e)}\n\n{traceback.format_exc()}"}
@@ -2482,52 +2539,68 @@ def get_bill_data(station: str, year: str):
     if not target_cust:
         return {"error": f"[{station}]의 한전 고객번호 매핑 정보를 찾을 수 없습니다."}
         
+    reset_kepco_cooldown()
     url = KEPCO_PROXY_URL
     
     def fetch_month_bill(m):
+        if time.time() < KEPCO_COOLDOWN_UNTIL:
+            return None
         data_month = f"{year}{m:02d}"
         params = {"type": "bill", "custNo": target_cust, "dataMonth": data_month, "serviceKey": KEPCO_API_KEY}
-        for _ in range(3):
+        req_ok = False
+        for attempt in range(2):
+            if time.time() < KEPCO_COOLDOWN_UNTIL:
+                return None
             try:
-                res = http_session.get(url, params=params, timeout=12)
+                res = http_session.get(url, params=params, timeout=10)
                 if res.status_code == 200:
                     data = res.json()
-                    if "custBillDataInfoList" in data and data["custBillDataInfoList"]:
-                        item = data["custBillDataInfoList"][0]
-                        def parse_float(val):
-                            try:
-                                if isinstance(val, str): val = val.replace(',', '').strip()
-                                return float(val)
-                            except: return 0.0
-                        
-                        lower_item = {k.lower(): v for k, v in item.items()}
-                        return {
-                            "bill_ym": str(lower_item.get("billym", lower_item.get("bill_ym", ""))),
-                            "mr_ymd": str(lower_item.get("mrymd", lower_item.get("mr_ymd", ""))),
-                            "bill_aply_pwr": parse_float(lower_item.get("billaplypwr", lower_item.get("bill_aply_pwr"))),
-                            "base_bill": parse_float(lower_item.get("basebill", lower_item.get("base_bill"))),
-                            "kwh_bill": parse_float(lower_item.get("kwhbill", lower_item.get("kwh_bill"))),
-                            "dc_bill": parse_float(lower_item.get("dcbill", lower_item.get("dc_bill"))),
-                            "req_bill": parse_float(lower_item.get("reqbill", lower_item.get("req_bill"))),
-                            "req_amt": parse_float(lower_item.get("reqamt", lower_item.get("req_amt"))),
-                            "lload_usekwh": parse_float(lower_item.get("lloadusekwh", lower_item.get("lload_usekwh"))),
-                            "mload_usekwh": parse_float(lower_item.get("mloadusekwh", lower_item.get("mload_usekwh"))),
-                            "maxload_usekwh": parse_float(lower_item.get("maxloadusekwh", lower_item.get("maxload_usekwh"))),
-                            "lload_needle": parse_float(lower_item.get("lloadneedle", lower_item.get("lload_needle"))),
-                            "mload_needle": parse_float(lower_item.get("mloadneedle", lower_item.get("mload_needle"))),
-                            "maxload_needle": parse_float(lower_item.get("maxloadneedle", lower_item.get("maxload_needle"))),
-                            "ji_pwrfact": parse_float(lower_item.get("jipwrfact", lower_item.get("ji_pwrfact"))),
-                            "jn_pwrfact": parse_float(lower_item.get("jnpwrfact", lower_item.get("jn_pwrfact")))
-                        }
-            except: time.sleep(0.5)
+                    if isinstance(data, dict) and not data.get("errCd") and not data.get("error"):
+                        req_ok = True
+                        record_kepco_result(True)
+                        if "custBillDataInfoList" in data and data["custBillDataInfoList"]:
+                            item = data["custBillDataInfoList"][0]
+                            def parse_float(val):
+                                try:
+                                    if isinstance(val, str): val = val.replace(',', '').strip()
+                                    return float(val)
+                                except: return 0.0
+                            
+                            lower_item = {k.lower(): v for k, v in item.items()}
+                            return {
+                                "bill_ym": str(lower_item.get("billym", lower_item.get("bill_ym", ""))),
+                                "mr_ymd": str(lower_item.get("mrymd", lower_item.get("mr_ymd", ""))),
+                                "bill_aply_pwr": parse_float(lower_item.get("billaplypwr", lower_item.get("bill_aply_pwr"))),
+                                "base_bill": parse_float(lower_item.get("basebill", lower_item.get("base_bill"))),
+                                "kwh_bill": parse_float(lower_item.get("kwhbill", lower_item.get("kwh_bill"))),
+                                "dc_bill": parse_float(lower_item.get("dcbill", lower_item.get("dc_bill"))),
+                                "req_bill": parse_float(lower_item.get("reqbill", lower_item.get("req_bill"))),
+                                "req_amt": parse_float(lower_item.get("reqamt", lower_item.get("req_amt"))),
+                                "lload_usekwh": parse_float(lower_item.get("lloadusekwh", lower_item.get("lload_usekwh"))),
+                                "mload_usekwh": parse_float(lower_item.get("mloadusekwh", lower_item.get("mload_usekwh"))),
+                                "maxload_usekwh": parse_float(lower_item.get("maxloadusekwh", lower_item.get("maxload_usekwh"))),
+                                "lload_needle": parse_float(lower_item.get("lloadneedle", lower_item.get("lload_needle"))),
+                                "mload_needle": parse_float(lower_item.get("mloadneedle", lower_item.get("mload_needle"))),
+                                "maxload_needle": parse_float(lower_item.get("maxloadneedle", lower_item.get("maxload_needle"))),
+                                "ji_pwrfact": parse_float(lower_item.get("jipwrfact", lower_item.get("ji_pwrfact"))),
+                                "jn_pwrfact": parse_float(lower_item.get("jnpwrfact", lower_item.get("jn_pwrfact")))
+                            }
+                        return None
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(0.4)
+        if not req_ok:
+            record_kepco_result(False)
         return None
 
-    with ThreadPoolExecutor(max_workers=6) as exec:
+    with ThreadPoolExecutor(max_workers=3) as exec:
         raw_results = list(exec.map(fetch_month_bill, range(1, 13)))
         
     records = [r for r in raw_results if r is not None]
     res = {"station_name": station, "cust_no": target_cust, "records": records}
-    GLOBAL_API_CACHE["bill"][cache_key] = res
+    if records:
+        set_bounded_api_cache("bill", cache_key, res)
     return res
 
 @app.get("/api/overview")
@@ -2538,6 +2611,8 @@ def get_overview_data(bypass: str = "false"):
         c_time, c_res = overview_cache["all"]
         if time.time() - c_time < 300:
             return c_res
+    if is_bypass:
+        reset_kepco_cooldown()    
 
     now_kst = get_kst_now()
     today_str = now_kst.strftime("%Y-%m-%d")
@@ -2870,7 +2945,7 @@ def export_master_backup():
         GLOBAL_API_CACHE["compare"].clear()
         GLOBAL_API_CACHE["predict"].clear()
         load_excel_dataset()
-
+        gc.collect()
         output.seek(0)
         return StreamingResponse(
             output, 
